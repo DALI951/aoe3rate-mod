@@ -1,11 +1,21 @@
+# runtime logs — never commit
 *.log
+*d3d9mod.log
+Temp/
+
+# build artifacts (compiled probes/tests) — never commit
 *.exe
-*.dll
 *.o
 *.obj
 *.d
-*.log
+
+# the Ship of Theseus carries the original d3dx9_25.dll — that one is NOT ours, don't commit it
 d3dx9_25.dll
-Temp/
+
+# transient build/test notes
 build_log.txt
 build_test.txt
+tests/build_actual.txt
+
+# duplicate copy of the proxy used as a local test fixture — the shipped binary lives in the repo root
+tests/d3d9.dll

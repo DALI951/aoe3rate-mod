@@ -1,4 +1,48 @@
-# BUILD.md — AoE3 TAD resource-rate HUD mod (d3d9 proxy DLL) — ROUND 12
+# BUILD.md — AoE3 TAD resource-rate HUD mod (d3d9 proxy DLL) — ROUND 13
+
+## ROUND 13 — single-human-observer, index-1 selection, corrected slot map (still ZERO rendering)
+R12's LIVE analysis settled both open questions: (1) the **human is player-array index 1** (index 0 = nature/gaia, 2+ = AI) — in the live n=3 session P1 (base 0x17FD6000) gathered food 0→530 across two matches while P2 (AI) trickled 0→55; (2) the stock container `*(player+0x230)` IS the real resource object and the existing XOR decrypt is CORRECT (decrypts to food=530 etc.). The only remaining error was the **slot label swap**: the HUD showed 530 food / 100 wood / 130 coin while R12's logger printed food=530 wood=130 coin=100 — proving slots 0/1 were swapped in the R12 labels. ROUND-13 applies the corrected map, hard-picks the human, deletes all probe/dump/scaffolding output, and emits ONE clean RES line per Present tick.
+
+### The R13 code changes (d3d9.c)
+1. **Player selection** — primary = **index 1 when n >= 2** (`[human-p1]` tag). Robust fallback when index 1 is out of range (n<2) or its base/res is 0: scan all players 0..n-1 and pick the one with the **largest decrypted food (slot 2)** (`[fallback: player#N food=..]`). If nothing sane, `[chain-break: no sane player]` and NULLs. All match-start machinery kept: `--- match start n=%d player=%08X res=%08X ---` header on ctx/player/n change, `s_tick` reset there.
+2. **Slot map (corrected)** — output now maps **food=slot2, wood=slot1, coin=slot0, export=slot7**. Decrypt math unchanged (still `key[slot] ^ enc[slot]`); only the name→slot mapping changed.
+3. **Output format** — one line per tick, chosen human only:
+   `RES t=%d food=%d wood=%d coin=%d export=%d player=%08X res=%08X`
+   Removed: per-player P0/P1/P2 blocks, `raw 0..7 incA/incB/incN` trail, `resraw`/`resraw2` stock-hunt, `cell P%d` dumps, `altCap/altAdd/altPanel` probes, `--- dump mode=all ---`, `MAX_PLAYERS`/`dump_all_players`/`dump_window_cells`/`log_resraw` infrastructure, and all window/probe machinery. Kept: compact match-start header per match, tick counter `s_tick++` per frame (reset at match start).
+4. **Observer-only invariant** preserved — no drawing, no fonts, no D3DX, no device state touches (KERNEL32+msvcrt imports only). fault filter + breadcrumbs + VirtualQuery-guarded reads all retained.
+
+### Build command
+```
+C:\Users\Dali\Documents\gaames\w64devkit-x86\w64devkit\bin\i686-w64-mingw32-gcc.exe -shared -static-libgcc -O2 -o d3d9.dll d3d9.c d3d9.def
+```
+(with the w64devkit bin + libexec\gcc\i686-w64-mingw32\16.2.0 on PATH so cc1 is found) → **rc=0, zero warnings**.
+
+### Build output / deploy
+- **Size 83,272 B**; SHA256 **`E6F79C46EF26FD430D3366B06418752B5E3E59870116295DF3BF75DA5D7DF6D0`**
+- objdump format: **`file format pei-i386`** (architecture i386)
+- Deployed byte-identical (`fc /b`) to BOTH the game dir (`Age of Empires III - Complete Collection\d3d9.dll`) and `tests\d3d9.dll` — both `no differences encountered`.
+- Import scan (pe_structure): **KERNEL32.dll + msvcrt.dll only**; exports unchanged (Direct3DCreate9 + Direct3DCreate9Ex + D3DPERF_*/DebugSet*).
+
+### Test results (per harness)
+- **test_source_contract.py (R13)**: **PASS** (72/72 checks — draw-layer absence, RES line format, slot map `food=v[2], wood=v[1], coin=v[0], export=v[7]`, match-start header, [human-p1]/[fallback:]/chain-break tags, tick `s_tick++`, and the removal of all P%d/raw/resraw/cell/dump/altCap/MAX_PLAYERS).
+- **test_d3d9_actual.c (R13, compiled + run)**: **ALL PASS** (22 checks — index-1 primary path, fallback to largest-food, single-player fallback, n=0 menu NULLs, all-zero-food still resolves p1, decrypt round-trip 0..1e6 no NaN/INF, rate_for 562.5, RES-line every tick, correct slot map on change, removal of raw/resraw/altCap/cell lines, nullsafe + unmapped-page guards).
+- **TESTER_nullsafe_O2**: **10/10 PASS** (safety properties unchanged).
+- **TESTER_decrypt**: **PASS** (key table matches game bytes, round-trip no NaN/INF).
+- **TESTER_loadsmoke_path**: **PASS** (loads OUR tests\d3d9.dll copy, Create9 callable).
+- **test_pe_structure.py**: **0 FAILURES** (0x14C, exports, KERNEL32/msvcrt only, age3y 0x400000 base + imports d3d9.dll).
+- Note: the nullsafe/decrypt/loadsmoke TESTER_* .exe harnesses were NOT recompiled — they test invariants (page guards, decrypt math, proxy load) that R13 does not change; they still pass against the deployed DLL.
+
+### What Dali does next
+Launch `age3y.exe` (game-dir d3d9.dll = R13 build), start a 1v1 skirmish, gather normally. The log should show:
+```
+DLL loaded .. / Create9 .. / CreateDevice ..
+chain game=.. ctx=.. n=3 player=.. res=.. inc=.. [human-p1]
+--- match start n=3 player=17FD6000 res=... ---
+RES t=1 food=530 wood=100 coin=130 export=.. player=17FD6000 res=...
+RES t=2 food=531 wood=100 coin=130 export=.. player=17FD6000 res=...
+...one RES line per Present frame for the human only...
+```
+HUD numbers (food/wood/coin/export) should match the HUD exactly now (slots 0/1 corrected). If the numbers still don't match the HUD, send me the log.
 
 ## ROUND 12 — SCAN ALL PLAYERS: per-player P%d lines + per-player memory dumps + plain-int stock-hunt (still ZERO rendering)
 R11's live log answered the wrong player question: the resolver's pick (player#2) was the **AI** (its stock climbed 0→~95/43/96 while Dali's HUD sat at food=600, wood=200, coin=30 — the human's stock NEVER appeared in any R11-scanned cell). ROUND-12 stops trusting one resolved player and does the decisive experiment the hard way: **scan every player 0..n-1** every frame for the per-player `P%d` resource lines, and every 5s dump three memory windows around EACH player's res/player/inc objects plus a **plain-int stock-hunt** (`resraw` = first 8 dwords of the res container, `resraw2` = the 8 dwords at container+0x80, NO decrypt) so Dali's frozen 600/200/30 is caught verbatim wherever the game stores it. No drawing, no D3DX, KERNEL32+msvcrt only.

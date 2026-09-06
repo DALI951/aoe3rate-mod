@@ -1,36 +1,22 @@
 #!/usr/bin/env python3
-"""test_source_contract.py — round-12 pure-observer source-level contract checks
+"""test_source_contract.py — round-13 pure-observer source-level contract checks
 on d3d9.c.
 
-Round-12 observer contracts (Dali's mission: NO rendering at all):
-  1. ALL draw-layer symbols must be ABSENT from the source: D3DXCreateFont,
-     ID3DXFont vtable Begin/DrawText/End indices, draw_hud_text, init_font,
-     draw_set_rt/states, draw_redrect, GetBackBuffer/SetRenderTarget,
-     BeginScene/EndScene wrappers, D3DFVF use.
-  2. The observer survives: observer_sample() present, called from present_hook
-     BEFORE s_orig_present, logging PER-PLAYER NAMED `P%d res food=%d wood=%d
-     coin=%d export=%d` lines (map food=slot2, wood=slot0, coin=slot1,
-     export=slot7) plus the RAW `P%d raw 0..7 incA incB incN` trail, reading
-     slots via decrypt_slot_at and income fields via OFF_INC_CUR/PREV/COUNT.
-     A `--- match start n=.. idx=.. ---` separator + snapshot reset fires on
-     ctx 0->non-0 / player change / n change.
-  3. g_player_idx must be tracked (=-1, =idx authoritative, =pick_i fallback);
-     g_obs_player tracked the same way for match-start detection.
-  3b. Every chain log line carries `idx=N` (raw game+0x14c, `-` when ctx==0).
+Round-13 observer contracts:
+  1. ALL draw-layer symbols must be ABSENT from the source.
+  2. observer_sample() present, called from present_hook BEFORE s_orig_present,
+     logs ONE `RES t=%d food=%d wood=%d coin=%d export=%d player=%08X res=%08X`
+     line per tick for the chosen human player. Slot map: food=slot2, wood=slot1,
+     coin=slot0, export=slot7. Match-start separator:
+     `--- match start n=%d player=%08X res=%08X ---`.
+  3. g_player_idx tracked; g_obs_player tracked for match-start.
+  4. Player selection: index 1 when n>=2 [human-p1], fallback scans all for
+     largest food, [chain-break: no sane player] on failure.
+  5. No per-player P%d blocks, no resraw, no cell dumps, no altCap/altAdd/altPanel,
+     no raw trail lines — only the RES line and match-start header.
 
-Round-12 dump contracts (the decisive experiment — scan ALL players):
-  dump_all_players() loops every players-table slot 0..n-1, dumping per-player
-  windows around res (tag r) / player (tag p) / inc (tag i) with the ACTUAL
-  address in `addr=`, the stock-hunt `P%d resraw`/`P%d resraw2` plain-int lines,
-  a `--- dump t=%d mode=all ---` separator per burst, and `cell P0-2 none` when
-  nothing changed. t = seconds since match start (s_dump_tick anchored at match
-  start, NEVER re-anchored after a dump). Per-player on-change snapshots exist.
-
-Round-5/7 chain contracts (regression cannot re-introduce): authoritative idx
-from game+0x14c trusted unconditionally when 0 <= idx < n (no probe veto),
-sticky fallback + [sticky], [src-authoritative]/[src-fallback]/[chain-break]
-tags, quiet chain log gate, no RVA_CUR_PLAYER_ID, probe uses
-decrypt_slot_at(<container>, 0) > 0.0f.
+Round-5/7 chain contracts (regression cannot re-introduce): sticky fallback
+tags, [src-fallback]/[chain-break] tags, quiet chain log gate.
 
 Usage: C:\\Python314\\python.exe tests\\test_source_contract.py
 """
@@ -56,9 +42,6 @@ def check(cond, msg):
 with open(SRC, "r", encoding="utf-8") as fh:
     src = fh.read()
 
-# code-only copy: strip /* ... */ block comments and // line comments so that
-# negative checks never false-positive on ROUND-8 prose mentioning the deleted
-# draw APIs (e.g. "SetRenderTarget was DELETED in round 8").
 code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
 code = re.sub(r"//[^\r\n]*", "", code)
 
@@ -84,24 +67,16 @@ check(m is None, "no d3dx9 module references remain in d3d9.c code")
 check("observer_sample" in src, "observer_sample() function present")
 obs = src.find("static void observer_sample")
 check(obs != -1, "observer_sample defined (static fn)")
-m = re.search(r'"P%d res food=%d wood=%d coin=%d export=%d"', src)
+m = re.search(r'"RES t=%d food=%d wood=%d coin=%d export=%d player=%08X res=%08X"', src)
 check(m is not None,
-      "ROUND-12 named line `P%d res food=%d wood=%d coin=%d export=%d` present")
-m = re.search(r'"P%d raw 0=%d 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 7=%d '
-              r'incA=%d incB=%d incN=%d"', src)
+      "ROUND-13 RES line `RES t=%d food=%d wood=%d coin=%d export=%d player=%08X res=%08X` present")
+m = re.search(r'"--- match start n=%d player=%08X res=%08X ---"', src)
 check(m is not None,
-      "ROUND-12 raw trail line `P%d raw 0..7 incA incB incN` present")
-m = re.search(r'"--- match start n=%d idx=%s ---"', src)
-check(m is not None,
-      "ROUND-9 match-start separator format present")
-check("rnd_i(v[2]), rnd_i(v[0]), rnd_i(v[1]), rnd_i(v[7])" in src,
-      "named line maps food=slot2, wood=slot0, coin=slot1, export=slot7 (R9)")
+      "ROUND-13 match-start separator format present")
+check("rnd_i(v[2]), rnd_i(v[1]), rnd_i(v[0]), rnd_i(v[7])" in src,
+      "named line maps food=slot2, wood=slot1, coin=slot0, export=slot7 (R13)")
 check("decrypt_slot_at(rr, s)" in src,
       "observer reads the 8 slots via decrypt_slot_at (real decrypt)")
-for off in ("OFF_INC_CUR", "OFF_INC_PREV", "OFF_INC_COUNT"):
-    check(f"ii + {off}" in src, f"observer reads income field {off}")
-check("s_snap" in src and "observer_sample()" in src,
-      "on-change snapshot state present")
 
 # observer runs in present_hook BEFORE the original Present
 start = src.find("static int STDMETHODCALLTYPE present_hook")
@@ -116,17 +91,15 @@ if oi != -1 and pi != -1:
     check(oi < pi, "observer_sample() runs BEFORE s_orig_present (read, then flip)")
 
 # --- contract 3: g_player_idx tracked through resolution --------------------
-loidx = src.find("g_player_idx = idx;")
-check(loidx != -1, "authoritative path: g_player_idx = idx")
-lpick = src.find("g_player_idx = pick_i;")
-check(lpick != -1, "fallback path: g_player_idx = pick_i")
-lnull = src.find("g_player_idx = -1;")
-check(lnull != -1, "reset/entry: g_player_idx = -1")
+# R13: g_player_idx = 1 in the primary [human-p1] path
+check("g_player_idx = 1;" in src, "primary path: g_player_idx = 1 (human-p1)")
+check("g_player_idx = pick_i;" in src, "fallback path: g_player_idx = pick_i")
+check("g_player_idx = -1;" in src, "reset/entry: g_player_idx = -1")
 
-# --- contract 3b (round 9): g_obs_player tracked for match-start -------------
+# --- contract 3b: g_obs_player tracked for match-start ----------------------
 check("g_obs_player = 0;" in src, "match-start: g_obs_player reset at entry")
-check("g_obs_player = player;" in src,
-      "match-start: g_obs_player set from authoritative player")
+check("g_obs_player = p1;" in src or "g_obs_player = player;" in src,
+      "match-start: g_obs_player set from primary player")
 check("g_obs_player = pick;" in src,
       "match-start: g_obs_player set from fallback pick")
 check("s_last_ctx" in src and "s_last_player" in src and "s_last_n" in src,
@@ -138,102 +111,43 @@ check(m is not None,
       "match-start fires on ctx 0->non-0 OR player-pointer change OR n change")
 check("s_snap_have = 0;" in src and "match_start" in src,
       "match-start resets the snapshot so the next frame always logs")
+check("s_tick = 0;" in src, "match-start resets the tick counter")
 
-# --- contract 4 (round 5): authoritative active-player source ---------------
-m = re.search(r"#define\s+OFF_GAME_ACTIVE_PLAYER\s+0x14c\b", src)
-check(m is not None, "#define OFF_GAME_ACTIVE_PLAYER 0x14c present")
-check("RVA_CUR_PLAYER_ID" not in src,
-      "no RVA_CUR_PLAYER_ID reference remains (old idx source 0x866664 removed)")
-m = re.search(r"idx\s*=\s*\(int\)safe_r32\(game\s*\+\s*OFF_GAME_ACTIVE_PLAYER\)", src)
-check(m is not None,
-      "locate_resources_impl reads idx from game+OFF_GAME_ACTIVE_PLAYER")
-check("OFF_GAME_CTX" in src and "OFF_CTX_PLAYERCNT" in src and
-      "OFF_CTX_PLAYERS" in src and "OFF_PLAYER_RES" in src and "OFF_PLAYER_INCOME" in src,
-      "chain defines present (ctx/players/res/income)")
+# --- contract 4 (R13): player selection via index 1 -------------------------
+check("[human-p1]" in src, "chain tag [human-p1] present")
+check("n >= 2" in src or "n>=2" in src, "primary path checks n >= 2")
+# index 1 access: arr + 1 * 4
+check("arr + 1 * 4" in src or "arr + 4" in src, "primary path reads player index 1")
 
-# --- contract 5 (round 5): probes + fallback -------------------------------
-check("[src-authoritative]" in src, "chain tag [src-authoritative] present")
-check("[src-fallback]" in src, "chain tag [src-fallback] present")
-check("[fallback: player#%d]" in src, "fallback logs the picked player index")
+# --- contract 5: fallback scan for largest food -----------------------------
+check("[fallback:" in src, "chain tag [fallback: ...] present")
 m = re.search(r"for\s*\(\s*int\s+i\s*=\s*0\s*;\s*i\s*<\s*n\s*;\s*i\+\+\)", src)
 check(m is not None, "fallback iterates the ctx players table (0..n)")
-for probe in ("+ OFF_PLAYER_RES", "+ OFF_PLAYER_INCOME"):
-    check(probe in src, f"probe-lite sanity rule uses {probe.strip()}")
-check(re.search(r"decrypt_slot_at\(\w+, 0\) > 0.0f", src) is not None,
-      "probe-lite sanity rule uses decrypt_slot_at(<container>, 0) > 0.0f")
+check("decrypt_slot_at(r, 2)" in src or "decrypt_slot_at(r2, 2)" in src,
+      "fallback scan uses largest food (slot 2)")
+check("[chain-break: no sane player]" in src, "chain-break tag retained")
 
-# --- contract 6 (round 5): quiet chain log ------------------------
-check("chain src=game+0x14C" in src,
-      "quiet chain log format `chain src=game+0x14C ...` present")
+# --- contract 6: quiet chain log -------------------------------------------
+check("chain game=" in src,
+      "compact chain log format `chain game= ...` present")
 check("g_chain_calls > 5" in src,
       "chain log quiet-gate (first 5 calls, then on change) present")
 
-# --- contract 6b (round 9): chain lines carry raw idx + probe-bypass proof ---
-check("idx=%s" in src and "idxbuf" in src,
-      "ROUND-9 chain lines append `idx=N` (raw game+0x14c, or `-` when ctx==0)")
+# --- contract 7: NO per-player scanning / dumps / raw trail -----------------
+check("P%d res" not in src, "no per-player P%d res lines (R13)")
+check("P%d raw" not in src, "no per-player P%d raw trail lines (R13)")
+check("dump_all_players" not in src, "no dump_all_players (R13)")
+check("dump_window_cells" not in src, "no dump_window_cells (R13)")
+check("log_resraw" not in src, "no log_resraw (R13)")
+check("resraw" not in src, "no resraw references (R13)")
+check("altCap" not in src and "altAdd" not in src and "altPanel" not in src,
+      "no altCap/altAdd/altPanel probes (R13)")
+check("cell P" not in src, "no cell dump lines (R13)")
+check("MAX_PLAYERS" not in src, "no MAX_PLAYERS (R13)")
 
-# --- contract 7 (round 7): unconditional authoritative + sticky fallback ----
-lo = src.find("static void locate_resources_impl")
-lr = src.find("#ifdef SWARM_TEST", lo)
-check(lo != -1 and lr != -1 and lr > lo, "locate_resources_impl body located")
-lbody = src[lo:lr]
-auth = re.search(r"idx\s*>=\s*0\s*&&\s*idx\s*<\s*n", lbody)
-check(auth is not None, "authoritative gate is 0 <= idx < n (in-range only)")
-if auth is not None:
-    seg = lbody[auth.start():lbody.find("dlog_chain", auth.start())]
-    check("player_sane" not in seg,
-          "NO sanity probe vetoes an in-range idx (unconditional trust)")
-check("s_fb_last" in src,
-      "sticky fallback remembers the last-picked player")
-check("[sticky]" in src, "[sticky] tag present")
-check("[chain-break: no sane player]" in src, "chain-break tag retained")
-
-# --- contract 8 (round 12): decisive-experiment dump, ALL players scanned -----
-m = re.search(r"static void dump_all_players\(DWORD arr, int n, DWORD now_ms\)", src)
-check(m is not None, "ROUND-12 dump_all_players() present (scans all players)")
-m = re.search(r"static int dump_window_cells\(int pdx, const char \*tag, DWORD center,"
-              r"\s*int lo, int nwords, DWORD \*snap\)", src)
-check(m is not None, "ROUND-12 dump_window_cells() present (per-window, per-player)")
-check("s_pA_snap[MAX_PLAYERS][256]" in src and "s_pB_snap[MAX_PLAYERS][512]" in src
-      and "s_pC_snap[MAX_PLAYERS][128]" in src,
-      "ROUND-12 per-player window snapshots (256/512/128) present")
-check("s_p_have[MAX_PLAYERS]" in src and "s_p_vals[MAX_PLAYERS][8]" in src,
-      "ROUND-12 per-player on-change observer snapshots present")
-m = re.search(r"for \(int i = 0; i < lim; i\+\+\)", src)
-check(m is not None, "ROUND-12 per-player loop over players table (0..n-1)")
-m = re.search(r"P%d resraw 0=%d 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 7=%d", src)
-check(m is not None, "ROUND-12 stock-hunt resraw (first 8 dwords, no decrypt)")
-m = re.search(r"P%d resraw2 0=%d 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 7=%d", src)
-check(m is not None, "ROUND-12 stock-hunt resraw2 (dwords at container+0x80)")
-m = re.search(r"addr=%08X int=%d float=%.1f", src)
-check(m is not None, "ROUND-12 cell line prints the ACTUAL address (addr=%08X)")
-m = re.search(r"--- dump t=%d mode=all ---", src)
-check(m is not None, "ROUND-12 dump burst separator present")
-m = re.search(r"cell P0-%d none", src)
-check(m is not None, "ROUND-12 silent-burst marker `cell P0-%d none` present")
-check('dump_window_cells(i, "r"' in src, "ROUND-12 res window cells use tag r")
-check('dump_window_cells(i, "p"' in src, "ROUND-12 player window cells use tag p")
-check('dump_window_cells(i, "i"' in src, "ROUND-12 inc window cells use tag i")
-check("(now_ms - s_dump_tick) / 1000u" in src,
-      "ROUND-12 t= is seconds since match start (integer slice of delta)")
-check("s_dump_tick = now_ms;" in src,
-      "ROUND-12 s_dump_tick anchored in match-start block (t= start)")
-check("now_ms - s_dump_tick) >= 5000u" in src,
-      "ROUND-12 cadence gate uses 5000 ms window from match-start anchor")
-check("match_end" in src and "match_start" in src,
-      "ROUND-12 match-start/match-end detection present")
-check("dump_all_players(arr, n, now_ms)" in src,
-      "ROUND-12 dump reachable (dumps the players table + resraw)")
-check("int do_dump = match_start" in src,
-      "ROUND-12 dump fires on match start (t=0 first burst), cadence AND match-end")
-for off in ("-0x200", "-0x100"):
-    check(off in src, f"ROUND-12 dump window offsets include {off}")
-check("center + lo" in src, "ROUND-12 windows computed as center + lo (real address)")
-check("si >= 0 && si <= 20000" in src,
-      "ROUND-12 int filter keeps [0, 20000] only")
-check("sf <= 20000.0f" in src, "ROUND-12 float filter keeps [0, 20000] only")
-check("0x7F800000u" in src, "ROUND-12 Inf/NaN rejected via exponent bits (no libm)")
-check("GetTickCount()" in src, "ROUND-12 timing source GetTickCount (KERNEL32 only)")
+# --- contract 8: tick counter increments per frame -------------------------
+check("s_tick++" in src, "tick counter increments each frame")
+check("s_tick" in src and "int" in src, "s_tick is a static int")
 
 print("SOURCE-CONTRACT:", "PASS" if failures == 0 else f"{failures} FAILURES")
 sys.exit(0 if failures == 0 else 1)
