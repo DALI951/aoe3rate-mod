@@ -1,4 +1,30 @@
-# BUILD — ROUND 8 (REWORK, 2026-09-07) — EXTERNAL REVIEW (A1-A5) + INSPECTOR (B1-B9)
+# BUILD — ROUND 9 (REWORK, 2026-09-07) — FONT VTABLE TRUTH + DEVICE-GATED BINDING + DRAIN CLAMP
+
+## ROUND SUMMARY
+No crash this round. R9 is the final hardening pass before the live test — four findings from a fresh read of the code:
+- **F1 (the big one): the ID3DXFont vtable slots were WRONG.** Since R14 the fallback binding used the canonical D3DX9 device layout (`Begin 12 / DrawTextA 13 / End 15`) against the D3DXFONT interface — that table is for `ID3DXSprite`, not `ID3DXFont`. Verified against the ACTUAL SDK interfaces (mingw-w64 `d3dx9core.h`, ReactOS, Wine-mirror, and the genuine Microsoft SDK 43 header — all identical since D3DX9 FWL iface never changed): ID3DXFont has **NO Begin and NO End**; slot 13 is **PreloadTextW**, DrawTextA=**14**, DrawTextW=15, OnLostDevice=16, OnResetDevice=17. The old table was dispatching `PreloadTextA/PreloadTextW/DrawTextW` into a real font (garbage calls on slots that exist but do the wrong thing). Fix: no Begin/End at all — a single `DrawTextA(14)` call with the true layout `(This, pSprite, pString, Count, pRect, Format, Color)`, `pSprite=NULL`, using the already-rotated render target. (The R9 draft claimed "Begin=13"; header grep shows slot 13 = PreloadTextW, and no Begin exists — the derived counts are authoritative.)
+- **F2:** `ui_create_font(*ppdev)` ran unconditionally in `w_create_device`/`w_create_device_ex` even when `patch_device_present` returned 0 (aux/second device) — the font attached to an un-patched device. Now gated: `if (patched) ui_create_font(*ppdev);` in BOTH paths.
+- **F3:** the ShowGains=0 skip tested `inst > g_last_ema[s] * ratio` — a drained slot (EMA ≈ 0/negative) makes `inst > 0` match EVERY positive sample forever. The reference is now clamped: `float ref = g_last_ema[s] > 0.0f ? g_last_ema[s] : 0.0f;` (skip against `ref * ratio`), so the slot lifecycle stays honest.
+- **F4:** contract harness tightened — A1 pins `s_tick` ABSENT from the `clock_now` body (old `return s_tick` guard only matched one shape); B6 pins FVF order `save < DrawPrimitiveUp < restore` inside the backdrop; B7 pins no early `return` between the tripwire set and clear while holding the token; new R9 asserts for the font slots/End-ban/7-arg DrawTextA/device-gated creation/clamp; rate harness got a drained-slot (EMA=0) ShowGains clamp sub-test.
+
+## The F1 fix (the reason this round exists)
+- `src/ui.c` slot table is now `FONT_DRAWTEXTA 14`, `FONT_ONLOSTDEVICE 16`, `FONT_ONRESETDEVICE 17` — `FONT_BEGIN`/`FONT_END` deleted. `ui_font_draw` calls `dt(font, NULL, s, -1, &rc, DT_LEFT|DT_TOP|DT_NOCLIP, color)` (real 7-arg COM layout). The panel no longer calls Begin/End at all. Breadcrumb `ovl-panel-text` added after `ui_draw_backdrop`. Header evidence recorded in `tests/test_source_contract.py` (R9 block) and this report.
+
+## File changes
+- `src/ui.c` — R9 ID3DXFont slot truth (DrawTextA=14 only; Begin/End removed); real 7-arg DrawTextA; `ovl-panel-text` breadcrumb; F1 layout comment.
+- `d3d9.c` — F2: `if (patched) ui_create_font(*ppdev);` in both create paths (font only binds to a device whose Present hook is installed).
+- `src/tracker.c` — F3: ShowGains skip reference clamped to `>= 0` (`ref * ratio`).
+- `tests/test_source_contract.py` — F4: A1 `s_tick` absent from clock_now body; B6 FVF order pinned; B7 no-early-return pin; R9 font-slot/End-ban/7-arg/gating/clamp asserts; R14 doc header corrected.
+- `tests/test_rate_engine.c` — F4/R9: drained-slot (EMA=0) ShowGains=0 clamp sub-test + resume-on-ShowGains=1.
+
+## Build / harnesses (this round)
+- Build rc=0, zero warnings, VERIFY PASS (i386 PE32, imports KERNEL32/USER32/msvcrt, 11 exports).
+- d3d9.dll = **142,052 B**, SHA256 `1bb1b24161d38c0153a261754f5590f236fe7fe27c48cc7caed959cf0ee16d5d`, deployed byte-identical to game dir + tests\d3d9.dll (verified identical on all 3 copies); old d3d9mod.log deleted.
+- Harnesses: test_d3d9_actual.exe ALL PASS · test_rate_engine.exe FAILURES 0 · test_source_contract.py PASS (0 failures) · test_pe_structure.py FAILURES 0.
+
+> Game NOT launched this round. Next step = the live test (with `[Debug] Enabled=1` for the first calibrated run).
+
+---
 
 ## ROUND SUMMARY
 No crash this round — R8 is a hardening/pass two-review pass over the R7 build:

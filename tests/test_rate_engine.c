@@ -131,6 +131,20 @@ static void test_rate_game_time(void) {
     g_settings.show_gains = 0;
     s_tick = 5200;  set_vals(a, 1500.0f);  ts((DWORD)s_tick, a);
     CHECK(rate_get_ema(0) == sg0, "ShowGains=0: positive jump does not move EMA");
+
+    /* R9 clamp: a DRAINED slot (EMA exactly 0) with ShowGains=0. The skip
+     * reference is clamped to >= 0, so any positive sample is a candidate and
+     * the baseline stays fresh instead of the EMA wedging forever at 0; the
+     * slot is NOT stuck — with ShowGains=1 the next normal sample resumes. */
+    g_last_ema[0] = 0.0f;
+    g_ema_valid[0] = 1;
+    g_slot_frozen[0] = 0;
+    s_tick = 5700;  set_vals(a, 1550.0f);  ts((DWORD)s_tick, a); /* +100/s => skip */
+    CHECK(rate_get_ema(0) == 0.0f, "R9: drained slot positive sample skipped (clamped ref), EMA stays 0");
+    g_settings.show_gains = 1; /* drained slot must NOT stay wedged once gains count */
+    s_tick = 6200;  set_vals(a, 1555.0f);  ts((DWORD)s_tick, a); /* +10/s */
+    CHECK(FEQ(rate_get_ema(0), 2.0f), "R9: drained slot resumes normally once gains are counted (0 + 0.2*10 = 2)");
+    g_last_ema[0] = sg0;
     g_settings.show_gains = 1;
 }
 

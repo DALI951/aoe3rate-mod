@@ -2,7 +2,10 @@
  *
  * Resurrects the R3-R7 draw architecture, hardened:
  *  - d3dx9_25.dll loaded at runtime; font via D3DXCreateFontA.
- *  - ID3DXFont vtable: 12 Begin, 13 DrawTextA, 15 End, 16 OnLostDevice, 17 OnResetDevice.
+ *  - ID3DXFont vtable (canonical, d3dx9core.h): 14 DrawTextA, 15 DrawTextW,
+ *    16 OnLostDevice, 17 OnResetDevice. NO Begin and NO End slots exist on
+ *    ID3DXFont (Begin/End are ID3DXSprite) — R9: slot 13 is PreloadTextW, so
+ *    the old "Begin(12)/DrawTextA(13)/End(15)" calls were shipping garbage.
  *  - Draw BEFORE original Present (hooked in d3d9.c). Explicit backbuffer RT via
  *    GetBackBuffer + SetRenderTarget; render states saved/restored.
  *  - TestCooperativeLevel guard; Reset hook (slot 16) -> font invalidate only.
@@ -46,10 +49,16 @@
 #define D3DBLEND_ONE          2
 #define D3DBLEND_ZERO         1
 
-/* ---------- D3DX font vtable slots ---------- */
-#define FONT_BEGIN        12
-#define FONT_DRAWTEXTA    13
-#define FONT_END          15
+/* ---------- D3DX font vtable slots ----------
+ * Canonical ID3DXFont (verified against the real Microsoft d3dx9core.h, SDK 43,
+ * and mingw-w64/ReactOS/Wine copies): after IUnknown(0-2) ...
+ *   3 GetDevice 4 GetDescA 5 GetDescW 6 GetTextMetricsA 7 GetTextMetricsW
+ *   8 GetDC 9 GetGlyphData 10 PreloadCharacters 11 PreloadGlyphs
+ *   12 PreloadTextA 13 PreloadTextW 14 DrawTextA 15 DrawTextW
+ *   16 OnLostDevice 17 OnResetDevice
+ * There is NO Begin and NO End on ID3DXFont. DrawTextA is the only call needed
+ * (the real signature is (pSprite, pString, Count, pRect, Format, Color)). */
+#define FONT_DRAWTEXTA    14
 #define FONT_ONLOSTDEVICE 16
 #define FONT_ONRESETDEVICE 17
 
@@ -70,10 +79,12 @@ typedef int (STDMETHODCALLTYPE *VF_DRAWUP)(void *self, DWORD prim, DWORD count,
         const void *data, DWORD stride);
 typedef int (STDMETHODCALLTYPE *VF_FVF)(void *self, DWORD fvf);      /* SetFVF */
 typedef int (STDMETHODCALLTYPE *VF_GETFVF)(void *self, DWORD *fvf);  /* GetFVF */
-typedef int (STDMETHODCALLTYPE *VF_DRAWTEXT)(void *self, const char *text,
-        int count, void *rect, DWORD fmt, DWORD color);
+typedef int (STDMETHODCALLTYPE *VF_DRAWTEXT)(void *self, void *sprite,
+        const char *text, int count, void *rect, DWORD fmt, DWORD color);
 
-/* font vtable: Begin(12), DrawTextA(13), End(15), OnLost(16), OnReset(17) */
+/* font vtable: DrawTextA(14) draws; slot 15 is DrawTextW (never called);
+ * OnLost/OnReset (16/17) go unused because the LOST path destroys the font
+ * (ui_on_reset) and the present path re-creates it lazily after TCL==S_OK. */
 
 static HMODULE g_d3dx = NULL;
 static void   *g_font = NULL;       /* g_font_dev extern lives in d3d9.c */
@@ -247,7 +258,9 @@ static void ui_font_draw(void *font, const char *s, int x, int y, DWORD color) {
     if (dt == NULL) return;
     RECT rc;
     rc.left = x; rc.top = y; rc.right = x + 400; rc.bottom = y + 200;
-    dt(font, s, -1, &rc, DT_LEFT | DT_TOP | DT_NOCLIP, color);
+    /* real ID3DXFont::DrawTextA(this, pSprite, pString, Count, pRect, Format,
+     * Color) — pSprite=NULL lets D3DX use its own sprite object (R9) */
+    dt(font, NULL, s, -1, &rc, DT_LEFT | DT_TOP | DT_NOCLIP, color);
 }
 
 static void ui_format_rate(char *out, size_t n, float rate) {
@@ -272,11 +285,10 @@ static void ui_draw_panel(void *dev) {
     if (g_font == NULL) return;
     void **vt = *(void ***)g_font;
     if (vt == NULL) return;
-    VF_HR begin = (VF_HR)vt[FONT_BEGIN];
-    VF_HR end = (VF_HR)vt[FONT_END];
-    if (!begin || !end) return;
 
-    if (begin(g_font) < 0) return; /* Begin failed: skip entirely */
+    /* R9: ID3DXFont has NO Begin/End — the old slot-12 "Begin" was actually
+     * PreloadTextA and slot-15 "End" was DrawTextW, so those dispatches were
+     * calling garbage. The text below (DrawTextA, slot 14) is the whole draw. */
 
     int fs = (g_settings.font_size >= 8 && g_settings.font_size <= 40)
            ? g_settings.font_size : 14;
@@ -309,6 +321,10 @@ static void ui_draw_panel(void *dev) {
     int pw = 250;
     int ph = lines * row + 8;
     ui_draw_backdrop(dev, px, py, pw, ph, panel_col);
+
+    /* breadcrumb the font call: a fault inside DrawTextA is then nameable
+     * (g_fault_dev=font, g_fault_slot=14, step=ovl-panel-text) */
+    set_trace(g_font, vt, FONT_DRAWTEXTA, "ovl-panel-text");
 
     int yy = py + 4;
     if (g_settings.show_header) {
@@ -346,7 +362,7 @@ static void ui_draw_panel(void *dev) {
               g_settings.sample_ms, g_settings.smoothing);
     ui_font_draw(g_font, tmp, px + 8, yy, dim_col);
 
-    end(g_font);
+    set_step("ovl-panel"); /* font draws done — back on the device view */
 }
 
 void ui_create_font(void *dev) {

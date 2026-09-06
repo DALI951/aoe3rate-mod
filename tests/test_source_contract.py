@@ -15,8 +15,10 @@ R13 observer contracts (must NOT regress):
 
 R14 contracts (new):
   - draw layer lives in src/ui.c: D3DXCreateFontA loaded via GetProcAddress at
-    runtime (no import-table dep on d3dx9*); ID3DXFont vtable Begin 12 /
-    DrawTextA 13 / End 15 / OnLostDevice 16 / OnResetDevice 17.
+    runtime (no import-table dep on d3dx9*); ID3DXFont vtable DrawTextA 14 /
+    OnLostDevice 16 / OnResetDevice 17 (R9: the old "Begin 12 / DrawTextA 13 /
+    End 15" table was wrong — ID3DXFont has NO Begin/End; slot 13 is
+    PreloadTextW).
   - device vtable hooks: Reset slot 16, Present slot 17; ui_draw runs BEFORE
     the original Present. TestCooperativeLevel / GetBackBuffer /
     SetRenderTarget / DrawPrimitiveUp present.
@@ -131,10 +133,19 @@ check("GetProcAddress(g_d3dx, \"D3DXCreateFontA\")" in src,
       "D3DXCreateFontA resolved via GetProcAddress (no import dep)")
 check("LoadLibraryA(\"d3dx9_25.dll\")" in src,
       "d3dx9_25.dll loaded at runtime via LoadLibraryA")
-check("FONT_BEGIN        12" in src, "ID3DXFont Begin=12 vtable slot")
-check("FONT_DRAWTEXTA    13" in src, "ID3DXFont DrawTextA=13 vtable slot")
+# R9: header-derived ID3DXFont slots (real Microsoft d3dx9core.h SDK43 +
+# mingw-w64/ReactOS/Wine all agree): DrawTextA=14, DrawTextW=15, OnLost=16,
+# OnReset=17 — and there is NO Begin / NO End on ID3DXFont (slot 13 is
+# PreloadTextW), so the old Begin=12/DrawTextA=13/End=15 table is banned.
+check("FONT_DRAWTEXTA    14" in src, "R9: ID3DXFont DrawTextA=14 vtable slot")
 check("FONT_ONLOSTDEVICE 16" in src, "ID3DXFont OnLostDevice=16 vtable slot")
 check("FONT_ONRESETDEVICE 17" in src, "ID3DXFont OnResetDevice=17 vtable slot")
+check("FONT_BEGIN" not in src and "FONT_END" not in src,
+      "R9: no Begin/End slots — ID3DXFont has neither (Begin/End are ID3DXSprite)")
+check("vt[FONT_DRAWTEXTA]" in src, "R9: text drawn ONLY through the DrawTextA(14) slot")
+check("dt(font, NULL, s, -1, &rc" in src,
+      "R9: DrawTextA called with the real (pSprite=NULL, pString, Count, rect, fmt, color) layout")
+check("slot 13 is PreloadTextW" in src, "R9: PreloadTextW-at-13 hazard documented in ui.c")
 check("D9_TESTCOOPLEVEL  3" in src, "TestCooperativeLevel device slot 3")
 check("D9_RESET          16" in src, "Reset device hook slot 16")
 check("D9_BEGINSCENE     41" in src, "BeginScene device slot 41")
@@ -330,12 +341,14 @@ check("now - s_poll_last) < 1000) return;" in code,
 check("second vtable %p seen" in src,
       "A5: second-device-vtable case is LOGGED (not silently skipped)")
 check("not re-patched" in src, "A5: single patched vtable semantics preserved + explained")
-# A1: clock_now() must NEVER hand back the s_tick frame counter
+# A1: clock_now() must NEVER hand back the s_tick frame counter — tighten the
+# old `return (DWORD)s_tick not in code` (a `return s_tick;` regression slips
+# through) by requiring the clock_now BODY itself to be free of the identifier.
 i_clock = code.find("static DWORD clock_now(void)")
-i_sample = code.find("void tracker_sample(", i_clock)
-cseg = code[i_clock:i_sample] if (i_clock != -1 and i_sample != -1 and i_clock < i_sample) else ""
-check("QueryPerformanceCounter" in cseg and "return (DWORD)s_tick" not in code,
-      "A1: clock_now uses realtime QPC; the s_tick frame counter is never a clock")
+i_cnext = code.find("static void tracker_store_sample", i_clock)
+cseg = code[i_clock:i_cnext] if (i_clock != -1 and i_cnext != -1 and i_clock < i_cnext) else ""
+check("QueryPerformanceCounter" in cseg and "s_tick" not in cseg,
+      "A1: clock_now body uses realtime QPC and contains NO s_tick identifier")
 check("clock: using realtime QPC (s_tick is a frame counter, not game time)" in src,
       "A1: one-time realtime-clock note logged in settings_load")
 
@@ -357,18 +370,64 @@ check("D9_SETFVF         89" in src and "D9_GETFVF         90" in src,
 check("saved_fvf" in code and "gf(dev, &saved_fvf)" in code and "sf(dev, saved_fvf)" in code,
       "B6: backdrop saves + restores the device FVF around DrawPrimitiveUp")
 check("ovl-fvf" in src, "B6: FVF calls breadcrumbed (ovl-fvf)")
+# R9: pin the FVF ORDER inside the backdrop helper — save < draw < restore
+i_back = code.find("static void ui_draw_backdrop(void *dev")
+i_backend = code.find("static void ui_font_draw", i_back)
+bseg = code[i_back:i_backend] if (i_back != -1 and i_backend != -1 and i_back < i_backend) else ""
+i_save = bseg.find("gf(dev, &saved_fvf)")
+i_draw = bseg.find("du(dev, D3DPT_TRIANGLESTRIP")
+i_rest = bseg.find("sf(dev, saved_fvf)")
+check(i_save != -1 and i_draw != -1 and i_rest != -1 and i_save < i_draw < i_rest,
+      "B6: FVF order pinned — save(GetFVF) < DrawPrimitiveUp < restore(SetFVF)")
 check("InterlockedCompareExchange" in code and "present-reentrant" in src,
       "B7: re-entrancy tripwire guards the overlay body (nested Present forwarded raw)")
 check("InterlockedExchange(&g_in_present, 0)" in code,
       "B7: tripwire cleared on the single exit path")
+# R9: pin the overlay-body no-early-return invariant — between the tripwire SET
+# and the CLEAR, the ONLY `return` is inside the reentrant branch (which never
+# holds the token); the overlay body cannot bail without clearing the flag.
+i_set = code.find("InterlockedCompareExchange(&g_in_present, 1, 0)")
+i_clr = code.find("InterlockedExchange(&g_in_present, 0)")
+pseg = code[i_set:i_clr] if (i_set != -1 and i_clr != -1 and i_set < i_clr) else ""
+ib = pseg.find("{")
+ie = pseg.find("}", ib)
+pmain = (pseg[:ib] + pseg[ie+1:]) if (ib != -1 and ie != -1) else pseg
+check(i_set != -1 and i_clr != -1 and i_set < i_clr and "return" not in pmain,
+      "B7: no early return between tripwire-set and clear while holding the token")
 check("!g_settings.show_gains" in code, "B8: ShowGains=0 skips positive jumps (EMA frozen)")
-check("inst > g_last_ema[s] * ratio" in code,
-      "B8: positive-jump skip uses the same ratio threshold as spend spikes")
+check("inst > ref * ratio" in code,
+      "B8: positive-jump skip uses the ratio threshold (R9: against the clamped ref)")
 check("if (g_settings.start_hidden) g_panel_visible = 0;" in code,
       "B9: StartHidden hides the panel at load in DllMain")
 check("g_panel_visible = 0;" in code.split("settings_init")[-1] or
       "start_hidden) g_panel_visible = 0;" in code,
       "B9: start_hidden applied AFTER settings_load (init order preserved)")
+
+# ================= ROUND 9: font vtable truth + drained-slot clamp =================
+# Finding 1: the R14 "font slots" were wrong. The REAL ID3DXFont (Microsoft
+# d3dx9core.h, SDK 43 — verified + reported in the round-9 message; mingw-w64/
+# ReactOS/Wine agree) is: ... 12 PreloadTextA 13 PreloadTextW 14 DrawTextA 15
+# DrawTextW 16 OnLostDevice 17 OnResetDevice. There is NO Begin/No End on
+# ID3DXFont, so "Begin=12 / DrawTextA=13 / End=15" was shipping garbage
+# (PreloadTextA / PreloadTextW / DrawTextW) into a live font — crash-or-no-text.
+# Fix: DrawTextA(14) only, with the real 7-arg layout (pSprite=NULL).
+check("FONT_DRAWTEXTA    14" in src, "R9: DrawTextA slot firmly 14")
+check("FONT_BEGIN" not in src and "FONT_END" not in src,
+      "R9: Begin/End slot macros FORBIDDEN (they do not exist on ID3DXFont)")
+check("vt[FONT_END]" not in src and "vt[15]" not in src and "vt[FONT_BEGIN]" not in src,
+      "R9: no slot-15 'End' / slot-12 'Begin' dispatch anywhere in ui.c")
+# Finding 2: font is bound ONLY to a device whose Present hook was actually
+# installed (CreateDevice/CreateDeviceEx gate on the patch result).
+check("if (patched) ui_create_font(*ppdev);" in code,
+      "R9: font created only when patch_device_present returned 1 (both create paths)")
+check(code.count("if (patched) ui_create_font(*ppdev);") == 2,
+      "R9: patch-gated font creation in BOTH CreateDevice and CreateDeviceEx")
+# Finding 3: ShowGains=0 drain-clamp — EMA reference clamped to >= 0 so a
+# drained slot cannot match every positive sample forever.
+check("g_last_ema[s] > 0.0f ? g_last_ema[s] : 0.0f" in code,
+      "R9: ShowGains skip clamps the EMA reference to >= 0 (drained slots recover)")
+check("g_ema_valid" in code, "R9 re-check: explicit EMA liveness remains (A2)")
+check("ovl-panel-text" in src, "R9: font DrawTextA calls breadcrumbed (ovl-panel-text)")
 
 # ================= R14: modular layout =================
 

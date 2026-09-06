@@ -171,7 +171,8 @@ static int STDMETHODCALLTYPE w_create_device(void *self, UINT adapter, UINT type
         dlog("CreateDevice hr=%#010x dev=%p patched=%s",
              (unsigned)hr, *ppdev, patched ? "yes" : "no");
         g_frames_since_reset = 0;
-        ui_create_font(*ppdev);   /* font at device-create, never mid-frame */
+        if (patched) ui_create_font(*ppdev);   /* R9: only bind a font to a device
+                                                  whose Present hook runs the overlay */
     }
     return hr;
 }
@@ -185,7 +186,8 @@ static int STDMETHODCALLTYPE w_create_device_ex(void *self, UINT adapter, UINT t
         dlog("CreateDeviceEx hr=%#010x dev=%p patched=%s",
              (unsigned)hr, *ppdev, patched ? "yes" : "no");
         g_frames_since_reset = 0;
-        ui_create_font(*ppdev);   /* font at device-create, never mid-frame */
+        if (patched) ui_create_font(*ppdev);   /* R9: only bind a font to a device
+                                                  whose Present hook runs the overlay */
     }
     return hr;
 }

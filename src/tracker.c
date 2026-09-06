@@ -153,9 +153,13 @@ void tracker_sample(DWORD current_tick, const float *values, int num_slots) {
         /* R16 B8 (ShowGains): when instant gains are disabled, a strongly
          * positive jump is treated EXACTLY like a spend spike — the EMA does
          * not jump up (it would be a lie to report +2k/min gold when the +N
-         * came in one frame from a trade/bonus). Baseline stays fresh. */
+         * came in one frame from a trade/bonus). Baseline stays fresh.
+         * R9: the reference is clamped to >= 0 so that a drained slot
+         * (EMA <= 0) cannot make the skip match every positive sample
+         * forever (inst > 0*ratio is always true when ref is 0). */
+        float ref = g_last_ema[s] > 0.0f ? g_last_ema[s] : 0.0f;
         if (alive_ema && !g_settings.show_gains && inst > 0.0f &&
-            inst > g_last_ema[s] * ratio) {
+            inst > ref * ratio) {
             tracker_store_sample(s, now, v);
             continue;
         }
