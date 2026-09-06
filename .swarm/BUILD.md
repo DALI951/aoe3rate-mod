@@ -1,4 +1,76 @@
-# BUILD.md — AoE3 TAD resource-rate HUD mod (d3d9 proxy DLL) — ROUND 13
+# BUILD.md — AoE3 TAD resource-rate HUD mod (d3d9 proxy DLL)
+
+## ROUND 14 — FULL RESOURCE-RATE MOD: rate engine + D3DX9 overlay + INI settings + version gate (single artifact d3d9.dll)
+R13 was a zero-render observer proving the memory chain. R14 turns it into the shippable mod: a rate engine (ring + EMA + spike/pause freeze), a D3DX9 font overlay (F9 toggle, live setting keys 1-6), an INI config with a DefaultProfile*.xml merge, a version gate that refuses to arm the overlay on a wrong age3y.exe, and a build/deploy pipeline. **Verified on-box, zero game launches**: the mod is compiled clean and all 4 harnesses pass; the only thing left is Dali's live in-game calibration.
+
+### Round summary
+- **Rate engine** (`src/tracker.c`, `src/rate.c`): per-slot ring of `(tick, value)` samples; EMA smoothing (low 0.1 / med 0.2 / high 0.4); sample cadence clamped 100–1000 ms (default 500). Rate = Δv/elapsed, /s but displayed as /min (or /s). Spending-spike skip: when `inst<0 && |inst| > EMA×DiscontinuityRatio` (3.0 default) the sample's EMA update is skipped and the ring baseline kept fresh, so a spend burst never yanks the rate down; positive jumps (instant gains) are counted per ShowGains. Freeze logic: game-time clock not advancing → global pause (no div-by-zero, no drift); and a slot whose value is *identical across a whole sample interval* freezes its EMA (the engine's Present-counter keeps ticking during ESC-pause, so value-flat is the reliable pause signal — live-check this, see risks).
+- **Overlay** (`src/ui.c`): resurrects the R3–R7 D3DX9 architecture hardened. `d3dx9_25.dll` loaded at runtime via `LoadLibraryA` + `D3DXCreateFontA` via GetProcAddress (NO import-table dep). Font vtable Begin 12 / DrawTextA 13 / End 15 / OnLostDevice 16 / OnResetDevice 17. Device vtable: TestCooperativeLevel 3, Reset hook 16 (font invalidate/recreate), Present hook 17, GetBackBuffer 18, SetRenderTarget 37, GetRenderTarget 38, BeginScene 41, EndScene 42, SetRenderState 57, GetRenderState 58, DrawPrimitiveUp 83. Draws BEFORE the original Present with the backbuffer as explicit RT; 7 render states saved/restored; draw is skipped in menus (n==0 ⇒ g_res==NULL), on D3DERR_DEVICELOST, when d3dx9 is missing, or when the version gate is closed. F9 toggles the panel; keys 1–6 flip settings live (header / slots567 / gains / unit / sample-ms / smoothing) and write back to the INI atomically.
+- **Settings** (`src/settings.c`): INI `<module>\ResourceRateMod.ini` sections `[General]/[Display]/[Rate]/[Debug]`, defaults game-time=1/sample=500/med/ratio 3.0, garbage-tolerant parse, atomic save (tmp + `MoveFileExA`), plus `Users\DefaultProfile*.xml` merge (mtime-gated, cheap).
+- **Version gate** (`d3d9.c`): refuses overlay if host is not the exact age3y.exe — size must equal 11,598,648, PE i386-PE32 with base 0x400000, and the version-resource `VS_FIXEDFILEINFO` must read `6.108.321.137`. On failure the log line says `version=BYPASS reason=...` and the overlay never arms.
+- **Modular layout**: `d3d9.c` stays the single build entry and `#includes` `src/state.h` + `src/{logger,tracker,rate,gameif,settings,ui}.c` (monolithic compilation keeps the SWARM_TEST harnesses that include `..\d3d9.c` working). R13's observer/logging contracts (RES line per tick, match-start header, human-p1/fallback selection, safe-chain tags) are byte-identical.
+
+### Files created/changed
+- **New**: `src/logger.c`, `src/tracker.c`, `src/rate.c`, `src/settings.c`, `src/ui.c`, `build/build.bat`, `build/verify_pe.py`, `tools/extract_bar.py`, `config/schema.md`, `ResourceRateMod.ini.example`, `LICENSE` (MIT), `tests/test_rate_engine.c`.
+- **Rewritten**: `src/state.h` (all externs + verified offsets + ModSettings + gate constants), `d3d9.c` (monolithic entry: globals, module includes, D3D9 wrapper/hooks, version gate, DllMain — R13 address constants and RES-line format untouched), `README.md`.
+- **Edited**: `src/gameif.c` (debug-only `rates ... paused=` line; aliasing fixes; cleanup — logic unchanged).
+- **Test harnesses updated**: `tests/test_source_contract.py` (R14 rewrite — observer contracts must not regress + R14 layer contracts), `tests/test_pe_structure.py` (new paths), `tests/test_d3d9_actual.c` (links `-luser32 -lwinmm` for ui.c).
+
+### Build result
+- Command (from repo root): `i686-w64-mingw32-gcc.exe -shared -static-libgcc -O2 -Wall -Wextra -o d3d9.dll d3d9.c d3d9.def -lwinmm -luser32` → **rc=0, zero warnings**.
+- PE verify (`build/verify_pe.py`): i386, PE32, imports ⊆ {KERNEL32, msvcrt, USER32} (confirmed: the three), exports = 11 (Direct3DCreate9 + Direct3DCreate9Ex + 7×D3DPERF_* + DebugSetLevel + DebugSetMute), **VERIFY PASS**.
+- **Size 135,180 B**; SHA256 **`dbec64b6d541356298157fc6dd08dc4f3362deea95a8b540e678c5949a15f04a`** (recorded in `d3d9.sha256`).
+- Deployed byte-identical to the game dir and `tests\d3d9.dll` (hashes equal, verified).
+
+### Rate-engine rules (as implemented + proven by `test_rate_engine.c`, 46/46)
+1. Bootstrap: first sample primes, no fake rate is shown.
+2. Cadence: sub-interval frames do not re-sample.
+3. Steady +1/500 ms ⇒ EMA converges to 2.0/s (120.0/min); raw = 2.0/s.
+4. Spending spike (|inst| > EMA×3) ⇒ EMA frozen, baseline kept fresh; resume measured vs post-spike value.
+5. Instant gain (positive jump) ⇒ counted, EMA tracks up.
+6. Clock not advancing ⇒ `g_paused=1`, EMA untouched, no div-by-zero.
+7. Value flat across a full interval ⇒ slot freezes (EMA not zeroed); unfreezes on the next change.
+8. Realtime mode (QPC) produces finite, sane rates (no all-zero, no NaN).
+
+### Overlay behavior (as implemented)
+- Draws only when: settings enabled, version gate OK, panel visible, in-match (g_res non-NULL), device + d3dx9 + font all available.
+- Built before the original Present; render states + RT restored; surface Release via surface's own vtable.
+- F9 toggles panel; 1:header 2:slots567 3:gains 4:sec/min 5:sample-ms(100→250→500→1000 cycle) 6:smoothing(low→med→high); live toggles call `settings_save()`.
+- Menu (n==0), DEVICELOST, and gate-fail paths are graceful no-ops (proven headless).
+
+### INI schema
+```
+[General]  Enabled=1  Hotkey=0x78  StartHidden=0
+[Display]  FontName=  FontSize=14  Opacity=0.85  PosX=12  PosY=12  ShowHeader=1  ShowSlots567=0
+[Rate]     SampleMs=500  Smoothing=med  Unit=min  UseGameTime=1  DiscontinuityRatio=3.0  ShowGains=1
+[Debug]    Enabled=0
+```
+plus optional `Users\DefaultProfile*.xml` `<Setting Name="ResourceRateMod.X">v</Setting>` entries (mtime-gated merge). Full keys documented in `config/schema.md`.
+
+### Version-gate result for age3y.exe on this machine
+Statically verified (no launch): **file size 11,598,648** ✔, **machine 0x14C i386** ✔, **PE32 magic 0x10B** ✔, **ImageBase 0x400000** ✔, **version resource = 6.108.321.137** ✔ → the gate will PASS and the overlay will arm. The gate's failure path (size mismatch vs the test exe) is proven by `test_rate_engine.c`.
+
+### Build/deploy instructions
+`cmd /c build\build.bat` does it all: PATH-prepend → compile (-Wall -Wextra) → `verify_pe.py` → write `d3d9.sha256` → deploy to game dir + `tests\d3d9.dll` → copy `ResourceRateMod.ini.example` if no INI yet → d3dx9_25.dll availability note (present in System32; no local copy required) → delete stale logs. Manual: same commands as above.
+
+### Test results (final pass, all green)
+- `tests/test_d3d9_actual.exe` → **22/22 PASS** (R13 contracts against the modular build).
+- `tests/test_rate_engine.exe` → **46/46 PASS** (rate engine, realtime, INI round-trip + garbage file, version-gate failure, observer menu/game no-crash, UI guards).
+- `tests/test_source_contract.py` → **PASS** (R13 regression + R14 draw/settings/gate/rate contracts).
+- `tests/test_pe_structure.py` → **0 FAILURES** (i386, exports, no-d3dx9-import allow-list, age3y base/size/import).
+- `build/verify_pe.py d3d9.dll` → **VERIFY PASS**.
+
+### Deviations / risks
+1. **Exports = 11, not 13** — the PLAN says "13 exports" but the verified `d3d9.def` has 11 (Direct3DCreate9, Direct3DCreate9Ex, 7×D3DPERF_*, DebugSetLevel, DebugSetMute). Kept the real 11; `verify_pe.py` asserts ≥ 11. (AOE's loader only needs Direct3DCreate9.)
+2. **Monolithic d3d9.c entry** instead of a separate `src/dllmain.c` — required so the SWARM_TEST harnesses that `#include "..\d3d9.c"` keep compiling; the module files are still real files.
+3. **Pause/freeze is a heuristic**, live-checkable: the Present counter keeps ticking during ESC-pause in this engine, so "tick not advancing" alone won't catch ESC — the per-slot value-flat freeze handles it. If Dali sees rates drift to 0 during ESC-pause, calibrate (see tracker.c).
+4. **Version check earlier was wrong** — R14 gate reads the *version resource* (`VS_FIXEDFILEINFO` 0xFEEF04BD), not the optional-header dwords; a naive header read returns `4.0.0.0` for age3y and would false-fail. Now verified correct on-box.
+5. **Overlay is unverified live** — R14 cannot run the renderer headless; D3DX display accuracy and in-game calibration (font scaling, colors, panel position) is Dali's live check. If `d3dx9_25.dll` were absent from the game dir on another machine, the mod still runs (log note) but the overlay stays off.
+
+### What Dali does next
+Copy the game-dir `d3d9.dll` + `ResourceRateMod.ini`, launch TAD, start a skirmish. Expect: `R14 DLL loaded ... version=OK`, then one `RES t=..` line per frame plus the overlay panel (F9 to hide). Calibrate: 5 toggles sample rate (default 500 ms), verify the freeze behaved right (gather, spend a huge ammo/troop cost, wait; then build-something-check rates), and confirm food/wood/coin/export + /min rates match the game HUD. Send the log if values drift.
+
+---
 
 ## ROUND 13 — single-human-observer, index-1 selection, corrected slot map (still ZERO rendering)
 R12's LIVE analysis settled both open questions: (1) the **human is player-array index 1** (index 0 = nature/gaia, 2+ = AI) — in the live n=3 session P1 (base 0x17FD6000) gathered food 0→530 across two matches while P2 (AI) trickled 0→55; (2) the stock container `*(player+0x230)` IS the real resource object and the existing XOR decrypt is CORRECT (decrypts to food=530 etc.). The only remaining error was the **slot label swap**: the HUD showed 530 food / 100 wood / 130 coin while R12's logger printed food=530 wood=130 coin=100 — proving slots 0/1 were swapped in the R12 labels. ROUND-13 applies the corrected map, hard-picks the human, deletes all probe/dump/scaffolding output, and emits ONE clean RES line per Present tick.

@@ -17,5 +17,10 @@ build_log.txt
 build_test.txt
 tests/build_actual.txt
 
+# generated files — never commit
+ResourceRateMod.ini
+d3d9.sha256
+verify_log.txt
+
 # duplicate copy of the proxy used as a local test fixture — the shipped binary lives in the repo root
 tests/d3d9.dll

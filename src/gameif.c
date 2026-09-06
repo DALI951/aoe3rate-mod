@@ -1,0 +1,326 @@
+/* gameif.c — game-context walk, slot decrypt, chain log, observer, rate_for
+ *
+ * Verbatim behavior from R13 (proven live), with rate_for production-ready.
+ * All derefs guarded by VirtualQuery via safe_r32/read32.
+ */
+#include "state.h"
+
+/* ---- diagnostic log (open/flush/close for crash safety) ---- */
+void dlog(const char *fmt, ...) {
+    if (g_log == NULL) {
+        char path[MAX_PATH];
+        if (GetModuleFileNameA(NULL, path, MAX_PATH) != 0) {
+            char *slash = strrchr(path, '\\');
+            if (slash != NULL) { slash[1] = '\0'; lstrcatA(path, "d3d9mod.log"); }
+            else lstrcpyA(path, "d3d9mod.log");
+            g_log = fopen(path, "a");
+        }
+    }
+    if (g_log == NULL) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_log, fmt, ap);
+    va_end(ap);
+    fputc('\n', g_log);
+    fflush(g_log);
+    fclose(g_log);
+    g_log = NULL;
+}
+
+/* ---- crash / fault ---- */
+void set_step(const char *s) {
+    size_t n = (s != NULL) ? strlen(s) : 0;
+    if (n >= sizeof(g_step)) n = sizeof(g_step) - 1;
+    memcpy((void *)g_step, (s != NULL) ? s : "", n);
+    g_step[n] = '\0';
+}
+
+long WINAPI fault_filter(struct _EXCEPTION_POINTERS *ep) {
+    DWORD addr = 0, code = 0;
+    if (ep != NULL && ep->ExceptionRecord != NULL) {
+        addr = (DWORD)(DWORD_PTR)ep->ExceptionRecord->ExceptionAddress;
+        code = ep->ExceptionRecord->ExceptionCode;
+    }
+    dlog("FAULT addr=%08X breadcrumb=%s code=%08X",
+         (unsigned)addr, (const char *)g_step, (unsigned)code);
+    ExitProcess(0);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* ---- guarded reads ---- */
+BOOL page_readable(DWORD addr) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (addr == 0) return FALSE;
+    if (VirtualQuery((LPCVOID)(DWORD_PTR)addr, &mbi, sizeof(mbi)) != sizeof(mbi))
+        return FALSE;
+    if (mbi.State != MEM_COMMIT) return FALSE;
+    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return FALSE;
+    switch (mbi.Protect & 0xFF) {
+        case PAGE_READONLY: case PAGE_READWRITE: case PAGE_WRITECOPY:
+        case PAGE_EXECUTE: case PAGE_EXECUTE_READ: case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+BOOL read32(DWORD addr, DWORD *out) {
+    if (addr == 0) return FALSE;
+    if (!page_readable(addr)) return FALSE;
+    *out = *(volatile DWORD *)(DWORD_PTR)addr;
+    return TRUE;
+}
+
+DWORD safe_r32(DWORD addr) { DWORD v = 0; read32(addr, &v); return v; }
+
+#ifdef SWARM_TEST
+float safe_rf(DWORD addr)  { DWORD v = 0; read32(addr, &v); float f = 0.0f; memcpy(&f, &v, sizeof(f)); return f; }
+void *safe_rptr(DWORD addr){ DWORD v = 0; if (!read32(addr, &v)) return NULL;
+                              return (void *)v; }
+#endif
+
+/* ---- decrypt ---- */
+float decrypt_slot_at(DWORD rbase, int slot) {
+    DWORD base  = g_base ? (DWORD)(DWORD_PTR)g_base : 0;
+    DWORD count = base ? safe_r32(base + RVA_SLOT_COUNT) : 0;
+    if (count == 0 || count > MAX_SLOTS) count = MAX_SLOTS;
+    if (base == 0 || rbase == 0 || slot < 0 || (DWORD)slot >= count) return 0.0f;
+    DWORD key = safe_r32(base + RVA_KEY_TABLE + (DWORD)slot * 4);
+    DWORD enc = safe_r32(rbase + (DWORD)slot * 4);
+    DWORD dec = enc ^ key;
+    float f = 0.0f;
+    memcpy(&f, &dec, sizeof(f));
+    return f;
+}
+
+#ifdef SWARM_TEST
+float decrypt_slot(int slot) {
+    return decrypt_slot_at(g_res ? (DWORD)(DWORD_PTR)g_res : 0, slot);
+}
+#endif
+
+/* ---- chain log (compact, first-5 + on-change quiet gate) ---- */
+static unsigned long g_chain_calls = 0;
+static DWORD g_last_c[3];
+static char  g_last_tag[128];
+
+void dlog_chain(DWORD game, DWORD ctx, int n,
+                DWORD player, DWORD res, DWORD inc,
+                const char *tag) {
+    DWORD cur[3] = { player, res, inc };
+    int first = (g_chain_calls == 0);
+    g_chain_calls++;
+    int changed = first;
+    if (!changed) {
+        for (int i = 0; i < 3; i++)
+            if (cur[i] != g_last_c[i]) { changed = 1; break; }
+        const char *curtag = tag ? tag : "";
+        if ((tag != NULL) != (g_last_tag[0] != '\0')) changed = 1;
+        else if (strcmp(curtag, g_last_tag) != 0) changed = 1;
+    }
+    if (g_chain_calls > 5 && !changed) return;
+    memcpy(g_last_c, cur, sizeof(cur));
+    g_last_tag[0] = '\0';
+    if (tag != NULL) strncpy(g_last_tag, tag, sizeof(g_last_tag) - 1);
+    dlog("chain game=%08X ctx=%08X n=%d player=%08X res=%08X inc=%08X%s%s",
+         (unsigned)game, (unsigned)ctx, n,
+         (unsigned)player, (unsigned)res, (unsigned)inc,
+         tag ? " " : "", tag ? tag : "");
+}
+
+/* ---- resource location ---- */
+void locate_resources_impl(void) {
+    g_res = NULL;
+    g_inc = NULL;
+    g_ctx = NULL;
+    g_player_idx = -1;
+    g_obs_player = 0;
+    if (g_base == NULL) return;
+    DWORD base = (DWORD)(DWORD_PTR)g_base;
+    DWORD game = safe_r32(base + RVA_GAME_PTR);
+    DWORD ctx = 0, arr = 0;
+    int   n = 0;
+
+    if (game == 0) { dlog_chain(0, 0, 0, 0, 0, 0, "[chain-break: game==0]"); return; }
+    ctx = safe_r32(game + OFF_GAME_CTX);
+    if (ctx == 0) { dlog_chain(game, 0, 0, 0, 0, 0, "[chain-break: ctx==0]"); return; }
+    g_ctx = (void *)ctx;
+    n   = (int)safe_r32(ctx + OFF_CTX_PLAYERCNT);
+    arr = safe_r32(ctx + OFF_CTX_PLAYERS);
+    if (n <= 0) { dlog_chain(game, ctx, n, 0, 0, 0, "[chain-break: n<=0]"); return; }
+    if (arr == 0) { dlog_chain(game, ctx, n, 0, 0, 0, "[chain-break: arr==0]"); return; }
+
+    /* primary: human = index 1 when n >= 2 */
+    if (n >= 2) {
+        DWORD p1 = safe_r32(arr + 1 * 4);
+        if (p1 != 0) {
+            DWORD r1 = safe_r32(p1 + OFF_PLAYER_RES);
+            DWORD i1 = safe_r32(p1 + OFF_PLAYER_INCOME);
+            if (r1 != 0 && i1 != 0) {
+                g_res = (void *)r1;
+                g_inc = (void *)i1;
+                g_player_idx = 1;
+                g_obs_player = p1;
+                dlog_chain(game, ctx, n, p1, r1, i1, "[human-p1]");
+                return;
+            }
+        }
+    }
+
+    /* fallback: scan all players, pick largest decrypted food (slot 2) */
+    {
+        int pick_i = -1;
+        DWORD pick = 0, pick_r = 0, pick_i2 = 0;
+        float best_food = -1.0f;
+        for (int i = 0; i < n; i++) {
+            DWORD p = safe_r32(arr + (DWORD)i * 4);
+            if (p == 0) continue;
+            DWORD r = safe_r32(p + OFF_PLAYER_RES);
+            DWORD ic = safe_r32(p + OFF_PLAYER_INCOME);
+            if (r == 0 || ic == 0) continue;
+            float food = decrypt_slot_at(r, 2);
+            if (food > best_food) {
+                best_food = food;
+                pick = p; pick_i = i;
+                pick_r = r; pick_i2 = ic;
+            }
+        }
+        if (pick != 0) {
+            g_res = (void *)pick_r;
+            g_inc = (void *)pick_i2;
+            g_player_idx = pick_i;
+            g_obs_player = pick;
+            char tag[80];
+            _snprintf(tag, sizeof(tag), "[fallback: player#%d food=%.0f]", pick_i, best_food);
+            dlog_chain(game, ctx, n, pick, pick_r, pick_i2, tag);
+            return;
+        }
+    }
+    dlog_chain(game, ctx, n, 0, 0, 0, "[chain-break: no sane player]");
+}
+
+void locate_resources(void) {
+    g_base = (void *)GetModuleHandleA("age3y.exe");
+    locate_resources_impl();
+}
+
+#ifdef SWARM_TEST
+void locate_resources_at(void *base) {
+    g_base = base;
+    locate_resources_impl();
+}
+#endif
+
+/* ---- FUN_0086da39 reproduction (rate_for) ---- */
+#ifdef SWARM_TEST
+float rate_for(int slot) {
+    DWORD base = g_base ? (DWORD)(DWORD_PTR)g_base : 0;
+    if (base == 0 || slot < 0 || (DWORD)slot >= MAX_SLOTS) return 0.0f;
+    DWORD inc = g_inc ? (DWORD)(DWORD_PTR)g_inc : 0;
+    if (inc == 0) return 0.0f;
+
+    int count = (int)safe_r32(inc + OFF_INC_COUNT);
+    if (count < 1) return 0.0f;
+
+    float window = RATE_WINDOW;
+    float thr = safe_rf(base + RVA_WIN_THRESH);
+    if (!(window >= thr)) return 0.0f;
+
+    float tstep = safe_rf(base + RVA_TIME_STEP);
+    if (!(tstep >= 0.0f) || !(tstep <= 1e3f)) tstep = 0.001f;
+    float fudge = safe_rf(base + RVA_NEG_FUDGE);
+    float divc  = safe_rf(base + RVA_DIV_CONST);
+    if (!(divc > 0.0f) || !(divc <= 1e10f)) divc = 1.0f;
+
+    DWORD ctx  = g_ctx ? (DWORD)(DWORD_PTR)g_ctx : 0;
+    int   snap = ctx ? (int)safe_r32(ctx + OFF_CTX_SNAP) : 0;
+    int   cur  = (int)safe_r32(inc + OFF_INC_CUR);
+    int   prev = (int)safe_r32(inc + OFF_INC_PREV);
+    DWORD hist = (DWORD)(DWORD_PTR)safe_rptr(inc + OFF_INC_HIST);
+
+    DWORD ns = safe_r32(base + RVA_SLOT_COUNT);
+    if (ns == 0 || ns > MAX_SLOTS) ns = MAX_SLOTS;
+    if ((DWORD)slot >= ns) return 0.0f;
+
+    float acc = 0.0f;
+    float sum = 0.0f;
+    int   j   = count - 1;
+    int   guard = MAX_HIST;
+    while (j >= 0 && guard-- > 0 && acc < window) {
+        int v = (j == count - 1) ? (snap - prev) + cur : cur;
+        float f = (float)v;
+        if (v < 0) f += fudge;
+        acc += f * tstep;
+        if (hist != 0) {
+            DWORD cont = (DWORD)(DWORD_PTR)safe_rptr(hist + (DWORD)j * 4);
+            if (cont != 0) {
+                DWORD key = safe_r32(base + RVA_KEY_TABLE + (DWORD)slot * 4);
+                DWORD enc = safe_r32(cont + (DWORD)slot * 4);
+                DWORD dec = enc ^ key;
+                float fv = 0.0f;
+                memcpy(&fv, &dec, sizeof(fv));
+                sum += fv;
+            }
+        }
+        j--;
+    }
+    if (!(acc > 0.0f)) return 0.0f;
+    float rate = sum * (divc / acc);
+    if (!(rate <= 1e7f) || !(rate >= -1e7f)) rate = 0.0f;
+    return rate;
+}
+#endif
+
+/* ---- helper ---- */
+static int rnd_i(float x) {
+    return (x >= 0.0f) ? (int)(x + 0.5f) : (int)(x - 0.5f);
+}
+
+/* ---- observer ---- */
+void observer_sample(void) {
+    DWORD ctx   = g_ctx ? (DWORD)(DWORD_PTR)g_ctx : 0;
+    int   n     = ctx ? (int)safe_r32(ctx + OFF_CTX_PLAYERCNT) : 0;
+
+    /* match-start detection */
+    int match_start = ((s_last_ctx == 0) && (ctx != 0)) ||
+                      (g_obs_player != 0 && g_obs_player != s_last_player) ||
+                      (n != s_last_n);
+    if (match_start) {
+        dlog("--- match start n=%d player=%08X res=%08X ---",
+             n,
+             g_obs_player ? (unsigned)g_obs_player : 0u,
+             g_res ? (unsigned)(DWORD_PTR)g_res : 0u);
+        s_last_ctx = ctx;
+        s_last_player = g_obs_player;
+        s_last_n = n;
+        s_snap_have = 0;
+        s_tick = 0;
+        tracker_reset();
+    }
+
+    s_tick++;
+
+    if (g_res == NULL || g_inc == NULL) return;
+
+    DWORD rr = (DWORD)(DWORD_PTR)g_res;
+    float v[8];
+    for (int s = 0; s < 8; s++)
+        v[s] = decrypt_slot_at(rr, s);
+
+    /* feed rate engine */
+    tracker_sample((DWORD)s_tick, v, 8);
+
+    if (g_settings.debug_enabled) {
+        logger_debug("rates food=%.1f wood=%.1f coin=%.1f export=%.1f paused=%d",
+                     rate_get_ema(2), rate_get_ema(1), rate_get_ema(0),
+                     rate_get_ema(7), g_paused);
+    }
+
+    /* R13 output: one RES line per tick */
+    dlog("RES t=%d food=%d wood=%d coin=%d export=%d player=%08X res=%08X",
+         s_tick,
+         rnd_i(v[2]), rnd_i(v[1]), rnd_i(v[0]), rnd_i(v[7]),
+         g_obs_player ? (unsigned)g_obs_player : 0u,
+         (unsigned)rr);
+}

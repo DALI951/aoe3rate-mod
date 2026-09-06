@@ -1,135 +1,119 @@
-# PLAN: Rebuild AoE3 TAD resource-rate HUD mod (d3d9 proxy DLL) — full Ghidra decompile first
+# PLAN — AoE3 TAD Resource-Rate Mod (R14+)
 
-## Environment facts (VERIFIED)
+## 1. SUMMARY
 
-| Item | Status |
-|---|---|
-| `C:\Users\Dali\Documents\gaames\Age of Empires III - Complete Collection\age3y.exe` | EXISTS, **32-bit i386** (machine=0x14C) |
-| `redist\DirectX\Apr2005_d3dx9_25_x86.cab` | EXISTS (no `d3dx9_25.dll` in game dir yet) |
-| `expand.exe` | EXISTS (`C:\Windows\system32\expand.exe`) |
-| Ghidra 12.1.3 | `C:\Users\Dali\Documents\gaames\ghidra_12.1.3_PUBLIC\` with `support\analyzeHeadless.bat`, `Ghidra\Features\Decompiler\lib\Decompiler.jar` |
-| Python | **FOUND: `C:\Python314\python.exe` (3.14.6) + `C:\Windows\py.exe`** |
-| JDK 25 | `C:\Users\Dali\Tools\jdk-25.0.4+7\bin\java.exe` (Temurin 25.0.4 LTS) — verify launch works, fallback to JDK 17 on PATH if not |
-| x86 GCC | NONE installed → download `w64devkit-x86` (GitHub release asset, self-extracting 7z, needs `7zr.exe` for scripted extract) |
+Upgrade the R13 observer-only proxy (`d3d9.dll`) into the full resource-rate mod: a real rate engine computed from the verified decrypted stock slots, a native-looking in-game overlay, and reliable settings. **Key empirical finding from this investigation changes the settings architecture:** the classic engine's UI gadget events are dispatched by compiled C++ handlers (gadslider.cpp, gadcore.cpp in the exe string table) — a proxy DLL cannot receive XML click events. UI XML also lives **inside `.bar` archives** (ESPN v2), not as loose files. Therefore the **F9 DLL-drawn overlay panel + INI is the primary settings surface**; the "native options tab via XML override" is an **experimental, gate-verified stretch** (approach b from the task, clearly documented, droppable).
 
-**Chosen decompile route:** Java post-script via `analyzeHeadless -postScript` (no Python dependency). **Fallback:** PyGhidra headless (`support\pyghidraRun.bat`) using `C:\Python314\python.exe`.
+**Deliveries:** `d3d9.dll` (single artifact) + `ResourceRateMod.ini` (+ optional experimental loose `data\ui\options.xml`). Two-file delivery stays intact.
 
-**Dir layout:**
-- Workspace: `C:\Users\Dali\Documents\gaames\aoe3rate-mod\`
-- Ghidra project: `C:\Users\Dali\Documents\gaames\ghidra_proj\`
-- Decompiled output: `C:\Users\Dali\Documents\gaames\ghidra_proj\aoe3y_decompiled\<addr>_<name>.c` + `dump_all_functions.txt`
+## 2. CURRENT-STATE AUDIT (verified this session)
 
-## Step 1 — Ghidra headless import + full analysis + decompile dump
+**Repo** `C:\Users\dali\aoe3rate-mod` @ `07f5b4f` R13, clean. `d3d9.c` = 616 lines, observer-only, logs `RES t=... food/wood/coin/export player= res=`. Exports 11, imports KERNEL32/msvcrt only, 83,272 B, SHA256 `E6F79C46...DF6D0`.
 
-Set JAVA_HOME per command. Prefer JDK 25; if analyzeHeadless.bat fails on launch, retry with JDK 17.
+**Game install** (MOVED from `Documents\gaames\`): `C:\Users\dali\Documents\Age of Empires III - Complete Collection\`. `age3y.exe` = 11,598,648 B, PE ver `6.0108.0321.0137` (TAD 1.0.8), image base `0x400000`, i386. Bars: `DataP/DataPX/DataPY.bar` + `data\Data/Data2/Data3.bar`, `FONTS\Fonts.bar`. Loose `data\*.xml` + `*.xml.XMB` pairs exist (stringtable etc.) — engine loads loose virtual files (standard). `ui\eso\game3.ddt` only loose UI file.
 
-**1a. Import + full analysis** (working dir: `C:\Users\Dali\Documents\gaames`):
-```
-set "JAVA_HOME=C:\Users\Dali\Tools\jdk-25.0.4+7" && "C:\Users\Dali\Documents\gaames\ghidra_12.1.3_PUBLIC\support\analyzeHeadless.bat" "C:\Users\Dali\Documents\gaames\ghidra_proj" AoE3Y -import "C:\Users\Dali\Documents\gaames\Age of Empires III - Complete Collection\age3y.exe" -overwrite
-```
-Wait — the -import may take minutes; run with a generous timeout. If launch fails, retry with JDK 17.
+**UI XML system:** all UI XML lives **inside `.bar` archives** (magic `ESPN`, ver 2, `11 22 33 44`, UTF-16 name table). `Data.bar` holds `options.xml.xmb`, `uioptions.xml.xmb`, `uioptionsdlg.xml.xmb`, `uilayout.xml.xmb`, `uimain.xml.xmb`, ~300 `ui*.xml.xmb` screens, plus `uilayout.dtd`. `Data3.bar` holds UI content (no options). `DataPY.bar` holds **no** UI strings. So the TAD options screen ships from `Data.bar`. The engine expects compiled `.xmb` (binary XML) — editing requires recompile (engine regens XMB from XML if XML newer; this is the documented AoE3 modding workflow).
 
-**1b. Write the Java decompile-dump post-script** at `C:\Users\Dali\Documents\gaames\aoe3rate-mod\ghidra_scripts\DumpAllFunctions.java`:
-```java
-// DumpAllFunctions.java — no package; run with analyzeHeadless -postScript
-import ghidra.app.decompiler.DecompInterface;
-import ghidra.app.decompiler.DecompileResults;
-import ghidra.app.script.GhidraScript;
-import ghidra.program.model.listing.Function;
-import ghidra.program.model.listing.FunctionIterator;
-import java.io.File;
-import java.io.PrintWriter;
+**Settings persistence:** `Users\DefaultProfile3.xml` etc. contain `<GameSettings Name="GameOptions" Def="cDefGameOptions">` / `<Settings Version="53">` / `<Setting Name="...">value</Setting>`. Settings are a generic name→value map — the DLL can poll the active profile for mod keys, but **driving those keys from XML clicks is NOT possible** (handlers compiled in exe).
 
-public class DumpAllFunctions extends GhidraScript {
-    @Override public void run() throws Exception {
-        File outDir = new File("C:/Users/Dali/Documents/gaames/ghidra_proj/aoe3y_decompiled");
-        outDir.mkdirs();
-        DecompInterface ifc = new DecompInterface();
-        ifc.openProgram(currentProgram);
-        PrintWriter big = new PrintWriter(
-            new File("C:/Users/Dali/Documents/gaames/ghidra_proj/aoe3y_decompiled/dump_all_functions.txt"));
-        int i = 0;
-        for (FunctionIterator it = currentProgram.getFunctionManager().getFunctions(true);
-                it.hasNext(); ) {
-            Function f = it.next();
-            DecompileResults r = ifc.decompileFunction(f, 60, monitor);
-            String c = (r == null || !r.decompileCompleted())
-                ? "// DECOMPILE FAILED: " + f.getName()
-                : r.getDecompiledFunction().getC();
-            String fn = String.format("%08x_%s.c", f.getEntryPoint().getOffset(), sanitize(f.getName()));
-            PrintWriter w = new PrintWriter(new File(outDir, fn));
-            w.println("// Function: " + f.getName() + " @ 0x" + f.getEntryPoint().toString());
-            w.println(c); w.close();
-            big.println("=================== " + fn + " ===================");
-            big.println(c);
-            if (monitor.isCancelled()) break;
-            if ((++i % 100) == 0) println("decompiled " + i + " functions");
-        }
-        big.close(); ifc.disposeProgram(); ifc.dispose();
-        println("DONE " + i + " functions -> " + outDir);
-    }
-    static String sanitize(String n) { return n.replaceAll("[^A-Za-z0-9_.]", "_"); }
-}
-```
-If the harness rejects the static helper, inline the replaceAll. IMPORTANT: if the full dump takes too long (very large binaries), you MAY write a bounded variant that dumps only a targeted slice FIRST (see Step 2 addresses) so the build isn't blocked, and run the full dump in the background. Prioritize the targeted functions over completeness.
+**Exe evidence of compiled UI dispatch:** strings `OptionsScreen`, `GameUI`, `HotKeySetupScreen`, `.\gadslider.cpp`, `.\gadcore.cpp`, `.\gadlist.cpp`, `.\gadtextsimple.cpp`, `.\screen.cpp`, `.\gameui.cpp`, `Executing console file %s`, `developer.con`/`gamey.con`.
 
-**1c. Run the dump** (appends to the existing project, -noanalysis):
-```
-set "JAVA_HOME=C:\Users\Dali\Tools\jdk-25.0.4+7" && "C:\Users\Dali\Documents\gaames\ghidra_12.1.3_PUBLIC\support\analyzeHeadless.bat" "C:\Users\Dali\Documents\gaames\ghidra_proj" AoE3Y -process -noanalysis -postScript "C:\Users\Dali\Documents\gaames\aoe3rate-mod\ghidra_scripts\DumpAllFunctions.java"
-```
+**Verified memory chain (reuse, do NOT re-derive):**
+`game=*(base+0x866234)` → `ctx=*(game+0x13c)` → `n=*(ctx+0x5c)` → `players=*(ctx+0x58)` → `human=players[1]` (n≥2; else largest-food scan) → `stock=*(human+0x230)`. Decrypt `value[slot]=float(key_dword[slot]^res_dword[slot])`, key table VA `0xC6DF14` (8 keys), count `0xC6DF38`, XOR2 `0xC6DF10=0xFBCC4F02`. **Slots: food=2, wood=1, coin=0, export=7; slots 3–6 unknown.** Income object `[human+0x80]`: `+0x160/+0x164` signed ints = game's own rate bookkeeping (do NOT trust for rate; we compute our own from deltas). Tick source: game clock read at `RVA_TIME_STEP 0x0079A5C8` region; `t` already available in Present. Menu/loading state = `n==0`.
 
-**1d. FALLBACK — PyGhidra headless (only if 1c's script compile fails):**
-```
-set "JAVA_HOME=C:\Users\Dali\Tools\jdk-25.0.4+7" && C:\Users\Dali\Documents\gaames\ghidra_12.1.3_PUBLIC\support\pyghidraRun.bat "C:\Users\Dali\Documents\gaames\aoe3rate-mod\ghidra_scripts\dump_all_py.py"
-```
+**Decrypted assets for RE:** `C:\Users\dali\Documents\age of empires 3 decompiled\age3y_full_disasm.txt` (75 MB) + `resources-analysis.txt`.
 
-## Step 2 — Address-map verification checklist (fresh decompile WINS)
-Grep the dump for each known fact from prior session; if any address differs, the FRESH value wins and d3d9.c must use it. Record findings in `C:\Users\Dali\Documents\gaames\aoe3rate-mod\VERIFIED_ADDRESSES.md`:
-1. Function `0x44EFFF` (decrypt): confirm `*(float *)(arr + 4*slot)` XOR `key[slot]`, key read via `*(DWORD *)(0xC6DF14 + 4*slot)`.
-2. `0xC6DF14` contents == `28 48 AC 4F 94 F8 3A 35 8B D8 4C 3F AB 12 FB AF 20 B3 5B CA F9 AB C4 2A B1 A1 CF DA F2 E4 82 10`.
-3. Count `0xC6DF38` == 8; secondary key `0xC6DF10` value.
-4. Container: any function doing `mov eax, [0xDCB808]` then `[eax + 4*slot]`, and `0xDCB808` used in add/encrypt `0x49A859`? Confirm PLAYER_ARRAY-chain NOT needed. RVA = 0xDCB808 − 0x400000 = 0x9CB808.
-5. Rate fields at `0xDCB808+0x160/0x164/0x168` (floats), updated by `0x86DA39`, divided via `0xB856BC`.
-6. Helpers `0x49A859`, `0x4470DB`, `0x7E8171` → decrypted buffer `0xDCB360`.
-7. Slots → resource mapping (0/1/2=food/wood/coin, 7=export — confirm or mark UNCONFIRMED).
+**Toolchain (MOVED):** `C:\Users\dali\AppData\Local\Temp\opencode\w64devkit-x86\w64devkit\bin\i686-w64-mingw32-gcc.exe` (i686 GCC 16.2.0; re-extractor `w64devkit-x86-2.9.1.7z.exe` in same temp dir — re-extract if temp is cleaned). Python: `C:\Users\dali\AppData\Local\Programs\Python\Python312\python.exe`. All old `Documents\gaames\...` and `C:\Python314\...` references in README/BUILD.md/TEST.md/test_source_contract.py/test_pe_structure.py are **stale — update them**.
 
-## Step 3 — Write `d3d9.c` + `d3d9.def` (in `C:\Users\Dali\Documents\gaames\aoe3rate-mod\`)
-- `d3d9.c`: global `g_real = LoadLibraryA("d3d9.dll")` in DllMain; **no hard link deps** on d3dx9 — load `d3dx9_25.dll` at runtime via LoadLibraryA + GetProcAddress(`D3DXCreateFontA`); if missing, HUD draws nothing but all device calls still forward.
-- Hook: intercept `Direct3DCreate9` → call real → take the returned `IDirect3D9*` → get device via `CreateDevice` (call real vtable method) → patch the DEVICE vtable slot 17 (Present, offset 17*4) to our hook (page-protect + restore). Store original.
-- Present hook: call original Present first (return its HRESULT), then draw HUD if `g_font && g_res`.
-- **`locate_resources()`**: `void *base = GetModuleHandleA("age3y.exe"); g_res = base ? (void*)*(DWORD*)((BYTE*)base + 0x9CB808) : 0;` — guarded (SEH `__try`/`__except`) reads via `safe_r32`. DIRECT deref, NO PLAYER_ARRAY chain.
-- Decrypt: replicate the game's own decrypt (from `0x44EFFF`) exactly — value[slot] = float( key_dword[slot] ^ res_dword[slot] ), where key table at `base + (0xC6DF14 - 0x400000)`.
-- Rate fields: `rate = safe_r32(g_res + 0x160/0x164/0x168)` then `rate / (g_div ? g_div : 1.0f)` with `g_div = safe_r32(base + (0xB856BC - 0x400000))`.
-- HUD: `D3DXCreateFontA(device, 16, 8, FW_BOLD, 0, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH|FF_DONTCARE, "Arial", &g_font)`, draw 4 lines (+N/s food/wood/coin + export). Skip drawing when `g_res==0` (main menu).
-- Build must compile with **purely MSVC-compatible win32 types** if mingw headers lack d3d9 structs — prefer declaring the needed COM vtables manually (they're well-known) to avoid header dependency problems on mingw.
-- `d3d9.def`: forward ALL standard d3d9 exports (`Direct3DCreate9`, `Direct3DCreate9Ex`, `D3DPERF_*`, `DebugSetLevel`, `DebugSetMute`, `D3Dbg` if present) via `Name = d3d9.Name` forwarding, OR implement thin wrappers calling GetProcAddress(g_real, name). The game only strictly needs `Direct3DCreate9`. Choose whichever is simplest and robust — thin wrappers are safest.
+**Build cmd (proven):** prepend `bin` + `libexec\gcc\i686-w64-mingw32\16.2.0` to PATH (cc1), then:
+`i686-w64-mingw32-gcc.exe -shared -static-libgcc -O2 -o d3d9.dll d3d9.c d3d9.def -lwinmm`
 
-## Step 4 — Compile (32-bit) with w64devkit-x86
-Prereq: download & extract w64devkit-x86 (needs internet — verify; if `curl` unavailable use PowerShell `Invoke-WebRequest`):
-```
-# from C:\Users\Dali\Documents\gaames\
-curl -LO https://github.com/skeeto/w64devkit/releases/latest/download/w64devkit-x86.exe
-7zr x w64devkit-x86.exe -oC:\Users\Dali\Documents\gaames\w64devkit-x86
-```
-If 7zr.exe is missing, run the self-extracting exe non-interactively if it supports it, otherwise extract via `C:\Python314\python.exe` + py7zr if installable, or ask Dali to double-click it. Bin at `C:\Users\Dali\Documents\gaames\w64devkit-x86\bin\i686-w64-mingw32-gcc.exe`.
+**Imports will change from 2 → 3 DLLs:** add USER32 (`GetAsyncKeyState` for F9). Update all "imports = KERNEL32/msvcrt only" assertions.
 
-Build (working dir `C:\Users\Dali\Documents\gaames\aoe3rate-mod`):
-```
-C:\Users\Dali\Documents\gaames\w64devkit-x86\bin\i686-w64-mingw32-gcc.exe -shared -static-libgcc -O2 d3d9.c -o d3d9.dll d3d9.def -lwinmm 2>build_log.txt
-```
-(Drop `-ld3d9` if you hand-declare vtables — no import lib dependency.) Verify PE machine:
-```
-C:\Users\Dali\Documents\gaames\w64devkit-x86\bin\i686-w64-mingw32-objdump.exe -p d3d9.dll | findstr /c:"architecture"
-```
-Expect `i386` (32-bit).
+## 3. FILE-BY-FILE BUILD PLAN
 
-## Step 5 — Deploy
-```
-expand "C:\Users\Dali\Documents\gaames\Age of Empires III - Complete Collection\redist\DirectX\Apr2005_d3dx9_25_x86.cab" -F:d3dx9_25.dll "C:\Users\Dali\Documents\gaames\Age of Empires III - Complete Collection\"
-copy d3d9.dll "C:\Users\Dali\Documents\gaames\Age of Empires III - Complete Collection\"
-```
-Also copy build artifacts (d3d9.c, d3d9.def, VERIFIED_ADDRESSES.md, dump files) stay in workspace. The LIVE game test is Dali's step — do not launch the game.
+New modular layout (keeps single artifact `d3d9.dll`):
 
-## Step 6 — Test assertions the tester will defend (MANDATORY requirements — build must be structured so these are testable)
-1. HAPPY PATH — decrypt math: given the real key array `28 48 AC 4F 94 F8 3A 35 8B D8 4C 3F AB 12 FB AF 20 B3 5B CA F9 AB C4 2A B1 A1 CF DA F2 E4 82 10` and count 8: for each slot, `float D[s] = bits_as_float(bits(E[s] XOR K[s]))`. Provide a small self-contained unit (e.g. `decrypt_unit.c` with `decrypt_slot()` copied from d3d9.c's exact logic, plus a `test_decrypt.c` main, or a python equivalent in `test_decrypt.py`) so the tester can run a round-trip assertion `decrypt(encrypt(x)) == x` within finite range (0…1e6, no NaN/INF).
-2. EDGE CASE — `locate_resources()` NULL-safe: when `*(DWORD*)(base + 0x9CB808) == 0` or the page is unmapped, locate must set `g_res=NULL` and HUD-draw called right after must return immediately drawing nothing, no crash. Provide a `test_nullsafe.c` stub harness that sets g_res=NULL (and a fake base with a zero at the offset) and calls the HUD path.
+- `src/dllmain.c` — DllMain, `Direct3DCreate9`/`Ex` wrappers, device + chain init, Present hook, Reset hook, version-gate, module path detection (existing pattern at d3d9.c:73).
+- `src/hooks.c/.h` — vtable hook manager: install, resurrect, recovery on lost device.
+- `src/gameif.c/.h` — game-context walk, human selection, slot decrypt, idle/menu state (`n==0`), signature/version check.
+- `src/tracker.c/.h` — per-slot ring of `(tick, value)` samples; delta; spend-spike skip; EMA; 60s window, depth 1024, zero alloc/frame.
+- `src/rate.c/.h` — rates from tracker; sec/min ×60; game-time vs real-time.
+- `src/ui.c/.h` — overlay: font mgmt, panel layout, line drawing, F9 toggle, menu hide.
+- `src/settings.c/.h` — INI parse/write with defaults + atomic write; `ResourceRateMod.ini` next to DLL.
+- `src/logger.c/.h` — existing chain-log moved verbatim.
+- `build/build.bat` — PATH prepend, gcc, hash, Copy-Item deploy to game dir + `tests\d3d9.dll`, delete old `d3d9mod.log`.
+- `tools/extract_bar.py` — ESPN-v2 bar listing/extract (for the experimental XML path + future RE).
+- `config/` — INI schema doc.
+- `ResourceRateMod.ini.example`, updated `README.md`, `LICENSE` (add — public domain/MIT).
+- Keep `d3d9.def` 13 exports unchanged.
+
+## 4. DRAW LAYER PLAN (resurrect R3–R7 architecture)
+
+- Load **`d3dx9_25.dll`** at runtime (`LoadLibraryA`), `D3DXCreateFontA` for a serif/sans font (game style: ivory/gold on translucent dark, red accent only for hotkey/alert — per taste: no clutter). **Ship `d3dx9_25.dll` beside `d3d9.dll`** (deploy step); if it fails to load → overlay disabled gracefully, proxy keeps working.
+- ID3DXFont vtable: `12 Begin, 13 DrawTextA, 14 DrawTextW, 15 End, 16 OnLostDevice, 17 OnResetDevice`.
+- Draw **before** original `Present`. Explicit RT via `GetBackBuffer`+`SetRenderTarget`; save/restore render states (Z off, stencil off, ALPHABLEND `SRCALPHA`). `TestCooperativeLevel` guard. Hook `Reset` (slot 16) → invalidate font, recreate next frame. Keep `VirtualQuery` guards + `SetUnhandledExceptionFilter` (MinGW SEH breakage).
+- Panel: header "RESOURCES"/rate title, rows `Food / Wood / Coin / Export` + `+x.x/s` (or `/min`), optional unknown slots 3–6 shown-if-nonzero labelled `Slot5` etc.
+
+## 5. RATE ENGINE SPEC
+
+- Per slot ring of samples at configurable `sample_ms` (default 500, range 100–1000). Rate = `(value[cur]−value[prev])/elapsed`; integrate over window; report smoothed.
+- **EMA smoothing:** Low/Med/High → alpha ≈ 0.1/0.2/0.4 (configurable). Unit sec → min ×60.
+- **Gametime vs realtime:** default game-time (tick delta, immune to FPS jitter); realtime fallback via `QueryPerformanceCounter`; a tick that does not advance = pause → freeze rates (do not divide by zero, do not show drift).
+- **Spending/spike detection:** large negative delta vs current EMA by `[Rate] DiscontinuityRatio` (default ~3.0) → skip sample (freeze), then resume; **positive jumps (instant gains) counted** (documented behavior).
+- Slots 3–6: auto-detect at runtime; display only when nonzero, labelled generically; configurable to hide.
+- Zero per-frame allocations; all state static.
+
+## 6. SETTINGS / INI SPEC
+
+`ResourceRateMod.ini` next to DLL, UTF-8, robust parser ignoring unknown keys, defaults applied, atomic rewrite (write temp + replace). Sections:
+- `[General]` `Enabled=1`, `Hotkey=0x78` (F9), `StartHidden=0`.
+- `[Display]` `FontName=`, `FontSize=14`, `Opacity=0.85`, `PosX=12`, `PosY=12`, `ShowHeader=1`, `ShowSlots567=0`.
+- `[Rate]` `SampleMs=500`, `Smoothing=med`, `Unit=min`, `UseGameTime=1`, `DiscontinuityRatio=3.0`, `ShowGains=1`.
+- `[Debug]` `Enabled=0` → extended `d3d9mod.log`.
+
+**Settings architecture decision (the honest mechanism):**
+1. **Primary — F9 overlay panel (DLL-ownable, reliable).** Drawn in game style; toggles; edits write INI live. This is the real settings surface, matching the task's allowed fallback.
+2. **Experimental — native options tab (approach b).** Requires unpacking `options.xml` from `Data.bar`, adding a "Resource Rate Mod" section bound to `<Setting>` keys, shipping loose at the matching virtual path, deleting stale `.XMB`. **Gate:** Dali live-tests one change (see §8). If the engine rejects foreign controls/keys → **drop XML, ship F9 + INI only**, document why. DLL also polls the active `Users\DefaultProfile*.xml` for any mod `<Setting>` keys it can find (cheap mtime+parse), merging over INI defaults.
+3. DLL always writes its own INI regardless of which surface changed values.
+
+## 7. VERSION DETECTION + FAIL-SAFE
+
+- Locate module dir via `GetModuleFileNameA` (already used for log path). Target exe must be `age3y.exe` (or fall back to `age3.exe`/`age3x.exe` at same ABI).
+- Signature gate: file size = 11,598,648 B, PE ver `6.0108.0321.0137`, image base `0x400000`, i386, + verify game-context chain bytes on first tick.
+- On mismatch: overlay disabled, one-line log reason, proxy passthrough only — never crash the game. All derefs behind `VirtualQuery` guards (existing nullsafe pattern).
+
+## 8. TEST PLAN
+
+**Offline harness (auto, in `tests/`, reuse `test_d3d9_actual.c` fixture: SWARM_TEST include, `KEY_BYTES`, `set_encrypted_slot`, `putu`/`putf`):**
+- Steady production → EMA converges to delta; unit sec→min correct.
+- Spending spike (large negative) → skipped, no discontinuity jump; resume after.
+- Instant gain (positive jump) → counted per `ShowGains`.
+- Pause (tick repeats) → rate frozen, no div-by-zero.
+- Game-time vs realtime divergence test.
+- `n==0` menu state → overlay hidden, no crash.
+- Lost-device/Reset → hook+font recovery (nullsafe).
+- PE checks: i386, 13 exports, imports ⊆ {KERNEL32, msvcrt, USER32}; SHA256 recorded.
+- Version gate: correct sig passes; tampered size/ver → disabled + log reason.
+- INI: missing/partial/garbage file falls back to defaults; round-trip write.
+- Fix stale paths in `test_pe_structure.py` / `test_source_contract.py` / `TEST.md` (new game path, new toolchain, Python312).
+- Runner: `test_rate_engine.py` driving the C harness + `test_rate_engine.c`; all via Python312.
+
+**Dali live checklist (manual):** deploy → delete old log → launch; verify panel shows values matching HUD (food/wood/coin); F9 toggles; watch during a spending burst (rates freeze then resume); ESC/menu hides panel; alt-tab/lost device no crash; quit clean; optionally test the experimental options-tab XML gate: if the tab renders AND a changed `<Setting>` value appears in `DefaultProfile3.xml` → keep approach b; else drop it.
+
+## 9. BUILD/DEPLOY
+
+1. `build\build.bat` (PATH prepend w64devkit bin + `libexec\gcc\i686-w64-mingw32\16.2.0`; gcc command from §2; capture rc/warnings).
+2. Verify `pei-i386`, exports, import set, SHA256.
+3. `Copy-Item d3d9.dll` → game dir supersedes existing; copy `ResourceRateMod.ini.example` → `ResourceRateMod.ini`; copy `d3dx9_25.dll` (from DX Redist 9.0c) → game dir if absent; delete old `d3d9mod.log`.
+4. **Dali launches the game — NEVER launch the game from swarm tasks.**
+
+## 10. RISKS + HONEST LIMITS
+
+- **XML clicks cannot reach the DLL** (compiled handlers) → F9+INI is the real settings surface; native options tab is an experiment and may ship disabled/dropped. Do not promise "settings in the in-game menu" as guaranteed.
+- UI XML is bar-packed XMB; loose-override + XMB recompile is unverified → gate it live.
+- `d3dx9_25.dll` may be missing → ship it or graceful disable.
+- Unknown slots 3–6: shown-if-nonzero with honest labels, never asserted as specific resources.
+- New import (USER32) + draw code violate R13's "clean binary" guarantee — tests must be updated accordingly, and the min-size increase documented.
+- Tick/time source behavior during pause/ESC is engine-dependent → freeze logic + live check.
+- Tunables (DiscontinuityRatio, alphas) are heuristic defaults; calibrate from real logs.

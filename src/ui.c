@@ -1,0 +1,392 @@
+/* ui.c — D3DX9 overlay: resource-rate panel + F9 toggle + settings panel (R14)
+ *
+ * Resurrects the R3-R7 draw architecture, hardened:
+ *  - d3dx9_25.dll loaded at runtime; font via D3DXCreateFontA.
+ *  - ID3DXFont vtable: 12 Begin, 13 DrawTextA, 15 End, 16 OnLostDevice, 17 OnResetDevice.
+ *  - Draw BEFORE original Present (hooked in d3d9.c). Explicit backbuffer RT via
+ *    GetBackBuffer + SetRenderTarget; render states saved/restored.
+ *  - TestCooperativeLevel guard; Reset hook (slot 16) -> font invalidate/recreate.
+ *  - Crash-proof: every call null-guarded; overlay disabled gracefully if
+ *    d3dx9_25.dll or the font fails.
+ *  - Panel hidden in menus (n==0 => g_res==NULL) and frozen while paused
+ *    (tracker freezes). F9 toggles; keys 1-6 flip settings and write INI live.
+ */
+#include "state.h"
+
+#define UI_D3DCOLOR_ARGB(a,r,g,b) \
+    ((DWORD)((((a)&0xff)<<24)|(((r)&0xff)<<16)|(((g)&0xff)<<8)|((b)&0xff)))
+
+/* ---------- D3D9 device vtable slots ---------- */
+#define D9_TESTCOOPLEVEL  3
+#define D9_RESET          16
+#define D9_GETBACKBUFFER  18
+#define D9_BEGINSCENE     41
+#define D9_ENDSCENE       42
+#define D9_SETRENDERTARGET 37
+#define D9_GETRENDERTARGET 38
+#define D9_SETRENDERSTATE 57
+#define D9_GETRENDERSTATE 58
+#define D9_DRAWPRIMITIVEUP 83
+
+/* ---------- D3D render states / values ---------- */
+#define D3DRS_ZENABLE         7
+#define D3DRS_ZWRITEENABLE    14
+#define D3DRS_STENCILENABLE   52
+#define D3DRS_ALPHABLENDENABLE 27
+#define D3DRS_SRCBLEND        19
+#define D3DRS_DESTBLEND       20
+#define D3DRS_LIGHTING        137
+#define D3DBLEND_SRCALPHA     5
+#define D3DBLEND_INVSRCALPHA  6
+#define D3DBLEND_ONE          2
+#define D3DBLEND_ZERO         1
+
+/* ---------- D3DX font vtable slots ---------- */
+#define FONT_BEGIN        12
+#define FONT_DRAWTEXTA    13
+#define FONT_END          15
+#define FONT_ONLOSTDEVICE 16
+#define FONT_ONRESETDEVICE 17
+
+#define DT_LEFT   0x00000000
+#define DT_TOP    0x00000000
+#define DT_NOCLIP 0x00000100
+#define DT_CENTER 0x00000001
+
+#define D3DPT_TRIANGLESTRIP 5
+#define D3DFVF_XYZRHW_DIFFUSE 0x0044
+
+typedef int (STDMETHODCALLTYPE *VF_HR)(void *self);
+typedef int (STDMETHODCALLTYPE *VF_HRRESET)(void *self, const void *pp);
+typedef int (STDMETHODCALLTYPE *VF_GETSTATE)(void *self, DWORD state, DWORD *v);
+typedef int (STDMETHODCALLTYPE *VF_SETSTATE)(void *self, DWORD state, DWORD v);
+typedef int (STDMETHODCALLTYPE *VF_GETBB)(void *self, UINT idx, DWORD tp, void **out);
+typedef int (STDMETHODCALLTYPE *VF_GETRT)(void *self, DWORD idx, void **out);
+typedef int (STDMETHODCALLTYPE *VF_SETRT)(void *self, DWORD idx, void *surf);
+typedef int (STDMETHODCALLTYPE *VF_DRAWUP)(void *self, DWORD prim, DWORD count,
+        const void *data, DWORD stride);
+typedef int (STDMETHODCALLTYPE *VF_DRAWTEXT)(void *self, const char *text,
+        int count, void *rect, DWORD fmt, DWORD color);
+
+/* font vtable: Begin(12), DrawTextA(13), End(15), OnLost(16), OnReset(17) */
+
+static HMODULE g_d3dx = NULL;
+static void   *g_font = NULL;
+static int     g_ui_ready = 0;
+static int     g_ui_logged = 0;
+static unsigned short g_key_prev[8];
+
+typedef int (STDMETHODCALLTYPE *PFN_CREATEFONT)(void *dev, int h, UINT w, UINT wt,
+        UINT mip, int italic, DWORD charset, DWORD outprec, DWORD qual, DWORD pitch,
+        const char *face, void **out);
+
+static void ui_release_font(void) {
+    if (g_font != NULL) {
+        void **vt = *(void ***)g_font;
+        if (vt != NULL) {
+            VF_HR onlost = (VF_HR)vt[FONT_ONLOSTDEVICE];
+            if (onlost) onlost(g_font);
+            VF_HR rel = (VF_HR)vt[2];
+            if (rel) rel(g_font);
+        }
+        g_font = NULL;
+    }
+}
+
+void ui_init(void) {
+    g_key_prev[0] = g_key_prev[1] = g_key_prev[2] = g_key_prev[3] = 0;
+    g_key_prev[4] = g_key_prev[5] = g_key_prev[6] = g_key_prev[7] = 0;
+    g_d3dx = LoadLibraryA("d3dx9_25.dll");
+    g_ui_ready = (g_d3dx != NULL);
+    if (!g_ui_ready) {
+        dlog("UI disabled: d3dx9_25.dll not loadable");
+        return;
+    }
+    dlog("UI ready: d3dx9_25.dll loaded");
+}
+
+void ui_on_reset(void) {
+    if (g_font != NULL) {
+        void **vt = *(void ***)g_font;
+        if (vt != NULL) {
+            VF_HR onlost = (VF_HR)vt[FONT_ONLOSTDEVICE];
+            if (onlost) onlost(g_font);
+            VF_HR rel = (VF_HR)vt[2];
+            if (rel) rel(g_font);
+        }
+        g_font = NULL;
+    }
+    dlog("reset -> font invalidated");
+}
+
+static int ui_key_edge(int vk, int idx) {
+    unsigned short now = (unsigned short)((GetAsyncKeyState(vk) & 0x8000) ? 1 : 0);
+    int edge = (idx >= 0 && idx < 8) ? (now && !g_key_prev[idx]) : now;
+    if (idx >= 0 && idx < 8) g_key_prev[idx] = now;
+    return edge;
+}
+
+void ui_toggle_panel(void) {
+    g_panel_visible = !g_panel_visible;
+    dlog("panel %s", g_panel_visible ? "shown" : "hidden");
+}
+
+void ui_check_hotkey(void) {
+    if (!g_settings.enabled) return;
+    if (ui_key_edge(g_settings.hotkey, 6)) {
+        ui_toggle_panel();
+    }
+    if (!g_panel_visible) return;
+    /* in-game settings toggles — written back to the INI live */
+    int changed = 0;
+    if (ui_key_edge('1', 0)) { g_settings.show_header = !g_settings.show_header; changed = 1; }
+    if (ui_key_edge('2', 1)) { g_settings.show_slots_567 = !g_settings.show_slots_567; changed = 1; }
+    if (ui_key_edge('3', 2)) { g_settings.show_gains = !g_settings.show_gains; changed = 1; }
+    if (ui_key_edge('4', 3)) { g_settings.use_unit_min = !g_settings.use_unit_min; changed = 1; }
+    if (ui_key_edge('5', 4)) {
+        if (g_settings.sample_ms <= 100) g_settings.sample_ms = 250;
+        else if (g_settings.sample_ms < 500) g_settings.sample_ms = 500;
+        else if (g_settings.sample_ms < 1000) g_settings.sample_ms = 1000;
+        else g_settings.sample_ms = 100;
+        changed = 1;
+    }
+    if (ui_key_edge('6', 5)) {
+        if (g_settings.smoothing[0] == 'l')
+            lstrcpyA(g_settings.smoothing, "med");
+        else if (g_settings.smoothing[0] == 'm' || g_settings.smoothing[0] == '\0')
+            lstrcpyA(g_settings.smoothing, "high");
+        else
+            lstrcpyA(g_settings.smoothing, "low");
+        changed = 1;
+    }
+    if (changed) {
+        settings_save();
+        dlog("settings updated via hotkeys (saved)");
+    }
+}
+
+static void ui_draw_backdrop(void *dev, int x, int y, int w, int h, DWORD color) {
+    if (dev == NULL || w <= 0 || h <= 0) return;
+    void **vt = *(void ***)dev;
+    if (vt == NULL) return;
+    VF_DRAWUP du = (VF_DRAWUP)vt[D9_DRAWPRIMITIVEUP];
+    if (du == NULL) return;
+    struct { float x, y, z, rhw; DWORD c; } v[4];
+    float fx = (float)x, fy = (float)y;
+    float fw = (float)w, fh = (float)h;
+    v[0].x = fx;      v[0].y = fy;      v[0].z = 0.0f; v[0].rhw = 1.0f; v[0].c = color;
+    v[1].x = fx + fw; v[1].y = fy;      v[1].z = 0.0f; v[1].rhw = 1.0f; v[1].c = color;
+    v[2].x = fx;      v[2].y = fy + fh; v[2].z = 0.0f; v[2].rhw = 1.0f; v[2].c = color;
+    v[3].x = fx + fw; v[3].y = fy + fh; v[3].z = 0.0f; v[3].rhw = 1.0f; v[3].c = color;
+    du(dev, D3DPT_TRIANGLESTRIP, 2, v, (DWORD)(5 * sizeof(float)));
+}
+
+static void ui_font_draw(void *font, const char *s, int x, int y, DWORD color) {
+    if (font == NULL || s == NULL) return;
+    void **vt = *(void ***)font;
+    if (vt == NULL) return;
+    VF_DRAWTEXT dt = (VF_DRAWTEXT)vt[FONT_DRAWTEXTA];
+    if (dt == NULL) return;
+    RECT rc;
+    rc.left = x; rc.top = y; rc.right = x + 400; rc.bottom = y + 200;
+    dt(font, s, -1, &rc, DT_LEFT | DT_TOP | DT_NOCLIP, color);
+}
+
+static void ui_format_rate(char *out, size_t n, float rate) {
+    if (g_settings.use_unit_min) rate *= 60.0f;
+    if (rate >= 0.0f)
+        _snprintf(out, n, "+%.1f", rate);
+    else
+        _snprintf(out, n, "%+.1f", rate);
+}
+
+static void ui_draw_panel(void *dev) {
+    if (g_font == NULL) return;
+    void **vt = *(void ***)g_font;
+    if (vt == NULL) return;
+    VF_HR begin = (VF_HR)vt[FONT_BEGIN];
+    VF_HR end = (VF_HR)vt[FONT_END];
+    if (!begin || !end) return;
+
+    if (begin(g_font) < 0) return; /* Begin failed: skip entirely */
+
+    int fs = (g_settings.font_size >= 8 && g_settings.font_size <= 40)
+           ? g_settings.font_size : 14;
+    int row = fs + 5;
+    int px = g_settings.pos_x;
+    int py = g_settings.pos_y;
+
+    DWORD alpha = (DWORD)((g_settings.opacity * 255.0f) + 0.5f);
+    if (alpha > 255) alpha = 255;
+    DWORD panel_col = UI_D3DCOLOR_ARGB(alpha, 8, 10, 12);
+    DWORD header_col = UI_D3DCOLOR_ARGB(alpha, 0xE0, 0xC0, 0x80);
+    DWORD text_col = UI_D3DCOLOR_ARGB(alpha, 0xFF, 0xF3, 0xD6);
+    DWORD dim_col = UI_D3DCOLOR_ARGB(alpha, 0xA8, 0x90, 0x60);
+
+    char food[80], wood[80], coin[80], expo[80];
+    float rf = rate_get_ema(2), rw = rate_get_ema(1), rc = rate_get_ema(0), rx = rate_get_ema(7);
+    _snprintf(food, sizeof(food), "Food %8.0f", g_last_values[2]);
+    _snprintf(wood, sizeof(wood), "Wood %8.0f", g_last_values[1]);
+    _snprintf(coin, sizeof(coin), "Coin %8.0f", g_last_values[0]);
+    _snprintf(expo, sizeof(expo), "Export %8.0f", g_last_values[7]);
+
+    char rf_s[40], rw_s[40], rc_s[40], rx_s[40];
+    ui_format_rate(rf_s, sizeof(rf_s), rf);
+    ui_format_rate(rw_s, sizeof(rw_s), rw);
+    ui_format_rate(rc_s, sizeof(rc_s), rc);
+    ui_format_rate(rx_s, sizeof(rx_s), rx);
+    const char *un = rate_unit_label();
+
+    int lines = 4 + (g_settings.show_header ? 1 : 0) + (g_settings.show_slots_567 ? 4 : 0) + 1;
+    int pw = 250;
+    int ph = lines * row + 8;
+    ui_draw_backdrop(dev, px, py, pw, ph, panel_col);
+
+    int yy = py + 4;
+    if (g_settings.show_header) {
+        ui_font_draw(g_font, "RESOURCES", px + 8, yy, header_col);
+        yy += row;
+    }
+    char tmp[160];
+    _snprintf(tmp, sizeof(tmp), "%s  %s%s", food, rf_s, un);
+    ui_font_draw(g_font, tmp, px + 8, yy, text_col); yy += row;
+    _snprintf(tmp, sizeof(tmp), "%s  %s%s", wood, rw_s, un);
+    ui_font_draw(g_font, tmp, px + 8, yy, text_col); yy += row;
+    _snprintf(tmp, sizeof(tmp), "%s  %s%s", coin, rc_s, un);
+    ui_font_draw(g_font, tmp, px + 8, yy, text_col); yy += row;
+    _snprintf(tmp, sizeof(tmp), "%s  %s%s", expo, rx_s, un);
+    ui_font_draw(g_font, tmp, px + 8, yy, text_col); yy += row;
+
+    if (g_settings.show_slots_567) {
+        for (int s = 3; s <= 6; s++) {
+            float v = g_last_values[s];
+            if (v < 0.5f && v > -0.5f) continue; /* show-if-nonzero */
+            float r = rate_get_ema(s);
+            char vs[40], rs[40];
+            _snprintf(vs, sizeof(vs), "Slot%d %8.0f", s, v);
+            ui_format_rate(rs, sizeof(rs), r);
+            _snprintf(tmp, sizeof(tmp), "%s  %s%s", vs, rs, un);
+            ui_font_draw(g_font, tmp, px + 8, yy, dim_col);
+            yy += row;
+        }
+    }
+
+    /* settings hint line */
+    _snprintf(tmp, sizeof(tmp), "[%s] 1:header 2:slots 3:gains 4:%s 5:%dms 6:%s",
+              g_panel_visible ? "ON" : "OFF",
+              g_settings.use_unit_min ? "sec" : "min",
+              g_settings.sample_ms, g_settings.smoothing);
+    ui_font_draw(g_font, tmp, px + 8, yy, dim_col);
+
+    end(g_font);
+}
+
+static void ui_recreate_font(void *dev) {
+    if (g_font != NULL) return;
+    void **vt = *(void ***)dev;
+    if (vt == NULL) return;
+    PFN_CREATEFONT cf = (PFN_CREATEFONT)(DWORD_PTR)
+        GetProcAddress(g_d3dx, "D3DXCreateFontA");
+    if (cf == NULL) {
+        if (!g_ui_logged) { dlog("UI: D3DXCreateFontA missing"); g_ui_logged = 1; }
+        return;
+    }
+    const char *face = (g_settings.font_name[0] != '\0')
+                     ? g_settings.font_name : "Georgia";
+    int size = (g_settings.font_size >= 8 && g_settings.font_size <= 40)
+             ? g_settings.font_size : 14;
+    void *font = NULL;
+    int hr = cf(dev, -size, 0, 400, 1, 0, 0, 1, 0, 0, face, &font);
+    if (hr >= 0 && font != NULL) {
+        g_font = font;
+        if (!g_ui_logged) { dlog("UI: font created size=%d face=%s", size, face); g_ui_logged = 1; }
+    } else if (!g_ui_logged) {
+        dlog("UI: D3DXCreateFontA failed hr=%#010x", (unsigned)hr);
+        g_ui_logged = 1;
+    }
+}
+
+void ui_draw(void) {
+    if (!g_settings.enabled) return;
+    if (!g_version_ok) return;           /* version gate failed -> no overlay */
+    if (!g_panel_visible) return;
+    if (g_res == NULL) return;           /* menu/loading (n==0) -> no overlay */
+    if (g_device == NULL) return;
+    if (!g_ui_ready) return;             /* d3dx9_25.dll missing -> graceful */
+    void *dev = g_device;
+
+    void **vt = *(void ***)dev;
+    if (vt == NULL) return;
+
+    /* cooperative level guard */
+    VF_HR tcl = (VF_HR)vt[D9_TESTCOOPLEVEL];
+    if (tcl != NULL) {
+        int hr = tcl(dev);
+        DWORD uhr = (DWORD)(unsigned long)hr;
+        if (uhr == 0x88760868u) return;    /* D3DERR_DEVICELOST */
+        if (uhr == 0x88760869u) {          /* D3DERR_DEVICENOTRESET */
+            ui_release_font();
+            return;
+        }
+    }
+
+    ui_recreate_font(dev);
+    if (g_font == NULL) return;
+
+    /* explicit backbuffer render target + render-state save/restore */
+    void *bb = NULL, *prev_rt = NULL;
+    VF_GETBB gbb = (VF_GETBB)vt[D9_GETBACKBUFFER];
+    VF_SETRT srt = (VF_SETRT)vt[D9_SETRENDERTARGET];
+    VF_GETSTATE grs = (VF_GETSTATE)vt[D9_GETRENDERSTATE];
+    VF_SETSTATE srs = (VF_SETSTATE)vt[D9_SETRENDERSTATE];
+    VF_GETRT grt = (VF_GETRT)vt[D9_GETRENDERTARGET];
+    if (grt != NULL) grt(dev, 0, &prev_rt);
+    if (gbb != NULL) gbb(dev, 0, 0, &bb);
+    if (bb != NULL && srt != NULL) srt(dev, 0, bb);
+
+    DWORD st_z = 1, st_zw = 1, st_st = 0, st_ab = 0, st_sb = 0, st_db = 0, st_li = 1;
+    if (grs != NULL) {
+        grs(dev, D3DRS_ZENABLE, &st_z);
+        grs(dev, D3DRS_ZWRITEENABLE, &st_zw);
+        grs(dev, D3DRS_STENCILENABLE, &st_st);
+        grs(dev, D3DRS_ALPHABLENDENABLE, &st_ab);
+        grs(dev, D3DRS_SRCBLEND, &st_sb);
+        grs(dev, D3DRS_DESTBLEND, &st_db);
+        grs(dev, D3DRS_LIGHTING, &st_li);
+    }
+    if (srs != NULL) {
+        srs(dev, D3DRS_ZENABLE, 0);
+        srs(dev, D3DRS_ZWRITEENABLE, 0);
+        srs(dev, D3DRS_STENCILENABLE, 0);
+        srs(dev, D3DRS_ALPHABLENDENABLE, 1);
+        srs(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        srs(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        srs(dev, D3DRS_LIGHTING, 0);
+    }
+
+    VF_HR beg = (VF_HR)vt[D9_BEGINSCENE];
+    VF_HR end = (VF_HR)vt[D9_ENDSCENE];
+    if (beg != NULL && beg(dev) >= 0) {
+        ui_draw_panel(dev);
+        if (end != NULL) end(dev);
+    }
+
+    /* restore render states + RT */
+    if (srs != NULL) {
+        srs(dev, D3DRS_LIGHTING, st_li);
+        srs(dev, D3DRS_DESTBLEND, st_db);
+        srs(dev, D3DRS_SRCBLEND, st_sb);
+        srs(dev, D3DRS_ALPHABLENDENABLE, st_ab);
+        srs(dev, D3DRS_STENCILENABLE, st_st);
+        srs(dev, D3DRS_ZWRITEENABLE, st_zw);
+        srs(dev, D3DRS_ZENABLE, st_z);
+    }
+    if (srt != NULL && prev_rt != NULL) srt(dev, 0, prev_rt);
+    if (bb != NULL) {
+        void **svt = *(void ***)bb;
+        if (svt != NULL) {
+            VF_HR rel = (VF_HR)svt[2];
+            if (rel) rel(bb);
+        }
+    }
+}

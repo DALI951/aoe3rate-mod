@@ -1,0 +1,26 @@
+; AoE3 Resource Rate Mod configuration
+; Edit while the game is NOT running, or flip toggles via the F9 overlay panel.
+[General]
+Enabled=1
+Hotkey=0x78
+StartHidden=0
+
+[Display]
+FontName=
+FontSize=14
+Opacity=0.85
+PosX=12
+PosY=12
+ShowHeader=1
+ShowSlots567=0
+
+[Rate]
+SampleMs=500
+Smoothing=med
+Unit=min
+UseGameTime=1
+DiscontinuityRatio=3.0
+ShowGains=1
+
+[Debug]
+Enabled=0

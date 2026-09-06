@@ -1,0 +1,341 @@
+/*
+ * test_rate_engine.c — R14 rate-engine + settings + version-gate harness.
+ * Compiles the REAL d3d9.c (via SWARM_TEST include) and drives the actual
+ * production functions: tracker_sample(), rate_get_ema/raw/display(),
+ * settings_init/load/save(), ui_* no-crash, observer path, version gate.
+ *
+ * Rate engine rules under test (game-time default, 1 tick = 1 ms):
+ *   - first sample bootstraps (no fake rate), cadence honored (500 ms default)
+ *   - steady gain:  +1 / 500 ms  => EMA converges to 2.0/s (120.0/min)
+ *   - spending spike: inst < 0 and |inst| > EMA*3 => EMA frozen, baseline fresh
+ *   - instant gains counted (positive jumps move the EMA strongly)
+ *   - global pause: clock not advancing => g_paused, EMA untouched
+ *   - slot freeze: value frozen across a full interval => EMA frozen
+ *   - realtime mode (QPC): finite, sane values, no div-by-zero
+ *   - settings INI round-trip + garbage-file resilience
+ *   - version gate failure path (host exe is the test, not age3y)
+ *
+ * Build (from tests dir):
+ *   i686-w64-mingw32-gcc.exe test_rate_engine.c -o test_rate_engine.exe -luser32 -lwinmm
+ */
+#define SWARM_TEST
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+#include "..\d3d9.c"
+
+static int failures = 0;
+
+static void putu(DWORD a, DWORD v) { *(volatile DWORD *)a = v; }
+static void putf(DWORD a, float f) { DWORD b; memcpy(&b, &f, 4); putu(a, b); }
+
+static void delete_log(void) {
+    char path[MAX_PATH];
+    GetModuleFileNameA(NULL, path, MAX_PATH);
+    char *s = strrchr(path, '\\'); if (s) s[1] = '\0';
+    lstrcatA(path, "d3d9mod.log");
+    DeleteFileA(path);
+}
+
+#define CHECK(cond, msg) do { \
+    if (cond) printf("PASS: %s\n", msg); \
+    else { printf("FAIL: %s\n", msg); failures++; } \
+} while (0)
+
+#define FEQ(a, b) (fabsf((a) - (b)) < 1e-3f)
+
+static void set_vals(float a[8], float v0) {
+    for (int i = 0; i < 8; i++) a[i] = (i == 0) ? v0 : 0.0f;
+}
+
+/* ---- STEP 1: rate engine, game-time ---- */
+static void test_rate_game_time(void) {
+    g_settings.use_game_time = 1;
+    g_settings.use_unit_min = 1;
+    g_settings.sample_ms = (int)SAMPLE_MS_DEFAULT;
+    lstrcpyA(g_settings.smoothing, "med");
+    g_settings.discontinuity_ratio = 3.0f;
+    tracker_reset();
+
+    float a[8];
+    /* 1st sample: bootstrap, no rate yet */
+    s_tick = 500;   set_vals(a, 100.0f);   tracker_sample((DWORD)s_tick, a, 8);
+    CHECK(rate_get_ema(0) == 0.0f, "bootstrap sample sets no EMA");
+    CHECK(g_values_valid == 1, "values valid after first sample");
+
+    /* steady +1 per 500ms => 2.0/s */
+    s_tick = 1000;  set_vals(a, 101.0f);   tracker_sample((DWORD)s_tick, a, 8);
+    CHECK(FEQ(rate_get_ema(0), 2.0f), "steady +1/500ms => EMA 2.0/s");
+    CHECK(FEQ(rate_get_raw(0), 2.0f), "raw rate 2.0/s from ring");
+    CHECK(FEQ(rate_display(0), 120.0f), "display x60 => 120.0/min");
+
+    s_tick = 1500;  set_vals(a, 102.0f);   tracker_sample((DWORD)s_tick, a, 8);
+    CHECK(FEQ(rate_get_ema(0), 2.0f), "steady rate keeps EMA at 2.0/s");
+
+    /* cadence is honored: sub-interval frame must not sample */
+    s_tick = 1600;  set_vals(a, 102.0f);   tracker_sample((DWORD)s_tick, a, 8);
+    CHECK(FEQ(rate_get_ema(0), 2.0f), "sub-interval frame does not re-sample");
+
+    /* spending spike: -82 over 500ms => -164/s, |..| > 2*3 => EMA frozen */
+    s_tick = 2100;  set_vals(a, 20.0f);    tracker_sample((DWORD)s_tick, a, 8);
+    CHECK(FEQ(rate_get_ema(0), 2.0f), "spending spike freezes EMA (skip sample)");
+    /* ring baseline advances to the post-spike value; the next normal sample
+     * measures against it (this is why the resume raw comes out as 10.0/s) */
+
+    /* resume: +5 over 500ms => 10/s, EMA = 2 + 0.2*(10-2) = 3.6 */
+    s_tick = 2600;  set_vals(a, 25.0f);    tracker_sample((DWORD)s_tick, a, 8);
+    CHECK(FEQ(g_last_values[0], 25.0f), "post-spike values continue feeding overlay");
+    CHECK(FEQ(rate_get_ema(0), 3.6f), "resume: EMA = 2 + 0.2*(10-2) = 3.6");
+    CHECK(FEQ(rate_get_raw(0), 10.0f), "raw rate 10.0/s after resume");
+
+    /* instant gain: +975/500ms => 1950/s positive, counted (ShowGains) */
+    s_tick = 3100;  set_vals(a, 1000.0f);  tracker_sample((DWORD)s_tick, a, 8);
+    CHECK(rate_get_ema(0) > 100.0f, "instant gain counted (EMA jumps up)");
+
+    /* global pause: same tick again */
+    float e = rate_get_ema(0);
+    s_tick = 3100;  set_vals(a, 1001.0f);  tracker_sample((DWORD)s_tick, a, 8);
+    CHECK(g_paused == 1, "advancing nothing => paused");
+    CHECK(rate_get_ema(0) == e, "paused: EMA untouched");
+    s_tick = 3600;  set_vals(a, 1002.0f);  tracker_sample((DWORD)s_tick, a, 8);
+    CHECK(g_paused == 0, "unpause when clock advances again");
+
+    /* slot freeze: value identical across a full interval */
+    e = rate_get_ema(0);
+    s_tick = 4100;  set_vals(a, 1002.0f);  tracker_sample((DWORD)s_tick, a, 8);
+    CHECK(g_slot_frozen[0] == 1, "slot frozen when value flat across interval");
+    CHECK(rate_get_ema(0) == e, "flat value freezes EMA (no drift to zero)");
+    s_tick = 4600;  set_vals(a, 1003.0f);  tracker_sample((DWORD)s_tick, a, 8);
+    CHECK(g_slot_frozen[0] == 0, "slot unfreezes on next value change");
+}
+
+/* ---- STEP 2: realtime mode ---- */
+static void test_rate_realtime(void) {
+    g_settings.use_game_time = 0;
+    g_settings.sample_ms = 100; /* cadence min; sleeps below guarantee due */
+    tracker_reset();
+    float a[8];
+    float e0, e1, e2;
+    set_vals(a, 100.0f);  tracker_sample(1, a, 8);
+    Sleep(120);
+    set_vals(a, 101.0f);  tracker_sample(2, a, 8);
+    e0 = rate_get_ema(0);
+    Sleep(120);
+    set_vals(a, 102.0f);  tracker_sample(3, a, 8);
+    e1 = rate_get_ema(0);
+    CHECK(e0 > 0.0f && e0 < 1e5f && e1 == e1 && e1 < 1e5f,
+          "realtime mode: finite, sane rates (no div-by-zero)");
+    CHECK(g_values_valid == 1, "realtime mode: values valid");
+    Sleep(120);
+    e2 = e1;
+    set_vals(a, 102.0f);  tracker_sample(4, a, 8); /* flat => slot freeze */
+    CHECK(g_slot_frozen[0] == 1, "realtime mode: flat value freezes slot EMA");
+    CHECK(rate_get_ema(0) == e2, "realtime mode: frozen EMA untouched");
+    Sleep(120);
+    set_vals(a, 103.0f);  tracker_sample(5, a, 8);
+    CHECK(g_slot_frozen[0] == 0, "realtime mode: unfreeze on change");
+    g_settings.use_game_time = 1;
+    g_settings.sample_ms = (int)SAMPLE_MS_DEFAULT;
+}
+
+/* ---- STEP 3: settings INI round-trip ---- */
+static void test_settings_ini(void) {
+    char ini[MAX_PATH];
+    GetModuleFileNameA(NULL, ini, MAX_PATH);
+    char *s = strrchr(ini, '\\'); if (s) s[1] = '\0';
+    lstrcatA(ini, "ResourceRateMod.ini");
+    char tmp[MAX_PATH];
+    _snprintf(tmp, sizeof(tmp), "%s.tmp", ini);
+    DeleteFileA(ini);
+    DeleteFileA(tmp);
+
+    settings_init();
+    CHECK(g_settings.use_game_time == 1, "default: game-time clock");
+    CHECK(g_settings.sample_ms == (int)SAMPLE_MS_DEFAULT, "default: 500ms sample");
+    CHECK(g_settings.discontinuity_ratio == 3.0f, "default: discontinuity ratio 3.0");
+
+    lstrcpyA(g_settings.font_name, "Arial");
+    g_settings.font_size = 18;
+    g_settings.sample_ms = 900;
+    g_settings.opacity = 0.37f;
+    g_settings.pos_x = 3;
+    g_settings.pos_y = 9;
+    lstrcpyA(g_settings.smoothing, "high");
+    g_settings.use_unit_min = 0;
+    g_settings.show_slots_567 = 1;
+    g_settings.debug_enabled = 1;
+    settings_save();
+
+    /* clobber, then reload */
+    memset(&g_settings, 0, sizeof(g_settings));
+    lstrcpyA(g_settings.smoothing, "");
+    settings_load();
+    CHECK(strcmp(g_settings.font_name, "Arial") == 0, "INI round-trip: font_name");
+    CHECK(g_settings.font_size == 18, "INI round-trip: font_size");
+    CHECK(g_settings.sample_ms == 900, "INI round-trip: sample_ms");
+    CHECK(FEQ(g_settings.opacity, 0.37f), "INI round-trip: opacity");
+    CHECK(g_settings.pos_x == 3 && g_settings.pos_y == 9, "INI round-trip: pos");
+    CHECK(strcmp(g_settings.smoothing, "high") == 0, "INI round-trip: smoothing");
+    CHECK(g_settings.use_unit_min == 0, "INI round-trip: unit=sec");
+    CHECK(g_settings.use_game_time == 1, "INI round-trip: UseGameTime default kept");
+    CHECK(g_settings.show_slots_567 == 1 && g_settings.debug_enabled == 1,
+          "INI round-trip: slots567 + debug");
+    CHECK(g_settings.discontinuity_ratio == 3.0f, "INI round-trip: ratio default kept");
+
+    /* garbage file must not crash or corrupt */
+    FILE *f = fopen(ini, "wb");
+    fputs("garbage line\nno=[\nUn=broken", f);
+    fclose(f);
+    settings_load();
+    CHECK(g_settings.sample_ms == 900, "garbage contents ignored (no crash)");
+
+    DeleteFileA(ini);
+    DeleteFileA(tmp);
+}
+
+/* ---- STEP 4: version gate failure path (host is the test exe) ---- */
+static void test_version_gate(void) {
+    g_version_ok = 1;
+    version_gate_check();
+    CHECK(g_version_ok == 0, "version gate fails against the test exe (not age3y)");
+    CHECK(strstr(g_version_reason, "size") != NULL, "reason mentions exe size mismatch");
+
+    /* overlay fully disabled when the gate is closed: no crash even with
+     * garbage device pointers, because ui_draw returns before touching vt. */
+    g_settings.enabled = 1;
+    g_panel_visible = 1;
+    g_res = (void *)0x1;
+    g_device = (void *)0x1;
+    ui_draw();
+    CHECK(1, "ui_draw no-op on failed gate (graceful)");
+    g_device = NULL;
+    g_res = NULL;
+    g_version_ok = 1;
+}
+
+/* ---- STEP 5: observer + UI no-crash on menu (n==0) ---- */
+static const unsigned char KEY_BYTES[32] = {
+    0x28, 0x48, 0xAC, 0x4F, 0x94, 0xF8, 0x3A, 0x35,
+    0x8B, 0xD8, 0x4C, 0x3F, 0xAB, 0x12, 0xFB, 0xAF,
+    0x20, 0xB3, 0x5B, 0xCA, 0xF9, 0xAB, 0xC4, 0x2A,
+    0xB1, 0xA1, 0xCF, 0xDA, 0xF2, 0xE4, 0x82, 0x10,
+};
+#define MAX_RVA 0xA00000u
+
+static void set_encrypted_slot(DWORD res_base, int slot, float value,
+                               const unsigned char *keybytes) {
+    DWORD key = keybytes[slot*4+0] | (keybytes[slot*4+1]<<8)
+              | (keybytes[slot*4+2]<<16) | (keybytes[slot*4+3]<<24);
+    DWORD bits; memcpy(&bits, &value, 4);
+    *(volatile DWORD *)(res_base + slot*4) = key ^ bits;
+}
+
+static LPVOID make_fake_image(void) {
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    DWORD page = si.dwAllocationGranularity;
+    SIZE_T size = ((MAX_RVA + page - 1) / page) * page;
+    LPVOID p = VirtualAlloc(NULL, size, MEM_COMMIT, PAGE_READWRITE);
+    if (!p) return NULL;
+    memset(p, 0, (size_t)size);
+    DWORD b = (DWORD)(DWORD_PTR)p;
+    memcpy((BYTE*)p + (0xC6DF14 - 0x400000), KEY_BYTES, 32);
+    putu(b + (0xC6DF38 - 0x400000), 8);
+    putf(b + 0x79A5C8, 0.001f);
+    putf(b + 0x7A12E8, 1e-6f);
+    putf(b + 0x7A12FC, 4294967296.0f);
+    putf(b + 0x7856BC, 1.0f);
+    return p;
+}
+
+static void test_observer_menu(void) {
+    LPVOID img = make_fake_image();
+    if (!img) { printf("FAIL: alloc (menu)\n"); failures++; return; }
+    DWORD b = (DWORD)(DWORD_PTR)img;
+    DWORD game = b + 0x1000, ctx = b + 0x2000, players = b + 0x3000;
+    putu(b + RVA_GAME_PTR, game);
+    putu(game + OFF_GAME_CTX, ctx);
+    putu(ctx + OFF_CTX_PLAYERCNT, 0); /* n==0 => menu */
+    putu(ctx + OFF_CTX_PLAYERS, players);
+
+    delete_log();
+    g_res = g_inc = NULL;
+    locate_resources_at(img);
+    observer_sample();
+    CHECK(g_res == NULL, "menu (n==0): resources stay NULL");
+    CHECK(1, "observer no-crash in menu");
+    VirtualFree(img, 0, MEM_RELEASE);
+}
+
+static void test_observer_rates_line(void) {
+    LPVOID img = make_fake_image();
+    if (!img) { printf("FAIL: alloc (rates)\n"); failures++; return; }
+    DWORD b = (DWORD)(DWORD_PTR)img;
+    DWORD game = b + 0x1000, ctx = b + 0x2000, players = b + 0x3000;
+    putu(b + RVA_GAME_PTR, game);
+    putu(game + OFF_GAME_CTX, ctx);
+    putu(ctx + OFF_CTX_SNAP, 3000);
+    putu(ctx + OFF_CTX_PLAYERCNT, 2);
+    putu(ctx + OFF_CTX_PLAYERS, players);
+    for (int i = 0; i < 2; i++) {
+        DWORD p = b + 0x4000 + (DWORD)i * 0x1000;
+        putu(players + (DWORD)i * 4, p);
+        DWORD cont = p + 0x300, inc = p + 0x600;
+        set_encrypted_slot(cont, 2, (float)(100 + i * 200), KEY_BYTES); /* food */
+        set_encrypted_slot(cont, 0, (float)(50 + i * 50), KEY_BYTES);   /* coin  */
+        putu(p + OFF_PLAYER_RES, cont);
+        putu(p + OFF_PLAYER_INCOME, inc);
+        putu(inc + OFF_INC_CUR, 1); putu(inc + OFF_INC_PREV, 1);
+        putu(inc + OFF_INC_COUNT, 1);
+    }
+
+    delete_log();
+    g_res = g_inc = NULL;
+    locate_resources_at(img);
+    CHECK(g_res != NULL, "observer: full chain resolves player in game (n=2)");
+    g_settings.debug_enabled = 1;
+    observer_sample();
+    s_tick += 500; /* advance game time so the tracker samples */
+    observer_sample();
+    CHECK(1, "observer no-crash in game");
+    g_settings.debug_enabled = 0;
+    VirtualFree(img, 0, MEM_RELEASE);
+}
+
+/* ---- STEP 6: UI graceful-degrade guards ---- */
+static void test_ui_guards(void) {
+    g_settings.enabled = 1;
+    g_version_ok = 1;
+    g_panel_visible = 1;
+    g_device = NULL;
+    ui_draw();
+    CHECK(1, "ui_draw no-op with no device (no crash)");
+    ui_init(); /* d3dx9_25.dll may or may not load; must not crash */
+    ui_draw();
+    CHECK(1, "ui_draw after init no-op/graceful (no crash)");
+    ui_on_reset(); /* font NULL => no-op */
+    CHECK(1, "ui_on_reset with no font (no crash)");
+    g_settings.hotkey = 0x78; /* F9 — GetAsyncKeyState returns 0 headless */
+    ui_check_hotkey();
+    CHECK(g_panel_visible == 1, "hotkey check headless: no phantom toggle");
+}
+
+int main(void) {
+    tracker_init();
+    test_rate_game_time();
+    printf("---\n");
+    test_rate_realtime();
+    printf("---\n");
+    test_settings_ini();
+    printf("---\n");
+    test_version_gate();
+    printf("---\n");
+    test_observer_menu();
+    test_observer_rates_line();
+    printf("---\n");
+    test_ui_guards();
+    printf("\nFAILURES: %d\n", failures);
+    return failures ? 1 : 0;
+}

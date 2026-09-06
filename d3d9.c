@@ -1,13 +1,14 @@
 /*
  * d3d9.c — AoE3 TAD resource-rate HUD mod (d3d9 proxy DLL), 32-bit i386.
  *
- * ROUND 13: single-player observer. Human = player index 1 when n>=2 (fallback
- * to largest-food scan). Output: one RES line per Present tick for the chosen
- * player. Slot map: food=slot2, wood=slot1, coin=slot0, export=slot7 (empirical
- * proof from R12 live: HUD 530/100/130 vs logged food=530 wood=130 coin=100
- * proved slots 0 and 1 were SWAPPED in R12 labels). Zero rendering, zero device
- * state changes — pure read-only observer. KERNEL32+msvcrt only.
+ * R14: Full resource-rate mod. Single-file build entry that #includes all
+ * module .c files. Monolithic compilation for SWARM_TEST compatibility.
+ * Single artifact: d3d9.dll. Exports: Direct3DCreate9, Direct3DCreate9Ex,
+ * D3DPERF_*, DebugSet*.
  */
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,431 +18,79 @@
 
 typedef DWORD D3DCOLOR;
 
-/* ------------------------- addressing ------------------------------------ */
-#define RVA_GAME_PTR           0x00866234u
-#define OFF_GAME_CTX           0x13c
-#define OFF_GAME_ACTIVE_PLAYER 0x14c
-#define OFF_CTX_PLAYERS        0x58
-#define OFF_CTX_PLAYERCNT      0x5c
-#define OFF_PLAYER_RES         0x230
-#define OFF_PLAYER_RES_CAP     0x238
-#define OFF_PLAYER_RES_ADD     0x240
-#define OFF_PLAYER_INCOME      0x80
-#define RVA_KEY_TABLE     0x0086DF14u
-#define RVA_SLOT_COUNT    0x0086DF38u
-#define MAX_SLOTS         8u
+/* ---- include shared state ---- */
+#include "src/state.h"
 
-/* income object fields (SWARM_TEST: rate_for) */
-#define OFF_INC_CUR       0x160
-#define OFF_INC_PREV      0x164
-#define OFF_INC_HIST      0x168
-#define OFF_INC_COUNT     0x16c
-#define OFF_CTX_SNAP      0x108
-#define RVA_TIME_STEP     0x0079A5C8u
-#define RVA_NEG_FUDGE     0x007A12FCu
-#define RVA_WIN_THRESH    0x007A12E8u
-#define RVA_DIV_CONST     0x007856BCu
-#define RATE_WINDOW       60.0f
-#define MAX_HIST          1024u
+/* ---- global variable definitions ---- */
+HMODULE g_real   = NULL;
+void   *g_base   = NULL;
+void   *g_ctx    = NULL;
+void   *g_res    = NULL;
+void   *g_inc    = NULL;
+void   *g_device = NULL;
+void  **g_devvt  = NULL;
 
-/* ------------------------------ globals ---------------------------------- */
-static HMODULE g_real   = NULL;
-static void   *g_base   = NULL;
-static void   *g_ctx    = NULL;
-static void   *g_res    = NULL;
-static void   *g_inc    = NULL;
-static void   *g_device = NULL;
-static void  **g_devvt  = NULL;
+int   g_player_idx = -1;
+int   s_snap_have  = 0;
 
-static int   g_player_idx = -1;
-static int   s_snap_have = 0;
+DWORD g_obs_player = 0;
+DWORD s_last_ctx   = 0;
+DWORD s_last_player = 0;
+int   s_last_n     = -1;
+int   s_tick       = 0;
 
-static DWORD g_obs_player = 0;
-static DWORD s_last_ctx = 0;
-static DWORD s_last_player = 0;
-static int   s_last_n = -1;
-static int   s_tick = 0;
+volatile char g_step[64];
+FILE         *g_log       = NULL;
+LPTOP_LEVEL_EXCEPTION_FILTER s_prev_filter = NULL;
 
-/* --------------------------- diagnostic log ------------------------------- */
-static FILE *g_log = NULL;
+/* tracker state */
+SlotTracker g_tracker[MAX_SLOTS];
+DWORD g_last_sample_tick = 0;
+int   g_paused           = 0;
+float g_last_values[MAX_SLOTS];
+int   g_values_valid     = 0;
+float g_last_ema[MAX_SLOTS];
+int   g_slot_frozen[MAX_SLOTS];
 
-static void dlog(const char *fmt, ...) {
-    if (g_log == NULL) {
-        char path[MAX_PATH];
-        if (GetModuleFileNameA(NULL, path, MAX_PATH) != 0) {
-            char *slash = strrchr(path, '\\');
-            if (slash != NULL) { slash[1] = '\0'; lstrcatA(path, "d3d9mod.log"); }
-            else lstrcpyA(path, "d3d9mod.log");
-            g_log = fopen(path, "a");
-        }
-    }
-    if (g_log == NULL) return;
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
-    va_end(ap);
-    fputc('\n', g_log);
-    fflush(g_log);
-    fclose(g_log);
-    g_log = NULL;
-}
+/* settings state */
+ModSettings g_settings;
+int g_panel_visible = 1;
 
-/* ------------------------- crash catch ----------------------------------- */
-static volatile char g_step[64];
-static LPTOP_LEVEL_EXCEPTION_FILTER s_prev_filter = NULL;
+/* version gate state */
+int  g_version_ok = 0;
+char g_version_reason[128] = "";
 
-static void set_step(const char *s) {
-    size_t n = (s != NULL) ? strlen(s) : 0;
-    if (n >= sizeof(g_step)) n = sizeof(g_step) - 1;
-    memcpy((void *)g_step, (s != NULL) ? s : "", n);
-    g_step[n] = '\0';
-}
+/* ---- include modules ---- */
+#include "src/logger.c"
+#include "src/tracker.c"
+#include "src/rate.c"
+#include "src/gameif.c"
+#include "src/settings.c"
+#include "src/ui.c"
 
-static long WINAPI fault_filter(struct _EXCEPTION_POINTERS *ep) {
-    DWORD addr = 0, code = 0;
-    if (ep != NULL && ep->ExceptionRecord != NULL) {
-        addr = (DWORD)(DWORD_PTR)ep->ExceptionRecord->ExceptionAddress;
-        code = ep->ExceptionRecord->ExceptionCode;
-    }
-    dlog("FAULT addr=%08X breadcrumb=%s code=%08X",
-         (unsigned)addr, (const char *)g_step, (unsigned)code);
-    ExitProcess(0);
-    return EXCEPTION_CONTINUE_SEARCH;
-}
+/* ========================= D3D9 wrapper ========================= */
+static int patch_device_present(void *dev);
 
-/* ------------------------- guarded reads --------------------------------- */
-static BOOL page_readable(DWORD addr) {
-    MEMORY_BASIC_INFORMATION mbi;
-    if (addr == 0) return FALSE;
-    if (VirtualQuery((LPCVOID)(DWORD_PTR)addr, &mbi, sizeof(mbi)) != sizeof(mbi))
-        return FALSE;
-    if (mbi.State != MEM_COMMIT) return FALSE;
-    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return FALSE;
-    switch (mbi.Protect & 0xFF) {
-        case PAGE_READONLY: case PAGE_READWRITE: case PAGE_WRITECOPY:
-        case PAGE_EXECUTE: case PAGE_EXECUTE_READ: case PAGE_EXECUTE_READWRITE:
-        case PAGE_EXECUTE_WRITECOPY:
-            return TRUE;
-        default:
-            return FALSE;
-    }
-}
-static BOOL read32(DWORD addr, DWORD *out) {
-    if (addr == 0) return FALSE;
-    if (!page_readable(addr)) return FALSE;
-    *out = *(volatile DWORD *)(DWORD_PTR)addr;
-    return TRUE;
-}
-static DWORD safe_r32(DWORD addr) { DWORD v = 0; read32(addr, &v); return v; }
-#ifdef SWARM_TEST
-static float safe_rf(DWORD addr)  { DWORD v = 0; read32(addr, &v); return *(float *)&v; }
-static void *safe_rptr(DWORD addr){ DWORD v = 0; if (!read32(addr, &v)) return NULL;
-                                    return (void *)v; }
-#endif
+struct d3d9w { void **vt; void *real; };
+typedef struct d3d9w D3D9W;
+static D3D9W g_wrapper_obj;
+static D3D9W *g_wrapper = NULL;
 
-/* --------------------------- decrypt ------------------------------------- */
-static float decrypt_slot_at(DWORD rbase, int slot) {
-    DWORD base  = g_base ? (DWORD)(DWORD_PTR)g_base : 0;
-    DWORD count = base ? safe_r32(base + RVA_SLOT_COUNT) : 0;
-    if (count == 0 || count > MAX_SLOTS) count = MAX_SLOTS;
-    if (base == 0 || rbase == 0 || slot < 0 || (DWORD)slot >= count) return 0.0f;
-    DWORD key = safe_r32(base + RVA_KEY_TABLE + (DWORD)slot * 4);
-    DWORD enc = safe_r32(rbase + (DWORD)slot * 4);
-    DWORD dec = enc ^ key;
-    return *(float *)&dec;
-}
-#ifdef SWARM_TEST
-static float decrypt_slot(int slot) {
-    return decrypt_slot_at(g_res ? (DWORD)(DWORD_PTR)g_res : 0, slot);
-}
-#endif
-
-/* ------------------------- chain log (compact) --------------------------- */
-static unsigned long g_chain_calls = 0;
-static DWORD g_last_c[3];
-static char  g_last_tag[128];
-
-static void dlog_chain(DWORD game, DWORD ctx, int n,
-                       DWORD player, DWORD res, DWORD inc,
-                       const char *tag) {
-    DWORD cur[3] = { player, res, inc };
-    int first = (g_chain_calls == 0);
-    g_chain_calls++;
-    int changed = first;
-    if (!changed) {
-        for (int i = 0; i < 3; i++)
-            if (cur[i] != g_last_c[i]) { changed = 1; break; }
-        const char *curtag = tag ? tag : "";
-        if ((tag != NULL) != (g_last_tag[0] != '\0')) changed = 1;
-        else if (strcmp(curtag, g_last_tag) != 0) changed = 1;
-    }
-    if (g_chain_calls > 5 && !changed) return;
-    memcpy(g_last_c, cur, sizeof(cur));
-    g_last_tag[0] = '\0';
-    if (tag != NULL) strncpy(g_last_tag, tag, sizeof(g_last_tag) - 1);
-    dlog("chain game=%08X ctx=%08X n=%d player=%08X res=%08X inc=%08X%s%s",
-         (unsigned)game, (unsigned)ctx, n,
-         (unsigned)player, (unsigned)res, (unsigned)inc,
-         tag ? " " : "", tag ? tag : "");
-}
-
-/* ------------------------- resource location ------------------------------ */
-/* R13: human = player index 1 when n>=2 (confirmed by R12 live analysis:
- * index 1 gathered food 0->530 across two matches while index 2 = AI
- * trickled 0->55). Fallback: scan all players, pick the one with the
- * largest decrypted food (slot 2). If no valid player found, log zeros. */
-static void locate_resources_impl(void) {
-    g_res = NULL;
-    g_inc = NULL;
-    g_ctx = NULL;
-    g_player_idx = -1;
-    g_obs_player = 0;
-    if (g_base == NULL) return;
-    DWORD base     = (DWORD)(DWORD_PTR)g_base;
-    DWORD game     = safe_r32(base + RVA_GAME_PTR);
-    DWORD ctx = 0, arr = 0, player = 0, res = 0, inc = 0;
-    int   n = 0;
-
-    if (game == 0) { dlog_chain(0, 0, 0, 0, 0, 0, "[chain-break: game==0]"); return; }
-    ctx = safe_r32(game + OFF_GAME_CTX);
-    if (ctx == 0) { dlog_chain(game, 0, 0, 0, 0, 0, "[chain-break: ctx==0]"); return; }
-    g_ctx = (void *)ctx;
-    n   = (int)safe_r32(ctx + OFF_CTX_PLAYERCNT);
-    arr = safe_r32(ctx + OFF_CTX_PLAYERS);
-    if (n <= 0) { dlog_chain(game, ctx, n, 0, 0, 0, "[chain-break: n<=0]"); return; }
-    if (arr == 0) { dlog_chain(game, ctx, n, 0, 0, 0, "[chain-break: arr==0]"); return; }
-
-    /* primary: human = index 1 when n >= 2 */
-    if (n >= 2) {
-        DWORD p1 = safe_r32(arr + 1 * 4);
-        if (p1 != 0) {
-            DWORD r1 = safe_r32(p1 + OFF_PLAYER_RES);
-            DWORD i1 = safe_r32(p1 + OFF_PLAYER_INCOME);
-            if (r1 != 0 && i1 != 0) {
-                g_res = (void *)r1;
-                g_inc = (void *)i1;
-                g_player_idx = 1;
-                g_obs_player = p1;
-                dlog_chain(game, ctx, n, p1, r1, i1, "[human-p1]");
-                return;
-            }
-        }
-    }
-
-    /* fallback: scan all players, pick largest decrypted food (slot 2) */
-    {
-        int pick_i = -1;
-        DWORD pick = 0, pick_r = 0, pick_i2 = 0;
-        float best_food = -1.0f;
-        for (int i = 0; i < n; i++) {
-            DWORD p = safe_r32(arr + (DWORD)i * 4);
-            if (p == 0) continue;
-            DWORD r = safe_r32(p + OFF_PLAYER_RES);
-            DWORD ic = safe_r32(p + OFF_PLAYER_INCOME);
-            if (r == 0 || ic == 0) continue;
-            float food = decrypt_slot_at(r, 2);
-            if (food > best_food) {
-                best_food = food;
-                pick = p; pick_i = i;
-                pick_r = r; pick_i2 = ic;
-            }
-        }
-        if (pick != 0) {
-            g_res = (void *)pick_r;
-            g_inc = (void *)pick_i2;
-            g_player_idx = pick_i;
-            g_obs_player = pick;
-            char tag[80];
-            _snprintf(tag, sizeof(tag), "[fallback: player#%d food=%.0f]", pick_i, best_food);
-            dlog_chain(game, ctx, n, pick, pick_r, pick_i2, tag);
-            return;
-        }
-    }
-    dlog_chain(game, ctx, n, 0, 0, 0, "[chain-break: no sane player]");
-}
-
-static void locate_resources(void) {
-    g_base = (void *)GetModuleHandleA("age3y.exe");
-    locate_resources_impl();
-}
-
-#ifdef SWARM_TEST
-static void locate_resources_at(void *base) {
-    g_base = base;
-    locate_resources_impl();
-}
-#endif
-
-/* ----------------------- rate fields (SWARM_TEST only) ------------------- */
-#ifdef SWARM_TEST
-static float rate_for(int slot) {
-    DWORD base = g_base ? (DWORD)(DWORD_PTR)g_base : 0;
-    if (base == 0 || slot < 0 || (DWORD)slot >= MAX_SLOTS) return 0.0f;
-    DWORD inc = g_inc ? (DWORD)(DWORD_PTR)g_inc : 0;
-    if (inc == 0) return 0.0f;
-
-    int count = (int)safe_r32(inc + OFF_INC_COUNT);
-    if (count < 1) return 0.0f;
-
-    float window = RATE_WINDOW;
-    float thr = safe_rf(base + RVA_WIN_THRESH);
-    if (!(window >= thr)) return 0.0f;
-
-    float tstep = safe_rf(base + RVA_TIME_STEP);
-    if (!(tstep >= 0.0f) || !(tstep <= 1e3f)) tstep = 0.001f;
-    float fudge = safe_rf(base + RVA_NEG_FUDGE);
-    float divc  = safe_rf(base + RVA_DIV_CONST);
-    if (!(divc > 0.0f) || !(divc <= 1e10f)) divc = 1.0f;
-
-    DWORD ctx  = g_ctx ? (DWORD)(DWORD_PTR)g_ctx : 0;
-    int   snap = ctx ? (int)safe_r32(ctx + OFF_CTX_SNAP) : 0;
-    int   cur  = (int)safe_r32(inc + OFF_INC_CUR);
-    int   prev = (int)safe_r32(inc + OFF_INC_PREV);
-    DWORD hist = (DWORD)(DWORD_PTR)safe_rptr(inc + OFF_INC_HIST);
-
-    DWORD ns = safe_r32(base + RVA_SLOT_COUNT);
-    if (ns == 0 || ns > MAX_SLOTS) ns = MAX_SLOTS;
-    if ((DWORD)slot >= ns) return 0.0f;
-
-    float acc = 0.0f;
-    float sum = 0.0f;
-    int   j   = count - 1;
-    int   guard = MAX_HIST;
-    while (j >= 0 && guard-- > 0 && acc < window) {
-        int v = (j == count - 1) ? (snap - prev) + cur : cur;
-        float f = (float)v;
-        if (v < 0) f += fudge;
-        acc += f * tstep;
-        if (hist != 0) {
-            DWORD cont = (DWORD)(DWORD_PTR)safe_rptr(hist + (DWORD)j * 4);
-            if (cont != 0) {
-                DWORD key = safe_r32(base + RVA_KEY_TABLE + (DWORD)slot * 4);
-                DWORD enc = safe_r32(cont + (DWORD)slot * 4);
-                DWORD dec = enc ^ key;
-                sum += *(float *)&dec;
-            }
-        }
-        j--;
-    }
-    if (!(acc > 0.0f)) return 0.0f;
-    float rate = sum * (divc / acc);
-    if (!(rate <= 1e7f) || !(rate >= -1e7f)) rate = 0.0f;
-    return rate;
-}
-#endif
-
-/* ----------------------------- observer ---------------------------------- */
-static int rnd_i(float x) {
-    return (x >= 0.0f) ? (int)(x + 0.5f) : (int)(x - 0.5f);
-}
-
-static void observer_sample(void) {
-    DWORD base  = g_base ? (DWORD)(DWORD_PTR)g_base : 0;
-    DWORD game  = base ? safe_r32(base + RVA_GAME_PTR) : 0;
-    DWORD ctx   = g_ctx ? (DWORD)(DWORD_PTR)g_ctx : 0;
-    int   n     = ctx ? (int)safe_r32(ctx + OFF_CTX_PLAYERCNT) : 0;
-
-    /* match-start detection: ctx 0->non-0, player change, or n change */
-    int match_start = ((s_last_ctx == 0) && (ctx != 0)) ||
-                      (g_obs_player != 0 && g_obs_player != s_last_player) ||
-                      (n != s_last_n);
-    if (match_start) {
-        dlog("--- match start n=%d player=%08X res=%08X ---",
-             n,
-             g_obs_player ? (unsigned)g_obs_player : 0u,
-             g_res ? (unsigned)(DWORD_PTR)g_res : 0u);
-        s_last_ctx = ctx;
-        s_last_player = g_obs_player;
-        s_last_n = n;
-        s_snap_have = 0;
-        s_tick = 0;
-    }
-
-    s_tick++;
-
-    if (g_res == NULL || g_inc == NULL) return;
-
-    DWORD rr = (DWORD)(DWORD_PTR)g_res;
-    float v[8];
-    for (int s = 0; s < 8; s++)
-        v[s] = decrypt_slot_at(rr, s);
-
-    /* R13 output: one RES line per tick for the chosen human player.
-     * Slot map: food=slot2, wood=slot1, coin=slot0, export=slot7 */
-    dlog("RES t=%d food=%d wood=%d coin=%d export=%d player=%08X res=%08X",
-         s_tick,
-         rnd_i(v[2]), rnd_i(v[1]), rnd_i(v[0]), rnd_i(v[7]),
-         g_obs_player ? (unsigned)g_obs_player : 0u,
-         (unsigned)rr);
-}
-
-/* -------------------------- device vtable hook ---------------------------- */
 typedef int  (STDMETHODCALLTYPE *PRESENT_FN)(void *self, const RECT *a,
         const RECT *b, HWND hwnd, const void *dirty);
 typedef int  (STDMETHODCALLTYPE *DEV_RESET)(void *, const void *);
 static PRESENT_FN s_orig_present = NULL;
 static DEV_RESET   s_orig_reset   = NULL;
-static int patch_device_present(void *dev);
 
-static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
-    g_device = self;
-    int hr = (s_orig_reset != NULL) ? s_orig_reset(self, pp) : (int)0x8876086c;
-    patch_device_present(self);
-    return hr;
-}
+/* (patch_device_present forward-declared above) */
 
+static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp);
 static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT *b,
-        HWND hwnd, const void *dirty) {
-    g_device = self;
-    locate_resources();
-    set_step("observer-sample");
-    observer_sample();
-    set_step("present-before");
-    int hr = (s_orig_present != NULL)
-        ? s_orig_present(self, a, b, hwnd, dirty)
-        : (int)0x8876086c;
-    set_step("present-after");
-    return hr;
-}
-
-static int patch_device_present(void *dev) {
-    if (dev == NULL) return 0;
-    void **vt = *(void ***)dev;
-    if (vt == NULL) return 0;
-    if (g_devvt != vt) {
-        DWORD old = 0;
-        if (s_orig_present == NULL) {
-            DWORD slot = (DWORD)(DWORD_PTR)&vt[17];
-            VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
-            s_orig_present = (PRESENT_FN)vt[17];
-            vt[17] = (void *)present_hook;
-            VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
-        }
-        if (s_orig_reset == NULL) {
-            DWORD slot = (DWORD)(DWORD_PTR)&vt[16];
-            VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
-            s_orig_reset = (DEV_RESET)vt[16];
-            vt[16] = (void *)reset_hook;
-            VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
-        }
-        g_devvt = vt;
-    }
-    return (g_devvt == vt && s_orig_present != NULL);
-}
-
-/* ------------------------ IDirect3D9 COM wrapper --------------------------- */
-struct d3d9w {
-    void **vt;
-    void  *real;
-};
-typedef struct d3d9w D3D9W;
-static D3D9W g_wrapper_obj;
-static D3D9W *g_wrapper = NULL;
+        HWND hwnd, const void *dirty);
 
 static int  STDMETHODCALLTYPE w_query_interface(void *self, const void *iid, void **p);
 static unsigned long STDMETHODCALLTYPE w_add_ref(void *self);
 static unsigned long STDMETHODCALLTYPE w_release(void *self);
-
 static int  STDMETHODCALLTYPE w_reg_swdev(void *self, void *fn) {
     return ((int (STDMETHODCALLTYPE *)(void *, void *))
         ((void ***)((D3D9W *)self)->real)[0][3])(((D3D9W *)self)->real, fn);
@@ -503,8 +152,6 @@ static int STDMETHODCALLTYPE w_create_device(void *self, UINT adapter, UINT type
         int patched = patch_device_present(*ppdev);
         dlog("CreateDevice hr=%#010x dev=%p patched=%s",
              (unsigned)hr, *ppdev, patched ? "yes" : "no");
-    } else if (hr >= 0) {
-        dlog("CreateDevice hr=%#010x dev=<NULL>", (unsigned)hr);
     }
     return hr;
 }
@@ -512,7 +159,7 @@ static int STDMETHODCALLTYPE w_create_device_ex(void *self, UINT adapter, UINT t
         HWND focus, DWORD flags, void *pparams, void *pfs, void **ppdev) {
     D3D9W *w = (D3D9W *)self;
     int hr = ((int (STDMETHODCALLTYPE *)(void *, UINT, UINT, HWND, DWORD, void *, void *, void **))
-        ((void ***)w->real)[0][17])    (w->real, adapter, type, focus, flags, pparams, pfs, ppdev);
+        ((void ***)w->real)[0][17])(w->real, adapter, type, focus, flags, pparams, pfs, ppdev);
     if (hr >= 0 && ppdev != NULL && *ppdev != NULL) {
         int patched = patch_device_present(*ppdev);
         dlog("CreateDeviceEx hr=%#010x dev=%p patched=%s",
@@ -556,7 +203,148 @@ static D3D9W *wrap_d3d9(void *real) {
     return g_wrapper;
 }
 
-/* ------------------------ Direct3DCreate9 exports -------------------------- */
+/* ========================= device hook ========================= */
+
+static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
+    g_device = self;
+    set_step("reset-hook");
+    ui_on_reset();
+    int hr = (s_orig_reset != NULL) ? s_orig_reset(self, pp) : (int)0x8876086c;
+    patch_device_present(self);
+    set_step("reset-done");
+    return hr;
+}
+
+static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT *b,
+        HWND hwnd, const void *dirty) {
+    g_device = self;
+    set_step("locate");
+    locate_resources();
+
+    set_step("observer-sample");
+    observer_sample();
+
+    set_step("hotkey");
+    ui_check_hotkey();
+
+    set_step("draw-overlay");
+    ui_draw();
+
+    set_step("present-before");
+    int hr = (s_orig_present != NULL)
+        ? s_orig_present(self, a, b, hwnd, dirty)
+        : (int)0x8876086c;
+    set_step("present-after");
+    return hr;
+}
+
+static int patch_device_present(void *dev) {
+    if (dev == NULL) return 0;
+    void **vt = *(void ***)dev;
+    if (vt == NULL) return 0;
+    if (g_devvt != vt) {
+        DWORD old = 0;
+        if (s_orig_present == NULL) {
+            DWORD slot = (DWORD)(DWORD_PTR)&vt[17];
+            VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
+            s_orig_present = (PRESENT_FN)vt[17];
+            vt[17] = (void *)present_hook;
+            VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
+        }
+        if (s_orig_reset == NULL) {
+            DWORD slot = (DWORD)(DWORD_PTR)&vt[16];
+            VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
+            s_orig_reset = (DEV_RESET)vt[16];
+            vt[16] = (void *)reset_hook;
+            VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
+        }
+        g_devvt = vt;
+    }
+    return (g_devvt == vt && s_orig_present != NULL);
+}
+
+/* ========================= version gate ========================= */
+
+void version_gate_check(void) {
+    g_version_ok = 0;
+    g_version_reason[0] = '\0';
+
+    /* 1) exe size */
+    char path[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, path, MAX_PATH)) {
+        lstrcpyA(g_version_reason, "GetModuleFileNameA failed"); return;
+    }
+    HANDLE hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, 0, NULL);
+    if (hf == INVALID_HANDLE_VALUE) { lstrcpyA(g_version_reason, "cannot open exe"); return; }
+    DWORD fsize = GetFileSize(hf, NULL);
+    CloseHandle(hf);
+    if (fsize != EXPECTED_EXE_SIZE) {
+        _snprintf(g_version_reason, sizeof(g_version_reason),
+                  "exe size=%lu expected=%lu",
+                  (unsigned long)fsize, (unsigned long)EXPECTED_EXE_SIZE);
+        return;
+    }
+
+    /* 2) PE identity via loaded image */
+    HMODULE me = GetModuleHandleA(NULL);
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)me;
+    if (dos == NULL || dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        lstrcpyA(g_version_reason, "not a PE image"); return;
+    }
+    const IMAGE_NT_HEADERS *nth = (const IMAGE_NT_HEADERS *)
+        ((const BYTE *)me + dos->e_lfanew);
+    if (nth->Signature != IMAGE_NT_SIGNATURE || nth->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
+        nth->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
+        lstrcpyA(g_version_reason, "not i386 PE32"); return;
+    }
+    if (nth->OptionalHeader.ImageBase != EXPECTED_IMAGE_BASE) {
+        _snprintf(g_version_reason, sizeof(g_version_reason),
+                  "base=%08lX expected=%08lX",
+                  (unsigned long)nth->OptionalHeader.ImageBase,
+                  (unsigned long)EXPECTED_IMAGE_BASE);
+        return;
+    }
+
+    /* 3) file version from the version resource */
+    HRSRC hr = FindResourceA(me, MAKEINTRESOURCE(1), RT_VERSION);
+    if (hr == NULL) { lstrcpyA(g_version_reason, "no version resource"); return; }
+    HGLOBAL hg = LoadResource(me, hr);
+    const BYTE *pv = (const BYTE *)LockResource(hg);
+    DWORD sz = SizeofResource(me, hr);
+    if (pv == NULL || sz < 60) { lstrcpyA(g_version_reason, "version resource unreadable"); return; }
+    {
+        const BYTE *p = pv;
+        DWORD left = sz;
+        DWORD sig_off = 0;
+        while (left >= 4) {
+            if (*(const DWORD *)(const void *)p == 0xFEEF04BD) { sig_off = (DWORD)(p - pv); break; }
+            p++; left--;
+        }
+        if (sig_off == 0 || sig_off + 16 > sz) {
+            lstrcpyA(g_version_reason, "VS_FIXEDFILEINFO not found"); return;
+        }
+        DWORD ms = *(const DWORD *)(const void *)(pv + sig_off + 8);
+        DWORD ls = *(const DWORD *)(const void *)(pv + sig_off + 12);
+        DWORD ems = (EXPECTED_PE_VER_HI << 16) | EXPECTED_PE_VER_LO;
+        DWORD els = (EXPECTED_PE_VER_R << 16) | EXPECTED_PE_VER_B;
+        if (ms != ems || ls != els) {
+            _snprintf(g_version_reason, sizeof(g_version_reason),
+                      "pe ver=%u.%u.%u.%u expected=%u.%u.%u.%u",
+                      (unsigned)(ms >> 16), (unsigned)(ms & 0xFFFF),
+                      (unsigned)(ls >> 16), (unsigned)(ls & 0xFFFF),
+                      EXPECTED_PE_VER_HI, EXPECTED_PE_VER_LO,
+                      EXPECTED_PE_VER_R, EXPECTED_PE_VER_B);
+            return;
+        }
+    }
+
+    lstrcpyA(g_version_reason, "ok");
+    g_version_ok = 1;
+}
+
+/* ========================= IDirect3D9 COM ========================= */
+
 void *WINAPI Direct3DCreate9(UINT SDKVersion) {
     if (g_real == NULL) return NULL;
     typedef void * (WINAPI *FN)(UINT);
@@ -578,7 +366,8 @@ int WINAPI Direct3DCreate9Ex(UINT SDKVersion, void **ppOut) {
     return hr;
 }
 
-/* ----------------------- thin-wrapper passthroughs ------------------------- */
+/* ========================= thin passthroughs ========================= */
+
 int  WINAPI D3DPERF_BeginEvent(D3DCOLOR color, LPCWSTR name);
 int  WINAPI D3DPERF_EndEvent(void);
 void WINAPI D3DPERF_SetMarker(D3DCOLOR color, LPCWSTR name);
@@ -644,6 +433,8 @@ void WINAPI DebugSetMute(void) {
     if (f) f();
 }
 
+/* ========================= DllMain ========================= */
+
 BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
@@ -652,6 +443,8 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         if (s_prev_filter == NULL)
             s_prev_filter = SetUnhandledExceptionFilter(fault_filter);
         set_step("dllmain");
+
+        /* load real d3d9.dll */
         GetSystemDirectoryA(sys, MAX_PATH);
         lstrcatA(sys, "\\d3d9.dll");
         g_real = LoadLibraryA(sys);
@@ -660,7 +453,37 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         s_orig_reset = NULL;
         g_devvt = NULL;
         g_base = (void *)GetModuleHandleA("age3y.exe");
-        dlog("DLL loaded, base=%p real_d3d9=%p", g_base, (void *)g_real);
+
+        /* version gate */
+        version_gate_check();
+
+        /* init subsystems */
+        logger_init();
+        settings_init();
+        settings_load();
+        tracker_init();
+
+        dlog("R14 DLL loaded base=%p real=%p version=%s reason=%s",
+             g_base, (void *)g_real,
+             g_version_ok ? "OK" : "BYPASS", g_version_reason);
+
+        if (g_settings.debug_enabled) {
+            logger_debug("debug: settings enabled=%d hotkey=0x%02X hidden=%d",
+                         g_settings.enabled, g_settings.hotkey, g_settings.start_hidden);
+            logger_debug("debug: font=%s size=%d opacity=%.2f pos=(%d,%d)",
+                         g_settings.font_name, g_settings.font_size,
+                         g_settings.opacity, g_settings.pos_x, g_settings.pos_y);
+            logger_debug("debug: sample_ms=%d smoothing=%s unit=%s discontinuity=%.1f",
+                         g_settings.sample_ms, g_settings.smoothing,
+                         g_settings.use_unit_min ? "min" : "sec",
+                         g_settings.discontinuity_ratio);
+            logger_debug("debug: show_slots567=%d show_gains=%d show_header=%d",
+                         g_settings.show_slots_567, g_settings.show_gains,
+                         g_settings.show_header);
+        }
+
+        ui_init();
+        set_step("dllmain-done");
     }
     return TRUE;
 }
