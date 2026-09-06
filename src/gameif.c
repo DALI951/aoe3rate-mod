@@ -53,7 +53,22 @@ static void fault_write_raw(const char *line) {
     CloseHandle(h);
 }
 
-long WINAPI fault_filter(struct _EXCEPTION_POINTERS *ep) {
+/* Exception codes the game OWNS and must be allowed to survive:
+ *  - any success/informational/warning severity (top 2 bits != 11): covers the
+ *    OutputDebugString notification 0x406D1388, DbgPrint 0x40010006/0x40010007,
+ *    and the whole DBG_* / 0x40000000 family,
+ *  - 0x80000003 breakpoint and 0x80000004 single-step (deliberate, debuggers),
+ *  - 0xE06D7363 MSVC C++ exception thrown across module boundaries (the game's
+ *    normal throw/catch flow).
+ * Fatal severity codes (0xC0000005 AV etc.) are NOT benign. */
+int fault_code_benign(DWORD code) {
+    if ((code & 0xC0000000u) != 0xC0000000u) return 1;
+    if (code == 0x80000003u || code == 0x80000004u) return 1;
+    if (code == 0xE06D7363u) return 1;
+    return 0;
+}
+
+static void fault_log_points(struct _EXCEPTION_POINTERS *ep) {
     DWORD addr = 0, code = 0;
     if (ep != NULL && ep->ExceptionRecord != NULL) {
         addr = (DWORD)(DWORD_PTR)ep->ExceptionRecord->ExceptionAddress;
@@ -66,14 +81,40 @@ long WINAPI fault_filter(struct _EXCEPTION_POINTERS *ep) {
     fault_write_raw(line);   /* Win32 direct: survives heap/CRT damage */
     dlog("FAULT addr=%08X breadcrumb=%s code=%08X",
          (unsigned)addr, (const char *)g_step, (unsigned)code);
-    ExitProcess(code ? code : 1);
+}
+
+/* Vectored handler (registered AddVectoredExceptionHandler(0, ...)): cannot be
+ * replaced by the game, so it ALWAYS gives us the breadcrumb of the dying call.
+ * LOG-ONLY — it must never ExitProcess: a first-chance/benign exception may be
+ * owned by the game's own __try/__except and must be allowed to propagate. */
+long WINAPI vectored_fault_filter(struct _EXCEPTION_POINTERS *ep) {
+    if (ep != NULL && ep->ExceptionRecord != NULL &&
+        !fault_code_benign(ep->ExceptionRecord->ExceptionCode)) {
+        fault_log_points(ep);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Legacy unhandled filter (SetUnhandledExceptionFilter, re-pinned every present
+ * frame): reached only for a genuinely UNHANDLED exception. Fatal -> log the
+ * FAULT line and silent ExitProcess (no Windows crash dialog), R6 semantics.
+ * Benign code defensively ignored here too. */
+long WINAPI fault_filter(struct _EXCEPTION_POINTERS *ep) {
+    if (ep == NULL || ep->ExceptionRecord == NULL) {
+        ExitProcess(1);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (fault_code_benign(ep->ExceptionRecord->ExceptionCode))
+        return EXCEPTION_CONTINUE_SEARCH;
+    fault_log_points(ep);
+    ExitProcess(ep->ExceptionRecord->ExceptionCode ?
+                ep->ExceptionRecord->ExceptionCode : 1);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
 /* The game (or another DLL) may replace SetUnhandledExceptionFilter after we
- * install it at DllMain. Re-pin it every present frame so a crash ALWAYS yields
- * our FAULT line. A vectored handler (installed in DllMain) is the backstop
- * that cannot be replaced. */
+ * install it at DllMain. Re-pin it every present frame so a genuinely fatal
+ * unhandled crash ALWAYS gets our FAULT line + silent exit. */
 void ensure_fault_filter(void) {
     if (s_prev_filter == NULL)
         s_prev_filter = SetUnhandledExceptionFilter(fault_filter);

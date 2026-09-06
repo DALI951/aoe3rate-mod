@@ -178,6 +178,29 @@ check("FindResourceA(me, MAKEINTRESOURCE(1), RT_VERSION)" in src,
       "version gate reads the PE version resource")
 check("0xFEEF04BD" in src, "version gate scans VS_FIXEDFILEINFO")
 
+# ================= Round 3: fault-safety semantics =================
+
+check("AddVectoredExceptionHandler(0, vectored_fault_filter)" in src,
+      "vectored handler registered (log-only, cannot be replaced)")
+check("fault_code_benign" in src and "0x406D1388" in src,
+      "benign notification 0x406D1388 (OutputDebugString) in the ignore list")
+check("0xE06D7363" in src, "MSVC C++ exception 0xE06D7363 ignored at VEH level")
+check("0x80000003" in src, "breakpoint 0x80000003 ignored at VEH level")
+n_veh = src.count("vectored_fault_filter")
+check(n_veh >= 2, "vectored_fault_filter defined AND registered")
+check("vectored_fault_filter" in src, "vectored fault filter present")
+# log-only VEH: CONTINUE_SEARCH and NO ExitProcess within vectored_fault_filter
+# (operate on `code`, the comment-stripped TU, so doc text can't false-positive)
+i_veh = code.find("long WINAPI vectored_fault_filter")
+i_veh_end = code.find("long WINAPI fault_filter")
+seg = code[i_veh:i_veh_end] if (i_veh != -1 and i_veh_end != -1 and i_veh < i_veh_end) else code
+check(seg.count("ExitProcess") == 0,
+      "vectored filter is LOG-ONLY (no ExitProcess inside)")
+check("EXCEPTION_CONTINUE_SEARCH" in seg,
+      "vectored filter returns EXCEPTION_CONTINUE_SEARCH")
+check("fault_filter" in src and "ExitProcess" in src,
+      "fatal exit lives on the legacy unhandled-filter path only")
+
 # ================= R14: modular layout =================
 
 for mod in ("logger.c", "tracker.c", "rate.c", "gameif.c", "settings.c", "ui.c"):

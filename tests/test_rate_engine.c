@@ -322,6 +322,47 @@ static void test_ui_guards(void) {
     CHECK(g_panel_visible == 1, "hotkey check headless: no phantom toggle");
 }
 
+/* ---- STEP 7: fault-filter semantics (round 3) ----
+ * The vectored handler is LOG-ONLY and must return EXCEPTION_CONTINUE_SEARCH
+ * for every code the game owns (benign notifications, breakpoints, MSVC++ EH),
+ * never ExitProcess. The legacy unhandled filter also refuses benign codes.
+ * ExitProcess on a truly-unhandled fatal code is intentionally NOT tested
+ * in-process (it would kill this harness); fault_code_benign() covers the
+ * decision, and the fatal path is the R6-proven behavior. */
+static void test_fault_filters(void) {
+    static EXCEPTION_RECORD rec;
+    static CONTEXT       ctx;
+    EXCEPTION_POINTERS   ep = { &rec, &ctx };
+    static const DWORD benign_codes[] = {
+        0x406D1388u, /* OutputDebugString notification (d3dx9/game at load) */
+        0x40010006u, /* DbgPrint / RIP */
+        0x40010007u, /* DbgPrintEx */
+        0xE06D7363u, /* MSVC C++ exception */
+        0x80000003u, /* breakpoint */
+        0x80000004u, /* single-step */
+        0x40080201u, /* VCPP EH */
+    };
+    for (size_t i = 0; i < sizeof(benign_codes) / sizeof(benign_codes[0]); i++) {
+        DWORD c = benign_codes[i];
+        memset(&rec, 0, sizeof(rec));
+        rec.ExceptionCode      = c;
+        rec.ExceptionAddress   = (PVOID)(DWORD_PTR)0x1234;
+        CHECK(fault_code_benign(c) == 1, "fault_code_benign recognizes a benign code");
+        CHECK(vectored_fault_filter(&ep) == EXCEPTION_CONTINUE_SEARCH,
+              "vectored filter: benign code -> CONTINUE_SEARCH (no exit)");
+        CHECK(fault_filter(&ep) == EXCEPTION_CONTINUE_SEARCH,
+              "unhandled filter: benign code -> CONTINUE_SEARCH (no exit)");
+    }
+    CHECK(fault_code_benign(0xC0000005u) == 0,
+          "fault_code_benign: fatal AV 0xC0000005 is NOT benign (fatal path exits)");
+    CHECK(fault_code_benign(0xC00000FDu) == 0,
+          "fault_code_benign: stack overflow 0xC00000FD is NOT benign");
+    CHECK(fault_code_benign(0x80000002u) == 1,
+          "fault_code_benign: 0x80000002 (warning severity) is benign");
+    CHECK(vectored_fault_filter(NULL) == EXCEPTION_CONTINUE_SEARCH,
+          "vectored filter: NULL pointers -> CONTINUE_SEARCH safe");
+}
+
 int main(void) {
     tracker_init();
     test_rate_game_time();
@@ -336,6 +377,8 @@ int main(void) {
     test_observer_rates_line();
     printf("---\n");
     test_ui_guards();
+    printf("---\n");
+    test_fault_filters();
     printf("\nFAILURES: %d\n", failures);
     return failures ? 1 : 0;
 }

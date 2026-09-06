@@ -72,7 +72,9 @@ void logger_debug(const char *fmt, ...);
 
 /* ---- crash / fault ---- */
 void set_step(const char *s);
-long WINAPI fault_filter(struct _EXCEPTION_POINTERS *ep);
+int  fault_code_benign(DWORD code);
+long WINAPI vectored_fault_filter(struct _EXCEPTION_POINTERS *ep);  /* log-only */
+long WINAPI fault_filter(struct _EXCEPTION_POINTERS *ep);           /* log + exit */
 
 /* ---- guarded reads ---- */
 BOOL page_readable(DWORD addr);

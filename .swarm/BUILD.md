@@ -1,3 +1,44 @@
+# BUILD — ROUND 3 (REWORK, 2026-09-06) — GAME WON'T START (BENIGN-EXCEPTION KILL)
+
+## ROUND SUMMARY
+After round 2, Dali's live test: **the game died at load**. `d3d9mod.log` repeated per launch:
+`FAULT addr=75AFD8C2 breadcrumb=dllmain-done code=406D1388` (twice) — i.e., right after our DllMain completed, during the loader phase, with the breadcrumb `dllmain-done`. Root cause: round 2 registered `fault_filter` (which logs FAULT **and `ExitProcess`**) as an `AddVectoredExceptionHandler(0, ...)` handler. `0x406D1388` is the **benign OutputDebugString notification exception** (raised by d3dx9_25.dll / the game at load; addr in kernelbase). A vectored handler runs on EVERY exception nobody else handled — including benign informational ones that the loader/game would otherwise ignore — so exit-on-any-exception = death at load. The double FAULT line was the same function running in both roles (VEH + unhandled filter) for the one exception.
+
+## ROOT CAUSE (one paragraph)
+Round 2's fault net treated **every** second-chance exception as a fatal crash: the VEH (which cannot be replaced and therefore sees benign notifications too) logged `FAULT` and called `ExitProcess(0)` before the loader could ignore the informational `0x406D1388` debug-print notification. The game never even got past DLL loading.
+
+## THE FIX (exact semantics)
+Split the two roles, with a benign-code guard shared by both:
+- `fault_code_benign(code)` — `1` (I) for any code whose top 2 bits are not `11` (success/informational/warning severity → covers `0x40010006`, `0x40010007`, `0x406D1388` and the whole `DBG_*`/`0x40000000` family), (II) `0x80000003` breakpoint / `0x80000004` single-step, (III) `0xE06D7363` MSVC C++ exception.
+- `vectored_fault_filter` (DllMain, `AddVectoredExceptionHandler(0, ...)`) — **LOG-ONLY, never exits**: benign code → silent `EXCEPTION_CONTINUE_SEARCH`; anything else → write the `FAULT addr=/breadcrumb=/code=` line (raw Win32 WriteFile+Flush) then `EXCEPTION_CONTINUE_SEARCH`. A first-chance/last-chance exception the game owns is allowed to propagate to its own handlers.
+- `fault_filter` (legacy `SetUnhandledExceptionFilter`, re-pinned each present frame by `ensure_fault_filter`) — the ONLY place that exits: benign → `CONTINUE_SEARCH` (defensive), genuinely unhandled fatal (`0xC0000005` etc.) → log FAULT + silent `ExitProcess` (R6 semantics, no crash dialog). If the game replaces our filter we just lose the exit — the VEH already gave the breadcrumb.
+- Round-2 fixes that were correct are untouched: font created at device-create/Reset only (never mid-frame), never `SetRenderTarget(NULL)`, both surfaces released, match-start requires a valid chain, `ovl-*` draw breadcrumbs.
+
+## FILES CHANGED
+- `src/gameif.c` — `fault_code_benign`, `vectored_fault_filter` (log-only), rewritten `fault_filter` (benign-skip + log + exit), shared `fault_log_points`; `ensure_fault_filter` unchanged in behavior.
+- `src/state.h` — declare `fault_code_benign`, `vectored_fault_filter`.
+- `d3d9.c` — DllMain registers `vectored_fault_filter` (was `fault_filter`).
+- `tests/test_rate_engine.c` — new STEP 7 `test_fault_filters`: benign codes (`0x406D1388`, `0x40010006/07`, `0xE06D7363`, `0x80000003/04`, `0x40080201`) → `fault_code_benign==1` AND both filters return `CONTINUE_SEARCH` (harness survives = no exit); fatal `0xC0000005`/`0xC00000FD` → not benign (exit path, not run in-process by design); `0x80000002` warning → benign; NULL EP safe.
+- `tests/test_source_contract.py` — asserts VEH registration, the benign-code list, and (on the comment-stripped TU) that the vectored filter body contains **no** `ExitProcess` and returns `CONTINUE_SEARCH`.
+
+## BUILD RESULT
+- `cmd /c build\build.bat` from repo dir → **rc=0, ZERO warnings**, verify_pe PASS (i386, PE32, imports ⊆ {KERNEL32, USER32, msvcrt}, **11 exports**)
+- **d3d9.dll = 137,170 B, SHA256 `12fe9ef97ad2e36d382b7b755058d870d424911d7a8b809a8ce4c3b4c275975f`** (`d3d9.sha256` updated)
+- **Deployed byte-identical**: repo root = game dir = `tests\d3d9.dll` (SHA256 equal on all three); old game `d3d9mod.log` deleted. Game NOT launched.
+
+## HARNESS RESULTS (all green)
+- `tests\test_d3d9_actual.exe` — ALL CHECKS PASSED
+- `tests\test_rate_engine.exe` — FAILURES: 0 (incl. new STEP 7 fault-filter semantics)
+- `tests\test_source_contract.py` — SOURCE-CONTRACT: PASS (incl. new round-3 checks)
+- `tests\test_pe_structure.py` — FAILURES: 0
+
+## WHAT DALI TESTS NEXT (live)
+1. Game must now **start and reach the main menu** (the `0x406D1388` notification is ignored, no FAULT line at load).
+2. Start a skirmish: chain → match start (valid chain) → `RES t=...` lines; overlay panel appears; no crash.
+3. Only a genuinely unhandled fatal exception will log `FAULT addr=.. breadcrumb=ovl-.. code=..` — if you ever see one, send that line.
+
+---
+
 # BUILD — ROUND 2 (REWORK, 2026-09-06) — FIX LIVE MATCH-START CRASH
 
 ## ROUND SUMMARY

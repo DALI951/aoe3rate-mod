@@ -447,8 +447,10 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         if (s_prev_filter == NULL)
             s_prev_filter = SetUnhandledExceptionFilter(fault_filter);
         /* second-chance vectored handler: cannot be replaced by the game's own
-         * SetUnhandledExceptionFilter calls, so a crash ALWAYS logs FAULT. */
-        AddVectoredExceptionHandler(0, fault_filter);
+         * SetUnhandledExceptionFilter calls, so an unhandled fault ALWAYS logs
+         * FAULT. LOG-ONLY (never exits) — the game may own/expect certain
+         * exceptions (benign 0x406D1388 debug-print etc.). */
+        AddVectoredExceptionHandler(0, vectored_fault_filter);
         set_step("dllmain");
 
         /* load real d3d9.dll */
