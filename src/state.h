@@ -66,6 +66,10 @@ extern int     s_tick;
 extern volatile char g_step[64];
 extern FILE   *g_log;
 extern LPTOP_LEVEL_EXCEPTION_FILTER s_prev_filter;
+extern void   *g_fault_dev;   /* device being called when a FAULT fires */
+extern void  **g_fault_vt;    /* that device's vtable pointer */
+extern int     g_fault_slot;  /* device vtable slot index being called */
+extern int     g_ovl_first_done;   /* first successful overlay draw marker */
 
 /* ---- logger ---- */
 void dlog(const char *fmt, ...);
@@ -178,7 +182,7 @@ void ensure_fault_filter(void);
 void ui_init(void);
 void ui_create_font(void *dev);   /* device-create + Reset only, never mid-frame */
 void ui_draw(void);
-void ui_on_reset(void);
+void ui_on_reset(void *dev);
 void ui_toggle_panel(void);
 void ui_check_hotkey(void);
 

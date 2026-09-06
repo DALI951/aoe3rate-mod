@@ -142,8 +142,9 @@ check("D9_BEGINSCENE     41" in src, "BeginScene device slot 41")
 check("D9_ENDSCENE       42" in src, "EndScene device slot 42")
 check("D9_SETRENDERTARGET 37" in src, "SetRenderTarget device slot 37")
 check("D9_DRAWPRIMITIVEUP 83" in src, "DrawPrimitiveUp device slot 83")
-check("reset_hook" in src and "ui_on_reset()" in src,
+check("reset_hook" in src and "ui_on_reset(" in src,
       "Reset hook invalidates/recreates the font")
+check("reset dev=%p" in src, "Reset hook logs the ACTUAL device (reset dev=%p)")
 check("g_version_ok) return;" in src or "if (!g_version_ok) return;" in src,
       "ui_draw is disabled when the version gate fails")
 
@@ -211,13 +212,43 @@ check("g_frames_since_reset = 0;" in src and src.count("g_frames_since_reset = 0
 check("g_font == NULL) return;" in src, "ui_draw guards font-first before RT work")
 check("g_frames_since_reset < RESET_COOLDOWN_FRAMES" in src,
       "ui_draw waits out the post-Reset cooldown before RT setup")
-# set-step ordering inside ui_draw: rt/tcl must come AFTER the cooldown check
-i_rt = src.find("set_step(\"ovl-rt\")")
+# set-step ordering inside ui_draw: the RT breadcrumbs must come AFTER the
+# cooldown check (ovl-grt = first RT call, replaces the coarse ovl-rt)
+i_rt = src.find("ovl-grt")
 i_cd = src.find("g_frames_since_reset < RESET_COOLDOWN_FRAMES")
 check(i_rt != -1 and i_cd != -1 and i_cd < i_rt,
-      "cooldown check precedes the ovl-rt (GetBackBuffer/SetRenderTarget) step")
+      "cooldown check precedes the ovl-grt (GetRenderTarget) step")
 check('dlog("UI: font created size=%d face=%s"' in src,
       "font creation logged on EVERY create (post-Reset path visible in log)")
+
+# ================= Round 5: per-vtable originals + crash instrumentation =================
+
+check("s_ovtab" in src and "OVTAB_MAX" in src,
+      "per-vtable original Present/Reset table present")
+check("resolve_orig_present" in src and "resolve_orig_reset" in src,
+      "hooks resolve originals per CURRENT device vtable")
+check("s_ovtab[k] = s_ovtab[k + 1];" in src,
+      "vtable table evicts oldest entry when full (multi-device safe)")
+check("patch_device_present(self);" in src,
+      "Reset hook re-patches the ACTUAL device passed to Reset (not a stored ptr)")
+n_trace = src.count("set_trace(dev, vt, D9_GETRENDERTARGET, \"ovl-grt\")")\
+        + src.count("set_trace(dev, vt, D9_GETBACKBUFFER, \"ovl-gbb\")")\
+        + src.count("set_trace(dev, vt, D9_SETRENDERTARGET, \"ovl-srt\")")
+check(n_trace == 3, "per-call breadcrumbs ovl-grt/ovl-gbb/ovl-srt set before each RT call")
+check('set_trace(dev, vt, D9_TESTCOOPLEVEL, "ovl-tcl")' in src,
+      "TCL guard breadcrumb preceeds the RT calls")
+check("ContextRecord->Eip" in src and "ContextRecord->Esp" in src and "ContextRecord->Ebp" in src,
+      "fault dump reads eip/esp/ebp from the exception CONTEXT")
+check('stk=' in src, "fault dump includes the stack dwords (stk=...)")
+check("g_fault_dev" in src and "g_fault_vt" in src and "g_fault_slot" in src,
+      "fault dump records device/vtable/slot of the dying call")
+check('"ovl first draw ok frame=%d"' in src, "first-draw marker logged once")
+# zero-touch Enabled path: present_hook forwards before ANY other work
+i_p = code.find("int STDMETHODCALLTYPE present_hook")
+i_e = code.find("!g_settings.enabled", i_p)
+i_l = code.find("locate_resources()", i_p)
+check(i_p != -1 and i_e != -1 and i_l != -1 and i_e < i_l,
+      "Enabled=0 zero-touch: present_hook forwards before observer/overlay work")
 
 # ================= R14: modular layout =================
 

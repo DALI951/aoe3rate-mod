@@ -107,9 +107,9 @@ void ui_init(void) {
     dlog("UI ready: d3dx9_25.dll loaded");
 }
 
-void ui_on_reset(void) {
+void ui_on_reset(void *dev) {
     ui_release_font();
-    dlog("reset -> font invalidated");
+    dlog("reset dev=%p -> font invalidated", dev);
 }
 
 static int ui_key_edge(int vk, int idx) {
@@ -300,6 +300,15 @@ void ui_create_font(void *dev) {
     }
 }
 
+/* per-call trace: records the device + vtable + slot being called so a FAULT
+ * dump (which sees only globals) names the exact dying call */
+static void set_trace(void *dev, void **vt, int slot, const char *step) {
+    g_fault_dev = dev;
+    g_fault_vt  = vt;
+    g_fault_slot = slot;
+    set_step(step);
+}
+
 void ui_draw(void) {
     set_step("ovl-start");
     if (!g_settings.enabled) return;
@@ -318,7 +327,7 @@ void ui_draw(void) {
     if (vt == NULL) return;
 
     /* cooperative level guard */
-    set_step("ovl-tcl");
+    set_trace(dev, vt, D9_TESTCOOPLEVEL, "ovl-tcl");
     VF_HR tcl = (VF_HR)vt[D9_TESTCOOPLEVEL];
     if (tcl != NULL) {
         int hr = tcl(dev);
@@ -330,15 +339,18 @@ void ui_draw(void) {
 
     /* RT switch only when BOTH the previous target and the backbuffer are
      * captured — a failed GetBackBuffer/GetRenderTarget must never NULL the
-     * device's target. */
-    set_step("ovl-rt");
+     * device's target. Each individual call gets its own breadcrumb + trace
+     * (device/vtable/slot) so a fault names the EXACT dying call. */
     void *bb = NULL, *prev_rt = NULL;
     VF_GETRT grt = (VF_GETRT)vt[D9_GETRENDERTARGET];
     VF_GETBB gbb = (VF_GETBB)vt[D9_GETBACKBUFFER];
     VF_SETRT srt = (VF_SETRT)vt[D9_SETRENDERTARGET];
     if (grt == NULL || gbb == NULL || srt == NULL) return;
+    set_trace(dev, vt, D9_GETRENDERTARGET, "ovl-grt");
     if (grt(dev, 0, &prev_rt) < 0 || prev_rt == NULL) return;
+    set_trace(dev, vt, D9_GETBACKBUFFER, "ovl-gbb");
     if (gbb(dev, 0, 0, &bb) < 0 || bb == NULL) return;
+    set_trace(dev, vt, D9_SETRENDERTARGET, "ovl-srt");
     if (srt(dev, 0, bb) < 0) {
         /* SetRenderTarget failed -> keep the device target untouched: restore
          * the previous RT and release both surfaces, then skip this frame. */
@@ -351,7 +363,7 @@ void ui_draw(void) {
     }
 
     /* render-state save / set / restore (SET only after a captured RT) */
-    set_step("ovl-states");
+    set_trace(dev, vt, D9_GETRENDERSTATE, "ovl-states");
     DWORD st_z = 1, st_zw = 1, st_st = 0, st_ab = 0, st_sb = 0, st_db = 0, st_li = 1;
     VF_GETSTATE grs = (VF_GETSTATE)vt[D9_GETRENDERSTATE];
     VF_SETSTATE srs = (VF_SETSTATE)vt[D9_SETRENDERSTATE];
@@ -375,18 +387,18 @@ void ui_draw(void) {
     }
 
     /* scene + panel: EndScene is ALWAYS called once BeginScene succeeded */
-    set_step("ovl-begin");
+    set_trace(dev, vt, D9_BEGINSCENE, "ovl-begin");
     VF_HR beg = (VF_HR)vt[D9_BEGINSCENE];
     VF_HR end = (VF_HR)vt[D9_ENDSCENE];
     if (beg != NULL && end != NULL && beg(dev) >= 0) {
-        set_step("ovl-panel");
+        set_trace(dev, vt, D9_DRAWPRIMITIVEUP, "ovl-panel");
         ui_draw_panel(dev);
-        set_step("ovl-end");
+        set_trace(dev, vt, D9_ENDSCENE, "ovl-end");
         end(dev);
     }
 
     /* restore render states (reverse), then the RT, then release surfaces */
-    set_step("ovl-restore");
+    set_trace(dev, vt, D9_SETRENDERTARGET, "ovl-restore");
     if (srs != NULL) {
         srs(dev, D3DRS_LIGHTING, st_li);
         srs(dev, D3DRS_DESTBLEND, st_db);
@@ -409,5 +421,6 @@ void ui_draw(void) {
             if (rel) rel(prev_rt);
         }
     }
+    if (!g_ovl_first_done) { g_ovl_first_done = 1; dlog("ovl first draw ok frame=%d", g_frames_since_reset); }
     set_step("ovl-done");
 }

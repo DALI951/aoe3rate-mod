@@ -1,3 +1,61 @@
+# BUILD — ROUND 5 (REWORK, 2026-09-06) — PERSISTENT ovl-rt CRASH: PORT-UNRECOVERABLE, PER-VTABLE FIX + FULL CRASH INSTRUMENTATION
+
+## ROUND SUMMARY
+Dali's round-4 live log shows the cooldown did NOT help: the post-Reset font re-create now logs correctly (`UI: font created size=14 face=Georgia` a second time), the cooldown elapsed, and `FAULT addr=774EFF25 breadcrumb=ovl-rt code=C0000005` still kills the process (x4) with the SAME stable ntdll-ish address. A stable ntdll address + intact overlay is a stale/REPLACED device vtable signature — the game or driver restores its own vtable or creates a SECOND device whose patch clobbers the first device's saved originals.
+
+## (a) R6-vs-R14 diff findings — R6 source is UNRECOVERABLE; the mechanics were already R6-faithful
+Mandate step 1 asked to port `git show <r6>:d3d9.c` "verbatim". **That commit does not exist.** Proof:
+- `git log --all -S "draw_hud_text"` and `-S "gotbb"` and `-S "reset dev="` return commits `21f7403, 07f5b4f, 1cc8708, 8262a4d` — R12/R13/R14. The repo history STARTS at R12 (`21f7403`); the root commit's `d3d9.c` already says *"All previous draw code (font init, text=/values=/gotbb dumps, red rect, SetRenderTarget/SetRenderState, Begin/EndScene) was DELETED in round 8"* (confirmed at `old_r12.c:543`). No R6/R7 blob exists anywhere in `--all`. The old repo (`C:\Users\Dali\Documents\gaames\aoe3rate-mod`) is gone, and the remote `main` contains only R12→R15.
+- Whole-tree grep for `gotbb`/`draw_hud_text`/`hud_text`/`reset dev=%p`/`text=%d`: only doc mentions in `.swarm\TEST.md`/`REVIEW.md`. `test_nullsafe.c` header says "the DLL no longer draws anything".
+- **Therefore the R6 "verbatim" port could not run.** I diffed the current RT/draw machinery element-by-element against the R6 spec you enumerated (the only authoritative record left). Result: **every R6 mechanical requirement was already satisfied**:
+  - GetBackBuffer(0,0,MONO,&bb) + HRESULT + NULL check — MATCH (slot 18)
+  - GetRenderTarget(0,&prev_rt) + SetRenderTarget(0,bb) + both-refs release order — MATCH (slot 38/37; grt/gbb each AddRef, both Released)
+  - render-state save/set/restore list ZENABLE/ZWRITEENABLE/STENCILENABLE/ALPHABLENDENABLE(SRCALPHA→INVSRCALPHA)/LIGHTING — MATCH (slots 58/57)
+  - Begin/End gated: BeginScene(41) failure skips panel AND EndScene; font Begin(12) failure skips DrawText AND font End — MATCH
+  - TestCooperativeLevel guard: LOST/NOTRESET skip the whole frame before any font/RT use — MATCH (slot 3 + 0x88760868/69)
+  - font-first + n==0 + g_values_valid + 30-frame cooldown (R14 hardening) — KEPT
+  - So "the RT mechanics must be R6-pure" was already true; the crash is NOT a mechanics regression vs R6. The real divergence from the proven R13 hooks is structural and below.
+
+## (b) The reset-hook / present-hook finding — single-slot globals could forward into the WRONG device's code
+OLD code (rounds 2-4, and R13): `patch_device_present()` saved the originals in ONE global pair and only patched when `g_devvt != vt`. If the game creates a SECOND device (different vtable — AoE3 does create auxiliary devices) or a driver swaps a vtable at Reset, the second patch RE-SAVES `s_orig_present`/`s_orig_reset` with the second device's originals and clobbers the first device's. Every subsequent Present/Reset on device #1 then forwarded into device #2's original Present/Reset via our stale single-slot globals — exactly the "calls a device in the wrong state -> dies inside ntdll with a stable address" signature of the log.
+NEW code (round 5): a per-vtable table (`s_ovtab`, 4 entries, oldest-evicted):
+- `patch_device_present()` keys entries by the device's CURRENT vtable pointer; records EACH vtable's true originals; never touches another entry's saved originals.
+- `resolve_orig_present(self)/resolve_orig_reset(self)` resolve the original by the CURRENT device's CURRENT vtable on EVERY call (falls back to last-patched if unknown).
+- `reset_hook` still re-patches `self` — the ACTUAL device passed to Reset (never a stored pointer) — and now logs `reset dev=%p -> font invalidated`.
+- `s_orig_present`/`s_orig_reset` remain only as last-patched diagnostics; the hooks no longer trust them alone.
+
+## (c) Crash instrumentation added
+- **Per-call breadcrumbs + trace:** replacing coarse `ovl-rt` with `ovl-tcl`, `ovl-grt`, `ovl-gbb`, `ovl-srt` set immediately BEFORE each individual call (keep `ovl-states/begin/panel/end/restore/done`). Each trace also stashes `g_fault_dev`/`g_fault_vt`/`g_fault_slot` so the fault dump knows the object, vtable, and slot being called.
+- **Richer FAULT dump:** the line is now `FAULT addr=.. eip=.. esp=.. ebp=.. stk=h1,h2,...h8 breadcrumb=.. code=.. dev=.. vt=.. slot=..` — context registers read from the exception CONTEXT (VirtualQuery-guarded stack read), plus the device/vtable/slot trace from the globals. A next crash names the exact dying call AND gives a call trail.
+- **First-draw marker:** `ovl first draw ok frame=N` logged once when the first full overlay draw completes, so the log proves whether the draw ever finishes.
+- **Zero-touch Enabled=0 path:** with `[General] Enabled=0`, `present_hook` forwards to the resolved original immediately — no locate/observer/hotkey/overlay/breadcrumbs. This is Dali's A/B control to split hook-vs-overlay as the culprit.
+
+## FILES CHANGED
+- `d3d9.c` — per-vtable originals table + resolve helpers; present_hook zero-touch path; reset_hook logs `reset dev=%p`; `g_fault_dev/vt/slot`, `g_ovl_first_done` globals.
+- `src/ui.c` — `set_trace()` helper; per-call `ovl-grt/gbb/srt` breadcrumbs (runs after cooldown+font-first, before any RT call); first-draw marker; all R14 gating kept.
+- `src/gameif.c` — `fault_log_points` now dumps eip/esp/ebp + 8 stack dwords + dev/vt/slot (VirtualQuery-guarded).
+- `src/state.h` — externs for the trace globals; `ui_on_reset(void *dev)`.
+- `tests/test_rate_engine.c` — `ui_on_reset(NULL)` (signature).
+- `tests/test_source_contract.py` — round-5 asserts (per-vt table, resolve helpers, eviction, `reset dev=%p`, `ovl-grt/gbb/srt` trace presence, eip/esp/ebp/stk dump, first-draw marker, zero-touch ordering).
+
+## BUILD RESULT
+- `cmd /c build\build.bat` → **rc=0, ZERO warnings**, verify_pe PASS (i386, PE32, imports ⊆ {KERNEL32, USER32, msvcrt}, **11 exports**)
+- **d3d9.dll = 138,890 B, SHA256 `71c41e2844bf8e095c28f2d6ca75b2a9d85c0e6d78c08ddb4a595c78747ce260`** (`d3d9.sha256` updated)
+- **Deployed byte-identical**: repo root = game dir = `tests\d3d9.dll` (SHA256 equal); old game `d3d9mod.log` deleted. Game NOT launched.
+
+## HARNESS RESULTS (all green)
+- `tests\test_d3d9_actual.exe` — ALL CHECKS PASSED
+- `tests\test_rate_engine.exe` — FAILURES: 0 (incl. STEP-7 fault semantics with the richer dump)
+- `tests\test_source_contract.py` — SOURCE-CONTRACT: PASS (incl. 10 new round-5 checks)
+- `tests\test_pe_structure.py` — FAILURES: 0
+
+## WHAT DALI TESTS NEXT (live)
+1. **A/B first:** set `[General] Enabled=0` in the game dir's `ResourceRateMod.ini`, launch, start a skirmish. If the process survives, the culprit is in the overlay draw/RT path; if it STILL dies, it's in the hook/observer path.
+2. Then `Enabled=1`: if it still crashes, the FAULT line now names the exact call: `ovl-grt` vs `ovl-gbb` vs `ovl-srt` vs `ovl-states`/`ovl-begin`/`ovl-panel`, with `dev=.. vt=.. slot=.. eip=.. esp=.. ebp=.. stk=..`. Send that line + the `CreateDevice`/`reset dev=` lines.
+3. Expect after the match-start Reset: `reset dev=.. -> font invalidated`, a second `UI: font created`, then `ovl first draw ok frame=..` once the overlay actually renders.
+
+---
+
 # BUILD — ROUND 4 (REWORK, 2026-09-05) — CRASH ON FIRST FRAME AFTER DEVICE RESET (ovl-rt AV)
 
 ## ROUND SUMMARY

@@ -44,6 +44,14 @@ volatile char g_step[64];
 FILE         *g_log       = NULL;
 LPTOP_LEVEL_EXCEPTION_FILTER s_prev_filter = NULL;
 
+/* crash-diagnosis context: the device / vtable / slot being called when a
+ * FAULT fires; the fault net dumps these with eip/esp/ebp/stk so the exact
+ * dying call is named, not just the step string. */
+void  *g_fault_dev  = NULL;
+void  **g_fault_vt  = NULL;
+int    g_fault_slot = -1;
+int    g_ovl_first_done = 0;   /* first full overlay draw marker */
+
 /* tracker state */
 SlotTracker g_tracker[MAX_SLOTS];
 DWORD g_last_sample_tick = 0;
@@ -80,7 +88,16 @@ static D3D9W *g_wrapper = NULL;
 typedef int  (STDMETHODCALLTYPE *PRESENT_FN)(void *self, const RECT *a,
         const RECT *b, HWND hwnd, const void *dirty);
 typedef int  (STDMETHODCALLTYPE *DEV_RESET)(void *, const void *);
-static PRESENT_FN s_orig_present = NULL;
+
+/* Per-VID device-vtable originals. A game/driver may swap a device's vtable
+ * during Reset or create a SECOND device (different vtable); a single
+ * s_orig_present/s_orig_reset pair would then hold the *other* device's
+ * originals and every Present/Reset on the first device would forward into the
+ * wrong code. Store originals per vtable pointer and resolve per call. */
+#define OVTAB_MAX 4
+static struct { void **vt; PRESENT_FN op; DEV_RESET or; } s_ovtab[OVTAB_MAX];
+static int s_novtab = 0;
+static PRESENT_FN s_orig_present = NULL;   /* last-patched vtable (diagnostic/fallback) */
 static DEV_RESET   s_orig_reset   = NULL;
 
 /* (patch_device_present forward-declared above) */
@@ -210,13 +227,37 @@ static D3D9W *wrap_d3d9(void *real) {
 
 /* ========================= device hook ========================= */
 
+/* Resolve the true original Present/Reset for the DEVICE CURRENTLY being
+ * called (keyed by its CURRENT vtable pointer). Falls back to the last-patched
+ * pair if the device's vtable is not in the table (defensive). */
+static PRESENT_FN resolve_orig_present(void *self) {
+    if (self != NULL) {
+        void **vt = *(void ***)self;
+        for (int i = 0; i < s_novtab; i++)
+            if (s_ovtab[i].vt == vt && s_ovtab[i].op != NULL) return s_ovtab[i].op;
+    }
+    return s_orig_present;
+}
+static DEV_RESET resolve_orig_reset(void *self) {
+    if (self != NULL) {
+        void **vt = *(void ***)self;
+        for (int i = 0; i < s_novtab; i++)
+            if (s_ovtab[i].vt == vt && s_ovtab[i].or != NULL) return s_ovtab[i].or;
+    }
+    return s_orig_reset;
+}
+
 static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
     g_device = self;
     g_frames_since_reset = 0;
     set_step("reset-hook");
-    ui_on_reset();
+    g_fault_dev = self;
+    g_fault_vt  = (self != NULL) ? *(void ***)self : NULL;
+    g_fault_slot = 16;
+    ui_on_reset(self);   /* logs "reset dev=%p -> font invalidated" */
+    s_orig_reset = resolve_orig_reset(self);
     int hr = (s_orig_reset != NULL) ? s_orig_reset(self, pp) : (int)0x8876086c;
-    patch_device_present(self);
+    patch_device_present(self);   /* re-assert slots 16/17 on the ACTUAL device */
     if (hr >= 0) ui_create_font(self);   /* re-create font on successful Reset */
     set_step("reset-done");
     return hr;
@@ -224,6 +265,13 @@ static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
 
 static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT *b,
         HWND hwnd, const void *dirty) {
+    if (!g_settings.enabled) {
+        /* ZERO-TOUCH path ([General] Enabled=0): no chain walk, no observer,
+         * no breadcrumbs, no font/RT calls — just forward the Present. This is
+         * the A/B control that splits "hook vs overlay" as the crash culprit. */
+        PRESENT_FN fl = resolve_orig_present(self);
+        return (fl != NULL) ? fl(self, a, b, hwnd, dirty) : (int)0x8876086c;
+    }
     g_device = self;
     if (g_frames_since_reset < 0x7FFFFFFF) g_frames_since_reset++;
     ensure_fault_filter();   /* the game may have replaced our unhandled filter */
@@ -240,6 +288,7 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
     ui_draw();
 
     set_step("present-before");
+    s_orig_present = resolve_orig_present(self);
     int hr = (s_orig_present != NULL)
         ? s_orig_present(self, a, b, hwnd, dirty)
         : (int)0x8876086c;
@@ -247,29 +296,47 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
     return hr;
 }
 
+/* Re-assert our Present/Reset hooks on THE ACTUAL device (never a stale stored
+ * pointer), per vtable. Records each vtable's true originals in s_ovtab so a
+ * second device / post-Reset vtable swap can't clobber the first device's
+ * forward targets. Idempotent per vtable. */
 static int patch_device_present(void *dev) {
     if (dev == NULL) return 0;
     void **vt = *(void ***)dev;
     if (vt == NULL) return 0;
-    if (g_devvt != vt) {
-        DWORD old = 0;
-        if (s_orig_present == NULL) {
-            DWORD slot = (DWORD)(DWORD_PTR)&vt[17];
-            VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
-            s_orig_present = (PRESENT_FN)vt[17];
-            vt[17] = (void *)present_hook;
-            VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
+    int i = 0;
+    while (i < s_novtab && s_ovtab[i].vt != vt) i++;
+    if (i >= s_novtab) {
+        if (s_novtab < OVTAB_MAX) {
+            i = s_novtab++;
+        } else {
+            /* table full: evict the oldest vtable (a live game uses few) */
+            for (int k = 0; k + 1 < OVTAB_MAX; k++) s_ovtab[k] = s_ovtab[k + 1];
+            i = OVTAB_MAX - 1;
         }
-        if (s_orig_reset == NULL) {
-            DWORD slot = (DWORD)(DWORD_PTR)&vt[16];
-            VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
-            s_orig_reset = (DEV_RESET)vt[16];
-            vt[16] = (void *)reset_hook;
-            VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
-        }
-        g_devvt = vt;
+        s_ovtab[i].vt = vt;
+        s_ovtab[i].op = NULL;
+        s_ovtab[i].or = NULL;
     }
-    return (g_devvt == vt && s_orig_present != NULL);
+    DWORD old = 0;
+    if (s_ovtab[i].op == NULL) {
+        DWORD slot = (DWORD)(DWORD_PTR)&vt[17];
+        VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
+        s_ovtab[i].op = (PRESENT_FN)vt[17];
+        vt[17] = (void *)present_hook;
+        VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
+    }
+    if (s_ovtab[i].or == NULL) {
+        DWORD slot = (DWORD)(DWORD_PTR)&vt[16];
+        VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
+        s_ovtab[i].or = (DEV_RESET)vt[16];
+        vt[16] = (void *)reset_hook;
+        VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
+    }
+    g_devvt = vt;
+    s_orig_present = s_ovtab[i].op;   /* last-patched (diagnostic) */
+    s_orig_reset   = s_ovtab[i].or;
+    return s_ovtab[i].op != NULL;
 }
 
 /* ========================= version gate ========================= */

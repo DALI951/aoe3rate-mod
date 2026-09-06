@@ -315,7 +315,7 @@ static void test_ui_guards(void) {
     ui_init(); /* d3dx9_25.dll may or may not load; must not crash */
     ui_draw();
     CHECK(1, "ui_draw after init no-op/graceful (no crash)");
-    ui_on_reset(); /* font NULL => no-op */
+    ui_on_reset(NULL); /* font NULL => no-op */
     CHECK(1, "ui_on_reset with no font (no crash)");
     g_settings.hotkey = 0x78; /* F9 — GetAsyncKeyState returns 0 headless */
     ui_check_hotkey();

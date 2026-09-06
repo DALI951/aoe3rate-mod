@@ -70,17 +70,52 @@ int fault_code_benign(DWORD code) {
 
 static void fault_log_points(struct _EXCEPTION_POINTERS *ep) {
     DWORD addr = 0, code = 0;
+    DWORD eip = 0, esp = 0, ebp = 0;
+    DWORD stk[8];
+    int nstk = 0;
     if (ep != NULL && ep->ExceptionRecord != NULL) {
         addr = (DWORD)(DWORD_PTR)ep->ExceptionRecord->ExceptionAddress;
         code = ep->ExceptionRecord->ExceptionCode;
     }
-    char line[224];
-    _snprintf(line, sizeof(line),
-              "FAULT addr=%08X breadcrumb=%s code=%08X\r\n",
-              (unsigned)addr, (const char *)g_step, (unsigned)code);
+    if (ep != NULL && ep->ContextRecord != NULL) {
+        eip = ep->ContextRecord->Eip;
+        esp = ep->ContextRecord->Esp;
+        ebp = ep->ContextRecord->Ebp;
+        if (esp != 0) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQuery((const void *)(DWORD_PTR)esp, &mbi, sizeof(mbi))
+                    && mbi.State == MEM_COMMIT
+                    && (mbi.Protect & (PAGE_READWRITE | PAGE_READONLY |
+                        PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                        PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY |
+                        PAGE_EXECUTE_WRITECOPY))
+                    && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
+                const DWORD *p = (const DWORD *)(DWORD_PTR)esp;
+                for (nstk = 0; nstk < 8; nstk++) stk[nstk] = p[nstk];
+            }
+        }
+    }
+    char line[320];
+    int ln = _snprintf(line, sizeof(line),
+        "FAULT addr=%08X eip=%08X esp=%08X ebp=%08X stk=", 
+        (unsigned)addr, (unsigned)eip, (unsigned)esp, (unsigned)ebp);
+    if (nstk > 0) {
+        for (int i = 0; i < nstk && ln > 0 && ln < (int)sizeof(line); i++)
+            ln += _snprintf(line + ln, sizeof(line) - ln, "%s%08X", i ? "," : "", (unsigned)stk[i]);
+    } else {
+        ln += _snprintf(line + ln, sizeof(line) - ln, "-");
+    }
+    _snprintf(line + ln, sizeof(line) - ln,
+        " breadcrumb=%s code=%08X dev=%08X vt=%08X slot=%d\r\n",
+        (const char *)g_step, (unsigned)code,
+        (unsigned)(DWORD_PTR)g_fault_dev, (unsigned)(DWORD_PTR)g_fault_vt,
+        g_fault_slot);
     fault_write_raw(line);   /* Win32 direct: survives heap/CRT damage */
-    dlog("FAULT addr=%08X breadcrumb=%s code=%08X",
-         (unsigned)addr, (const char *)g_step, (unsigned)code);
+    dlog("FAULT addr=%08X eip=%08X esp=%08X ebp=%08X stk=%d breadcrumb=%s code=%08X dev=%08X vt=%08X slot=%d",
+         (unsigned)addr, (unsigned)eip, (unsigned)esp, (unsigned)ebp, nstk,
+         (const char *)g_step, (unsigned)code,
+         (unsigned)(DWORD_PTR)g_fault_dev, (unsigned)(DWORD_PTR)g_fault_vt,
+         g_fault_slot);
 }
 
 /* Vectored handler (registered AddVectoredExceptionHandler(0, ...)): cannot be
