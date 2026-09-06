@@ -1,0 +1,8 @@
+*.log
+d3d9.dll
+d3dx9_25.dll
+tests/d3d9.dll
+tests/*.exe
+Temp/
+*.o
+*.obj
