@@ -1,19 +1,25 @@
 /*
- * test_rate_engine.c — R14 rate-engine + settings + version-gate harness.
+ * test_rate_engine.c ??? R14 rate-engine + settings + version-gate harness.
  * Compiles the REAL d3d9.c (via SWARM_TEST include) and drives the actual
  * production functions: tracker_sample(), rate_get_ema/raw/display(),
  * settings_init/load/save(), ui_* no-crash, observer path, version gate.
  *
- * Rate engine rules under test (game-time default, 1 tick = 1 ms):
+ * Rate engine rules under test (deterministic override clock, R16 A1):
  *   - first sample bootstraps (no fake rate), cadence honored (500 ms default)
  *   - steady gain:  +1 / 500 ms  => EMA converges to 2.0/s (120.0/min)
  *   - spending spike: inst < 0 and |inst| > EMA*3 => EMA frozen, baseline fresh
  *   - instant gains counted (positive jumps move the EMA strongly)
+ *   - ShowGains=0: a positive jump is treated like a spend spike (EMA frozen)
  *   - global pause: clock not advancing => g_paused, EMA untouched
  *   - slot freeze: value frozen across a full interval => EMA frozen
  *   - realtime mode (QPC): finite, sane values, no div-by-zero
  *   - settings INI round-trip + garbage-file resilience
  *   - version gate failure path (host exe is the test, not age3y)
+ *
+ * The R16 A1 clock change makes the shipped tracker use realtime QPC. The
+ * deterministic timeline below therefore pins the clock via
+ * tracker_set_clock_override(); the QPC path itself is exercised end-to-end
+ * in test_rate_realtime().
  *
  * Build (from tests dir):
  *   i686-w64-mingw32-gcc.exe test_rate_engine.c -o test_rate_engine.exe -luser32 -lwinmm
@@ -51,6 +57,13 @@ static void set_vals(float a[8], float v0) {
     for (int i = 0; i < 8; i++) a[i] = (i == 0) ? v0 : 0.0f;
 }
 
+/* deterministic clock pin (R16 A1): sample with the s_tick timeline as the
+ * clock value, exactly like the old game-time mode did */
+static void ts(DWORD tick, float *a) {
+    tracker_set_clock_override(tick);
+    tracker_sample(tick, a, 8);
+}
+
 /* ---- STEP 1: rate engine, game-time ---- */
 static void test_rate_game_time(void) {
     g_settings.use_game_time = 1;
@@ -58,58 +71,67 @@ static void test_rate_game_time(void) {
     g_settings.sample_ms = (int)SAMPLE_MS_DEFAULT;
     lstrcpyA(g_settings.smoothing, "med");
     g_settings.discontinuity_ratio = 3.0f;
+    g_settings.show_gains = 1;   /* production default */
     tracker_reset();
 
     float a[8];
     /* 1st sample: bootstrap, no rate yet */
-    s_tick = 500;   set_vals(a, 100.0f);   tracker_sample((DWORD)s_tick, a, 8);
+    s_tick = 500;   set_vals(a, 100.0f);   ts((DWORD)s_tick, a);
     CHECK(rate_get_ema(0) == 0.0f, "bootstrap sample sets no EMA");
     CHECK(g_values_valid == 1, "values valid after first sample");
 
     /* steady +1 per 500ms => 2.0/s */
-    s_tick = 1000;  set_vals(a, 101.0f);   tracker_sample((DWORD)s_tick, a, 8);
+    s_tick = 1000;  set_vals(a, 101.0f);   ts((DWORD)s_tick, a);
     CHECK(FEQ(rate_get_ema(0), 2.0f), "steady +1/500ms => EMA 2.0/s");
     CHECK(FEQ(rate_get_raw(0), 2.0f), "raw rate 2.0/s from ring");
     CHECK(FEQ(rate_display(0), 120.0f), "display x60 => 120.0/min");
 
-    s_tick = 1500;  set_vals(a, 102.0f);   tracker_sample((DWORD)s_tick, a, 8);
+    s_tick = 1500;  set_vals(a, 102.0f);   ts((DWORD)s_tick, a);
     CHECK(FEQ(rate_get_ema(0), 2.0f), "steady rate keeps EMA at 2.0/s");
 
     /* cadence is honored: sub-interval frame must not sample */
-    s_tick = 1600;  set_vals(a, 102.0f);   tracker_sample((DWORD)s_tick, a, 8);
+    s_tick = 1600;  set_vals(a, 102.0f);   ts((DWORD)s_tick, a);
     CHECK(FEQ(rate_get_ema(0), 2.0f), "sub-interval frame does not re-sample");
 
     /* spending spike: -82 over 500ms => -164/s, |..| > 2*3 => EMA frozen */
-    s_tick = 2100;  set_vals(a, 20.0f);    tracker_sample((DWORD)s_tick, a, 8);
+    s_tick = 2100;  set_vals(a, 20.0f);    ts((DWORD)s_tick, a);
     CHECK(FEQ(rate_get_ema(0), 2.0f), "spending spike freezes EMA (skip sample)");
     /* ring baseline advances to the post-spike value; the next normal sample
      * measures against it (this is why the resume raw comes out as 10.0/s) */
 
     /* resume: +5 over 500ms => 10/s, EMA = 2 + 0.2*(10-2) = 3.6 */
-    s_tick = 2600;  set_vals(a, 25.0f);    tracker_sample((DWORD)s_tick, a, 8);
+    s_tick = 2600;  set_vals(a, 25.0f);    ts((DWORD)s_tick, a);
     CHECK(FEQ(g_last_values[0], 25.0f), "post-spike values continue feeding overlay");
     CHECK(FEQ(rate_get_ema(0), 3.6f), "resume: EMA = 2 + 0.2*(10-2) = 3.6");
     CHECK(FEQ(rate_get_raw(0), 10.0f), "raw rate 10.0/s after resume");
 
     /* instant gain: +975/500ms => 1950/s positive, counted (ShowGains) */
-    s_tick = 3100;  set_vals(a, 1000.0f);  tracker_sample((DWORD)s_tick, a, 8);
+    s_tick = 3100;  set_vals(a, 1000.0f);  ts((DWORD)s_tick, a);
     CHECK(rate_get_ema(0) > 100.0f, "instant gain counted (EMA jumps up)");
 
     /* global pause: same tick again */
     float e = rate_get_ema(0);
-    s_tick = 3100;  set_vals(a, 1001.0f);  tracker_sample((DWORD)s_tick, a, 8);
+    s_tick = 3100;  set_vals(a, 1001.0f);  ts((DWORD)s_tick, a);
     CHECK(g_paused == 1, "advancing nothing => paused");
     CHECK(rate_get_ema(0) == e, "paused: EMA untouched");
-    s_tick = 3600;  set_vals(a, 1002.0f);  tracker_sample((DWORD)s_tick, a, 8);
+    s_tick = 3600;  set_vals(a, 1002.0f);  ts((DWORD)s_tick, a);
     CHECK(g_paused == 0, "unpause when clock advances again");
 
     /* slot freeze: value identical across a full interval */
     e = rate_get_ema(0);
-    s_tick = 4100;  set_vals(a, 1002.0f);  tracker_sample((DWORD)s_tick, a, 8);
+    s_tick = 4100;  set_vals(a, 1002.0f);  ts((DWORD)s_tick, a);
     CHECK(g_slot_frozen[0] == 1, "slot frozen when value flat across interval");
     CHECK(rate_get_ema(0) == e, "flat value freezes EMA (no drift to zero)");
-    s_tick = 4600;  set_vals(a, 1003.0f);  tracker_sample((DWORD)s_tick, a, 8);
+    s_tick = 4600;  set_vals(a, 1003.0f);  ts((DWORD)s_tick, a);
     CHECK(g_slot_frozen[0] == 0, "slot unfreezes on next value change");
+
+    /* ShowGains=0 (R16 B8): a strongly positive jump is skipped like a spend
+     * spike — the EMA must NOT jump up. +497 over 500ms => ~994/s, > 3*EMA. */
+    float sg0 = rate_get_ema(0);
+    g_settings.show_gains = 0;
+    s_tick = 5200;  set_vals(a, 1500.0f);  ts((DWORD)s_tick, a);
+    CHECK(rate_get_ema(0) == sg0, "ShowGains=0: positive jump does not move EMA");
+    g_settings.show_gains = 1;
 }
 
 /* ---- STEP 2: realtime mode ---- */
@@ -317,7 +339,7 @@ static void test_ui_guards(void) {
     CHECK(1, "ui_draw after init no-op/graceful (no crash)");
     ui_on_reset(NULL); /* font NULL => no-op */
     CHECK(1, "ui_on_reset with no font (no crash)");
-    g_settings.hotkey = 0x78; /* F9 — GetAsyncKeyState returns 0 headless */
+    g_settings.hotkey = 0x78; /* F9 ??? GetAsyncKeyState returns 0 headless */
     ui_check_hotkey();
     CHECK(g_panel_visible == 1, "hotkey check headless: no phantom toggle");
 }

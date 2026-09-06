@@ -30,6 +30,8 @@
 #define D9_SETRENDERSTATE 57
 #define D9_GETRENDERSTATE 58
 #define D9_DRAWPRIMITIVEUP 83
+#define D9_SETFVF         89   /* R16 B6: canonical DX9 vtable */
+#define D9_GETFVF         90
 
 /* ---------- D3D render states / values ---------- */
 #define D3DRS_ZENABLE         7
@@ -66,16 +68,21 @@ typedef int (STDMETHODCALLTYPE *VF_SETSTATE)(void *self, DWORD state, DWORD v);
 typedef int (STDMETHODCALLTYPE *VF_GETRT)(void *self, DWORD idx, void **out);
 typedef int (STDMETHODCALLTYPE *VF_DRAWUP)(void *self, DWORD prim, DWORD count,
         const void *data, DWORD stride);
+typedef int (STDMETHODCALLTYPE *VF_FVF)(void *self, DWORD fvf);      /* SetFVF */
+typedef int (STDMETHODCALLTYPE *VF_GETFVF)(void *self, DWORD *fvf);  /* GetFVF */
 typedef int (STDMETHODCALLTYPE *VF_DRAWTEXT)(void *self, const char *text,
         int count, void *rect, DWORD fmt, DWORD color);
 
 /* font vtable: Begin(12), DrawTextA(13), End(15), OnLost(16), OnReset(17) */
 
 static HMODULE g_d3dx = NULL;
-static void   *g_font = NULL;
+static void   *g_font = NULL;       /* g_font_dev extern lives in d3d9.c */
 static int     g_ui_ready = 0;
 static int     g_font_guard_warned = 0;
+static int     s_font_fail_n = 0;   /* consecutive font-create fails (R16 B4) */
 static unsigned short g_key_prev[8];
+
+static void set_trace(void *dev, void **vt, int slot, const char *step);
 
 /* Returns 1 only when the font object and its vtable are safely dereferenceable:
  * g_font non-NULL, reading *g_font won't fault, and the vtable pointed at is a
@@ -103,15 +110,19 @@ typedef int (STDMETHODCALLTYPE *PFN_CREATEFONT)(void *dev, int h, UINT w, UINT w
 /* The ONLY way the font object gets freed. Strict NULL discipline: g_font is
  * cleared immediately after Release so no code can ever call through a dangling
  * font vtable (round-7 crash was exactly that: font created inside Reset ->
- * broken object -> eip=000000D8 at ovl-panel). */
+ * broken object -> eip=000000D8 at ovl-panel).
+ * R16 B3: the Release is only attempted through a font_safe() pointer — a
+ * dangling/corrupted font is dropped (both pointers NULLed) without calling
+ * into garbage memory. */
 static void font_destroy(void) {
     if (g_font != NULL) {
-        void **vt = *(void ***)g_font;
-        if (vt != NULL) {
+        if (font_safe()) {
+            void **vt = *(void ***)g_font;
             VF_HR rel = (VF_HR)vt[2];
             if (rel) rel(g_font);
         }
         g_font = NULL;
+        g_font_dev = NULL;
     }
 }
 
@@ -144,33 +155,56 @@ void ui_toggle_panel(void) {
     dlog("panel %s", g_panel_visible ? "shown" : "hidden");
 }
 
+/* R16 B2: the 1-6 settings toggles only respond while the game window is the
+ * foreground app — typing "3" in in-game chat or being alt-tabbed must not
+ * flip the overlay settings. */
+static int ui_is_foreground(void) {
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg == NULL) return 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return (pid == GetCurrentProcessId());
+}
+
 void ui_check_hotkey(void) {
     if (!g_settings.enabled) return;
+    /* F9 toggles the panel; edge-triggered so a held F9 toggles once */
     if (ui_key_edge(g_settings.hotkey, 6)) {
         ui_toggle_panel();
     }
     if (!g_panel_visible) return;
-    /* in-game settings toggles — written back to the INI live */
+    /* in-game settings toggles — written back to the INI live. They need the
+     * game window foreground AND F9 held simultaneously (R16 B2): no phantom
+     * toggles when typing in chat or driving the window from elsewhere. */
+    int f9_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    int fg = ui_is_foreground();
     int changed = 0;
-    if (ui_key_edge('1', 0)) { g_settings.show_header = !g_settings.show_header; changed = 1; }
-    if (ui_key_edge('2', 1)) { g_settings.show_slots_567 = !g_settings.show_slots_567; changed = 1; }
-    if (ui_key_edge('3', 2)) { g_settings.show_gains = !g_settings.show_gains; changed = 1; }
-    if (ui_key_edge('4', 3)) { g_settings.use_unit_min = !g_settings.use_unit_min; changed = 1; }
-    if (ui_key_edge('5', 4)) {
-        if (g_settings.sample_ms <= 100) g_settings.sample_ms = 250;
-        else if (g_settings.sample_ms < 500) g_settings.sample_ms = 500;
-        else if (g_settings.sample_ms < 1000) g_settings.sample_ms = 1000;
-        else g_settings.sample_ms = 100;
-        changed = 1;
-    }
-    if (ui_key_edge('6', 5)) {
-        if (g_settings.smoothing[0] == 'l')
-            lstrcpyA(g_settings.smoothing, "med");
-        else if (g_settings.smoothing[0] == 'm' || g_settings.smoothing[0] == '\0')
-            lstrcpyA(g_settings.smoothing, "high");
-        else
-            lstrcpyA(g_settings.smoothing, "low");
-        changed = 1;
+    if (f9_down && fg) {
+        static const int keys[6] = { '1','2','3','4','5','6' };
+        for (int i = 0; i < 6; i++) {
+            if (!ui_key_edge(keys[i], i)) continue;
+            switch (i) {
+            case 0: g_settings.show_header = !g_settings.show_header; break;
+            case 1: g_settings.show_slots_567 = !g_settings.show_slots_567; break;
+            case 2: g_settings.show_gains = !g_settings.show_gains; break;
+            case 3: g_settings.use_unit_min = !g_settings.use_unit_min; break;
+            case 4:
+                if (g_settings.sample_ms <= 100) g_settings.sample_ms = 250;
+                else if (g_settings.sample_ms < 500) g_settings.sample_ms = 500;
+                else if (g_settings.sample_ms < 1000) g_settings.sample_ms = 1000;
+                else g_settings.sample_ms = 100;
+                break;
+            case 5:
+                if (g_settings.smoothing[0] == 'l')
+                    lstrcpyA(g_settings.smoothing, "med");
+                else if (g_settings.smoothing[0] == 'm' || g_settings.smoothing[0] == '\0')
+                    lstrcpyA(g_settings.smoothing, "high");
+                else
+                    lstrcpyA(g_settings.smoothing, "low");
+                break;
+            }
+            changed = 1;
+        }
     }
     if (changed) {
         settings_save();
@@ -191,7 +225,18 @@ static void ui_draw_backdrop(void *dev, int x, int y, int w, int h, DWORD color)
     v[1].x = fx + fw; v[1].y = fy;      v[1].z = 0.0f; v[1].rhw = 1.0f; v[1].c = color;
     v[2].x = fx;      v[2].y = fy + fh; v[2].z = 0.0f; v[2].rhw = 1.0f; v[2].c = color;
     v[3].x = fx + fw; v[3].y = fy + fh; v[3].z = 0.0f; v[3].rhw = 1.0f; v[3].c = color;
+    /* R16 B6: DrawPrimitiveUp respects the device's current FVF; the game may
+     * have any FVF set (fog pass, minimap, xform). Save it, set the mixed
+     * XYZRHW|DIFFUSE flavor this vertex layout needs, and restore afterwards so
+     * the game's own primitives keep working. Breadcrumbed in case of a fault. */
+    VF_GETFVF gf = (VF_GETFVF)vt[D9_GETFVF];
+    VF_FVF sf = (VF_FVF)vt[D9_SETFVF];
+    DWORD saved_fvf = 0;
+    if (gf != NULL) { set_trace(dev, vt, D9_GETFVF, "ovl-fvf"); gf(dev, &saved_fvf); }
+    if (sf != NULL) { set_trace(dev, vt, D9_SETFVF, "ovl-fvf"); sf(dev, D3DFVF_XYZRHW_DIFFUSE); }
+    set_trace(dev, vt, D9_DRAWPRIMITIVEUP, "ovl-panel");
     du(dev, D3DPT_TRIANGLESTRIP, 2, v, (DWORD)(5 * sizeof(float)));
+    if (sf != NULL) { set_trace(dev, vt, D9_SETFVF, "ovl-fvf"); sf(dev, saved_fvf); }
 }
 
 static void ui_font_draw(void *font, const char *s, int x, int y, DWORD color) {
@@ -305,7 +350,13 @@ static void ui_draw_panel(void *dev) {
 }
 
 void ui_create_font(void *dev) {
-    if (g_font != NULL) return;
+    /* R16 B1: a font is bound to ONE device. If one already exists but for a
+     * different device (e.g. a Reset/Create on a new object), drop it first so
+     * the HUD never draws through a font that belongs to a gone device. */
+    if (g_font != NULL) {
+        if (g_font_dev == dev) return;
+        font_destroy();
+    }
     if (dev == NULL) return;
     if (!g_ui_ready) return;
     void **vt = *(void ***)dev;
@@ -324,10 +375,21 @@ void ui_create_font(void *dev) {
     int hr = cf(dev, -size, 0, 400, 1, 0, 0, 1, 0, 0, face, &font);
     if (hr == 0 && font != NULL) {
         g_font = font;
+        g_font_dev = dev;
+        s_font_fail_n = 0;
         dlog("UI: font created size=%d face=%s font=%p", size, face, font);
     } else {
-        g_font = NULL;   /* never leave a dangling/non-NULL font on failure */
-        dlog("UI: font create FAILED hr=0x%08X", (unsigned)(DWORD)(unsigned long)hr);
+        /* never leave a dangling/non-NULL font on failure; log at most once,
+         * then a heartbeat every 300 failures (R16 B4) so a persistent
+         * create-failure cannot flood the live log ~60 lines/sec */
+        g_font = NULL;
+        g_font_dev = NULL;
+        s_font_fail_n++;
+        unsigned int h = (unsigned)hr;
+        if (s_font_fail_n == 1)
+            dlog("UI: font create FAILED hr=0x%08X", h);
+        else if ((s_font_fail_n % 300) == 0)
+            dlog("UI: font create still failing (%d)", s_font_fail_n);
     }
 }
 
@@ -365,6 +427,7 @@ void ui_draw(void) {
         if (uhr == 0x88760868u) return;    /* D3DERR_DEVICELOST: no draw */
         if (uhr == 0x88760869u) return;    /* D3DERR_DEVICENOTRESET: no draw
                                               (font re-created lazily below) */
+        if (uhr != 0) return;              /* R16 B5: only S_OK may proceed */
     }
 
     /* LAZY font creation (round-7 fix): the font is NEVER created inside the

@@ -403,6 +403,7 @@ static void test_observer_log(void) {
     s_last_ctx = 0; s_last_player = 0; s_last_n = -1;
     s_snap_have = 0;
     s_tick = 0;
+    g_settings.debug_enabled = 1;   /* R16 A3: RES lines are DebugEnabled-gated */
     locate_resources_at(base);
     if (g_res != (void *)(DWORD_PTR)container) {
         printf("FAIL: observer world did not resolve\n");
@@ -425,13 +426,15 @@ static void test_observer_log(void) {
 
     int n0 = log_count();
 
+    /* with DebugEnabled=1, each tick logs TWO lines: the `rates` debug line
+     * + the RES line (R16 A3 put both per-tick lines in the same gate) */
     observer_sample();  /* tick 2, same values -> STILL logs (every tick) */
-    if (log_count() != n0 + 1)
+    if (log_count() != n0 + 2)
         { printf("FAIL: tick 2 must log (every tick)\n"); failures++; }
     else printf("PASS: tick 2 logs (every tick)\n");
 
     observer_sample();  /* tick 3 */
-    if (log_count() != n0 + 2)
+    if (log_count() != n0 + 4)
         { printf("FAIL: tick 3 must log\n"); failures++; }
     else printf("PASS: tick 3 logs\n");
 
@@ -458,6 +461,7 @@ static void test_observer_log(void) {
         { printf("FAIL: dump/cell/resraw/probe lines should be removed\n"); failures++; }
     else printf("PASS: no dump/cell/resraw/probe lines (removed)\n");
 
+    g_settings.debug_enabled = 0;
     VirtualFree(base, 0, MEM_RELEASE);
 }
 

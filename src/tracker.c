@@ -1,10 +1,12 @@
 /* tracker.c — per-slot ring sampling + EMA smoothing + spending-spike skip (R14)
  *
  * Samples the decrypted stock values at g_settings.sample_ms cadence.
- * Clock sources:
- *   game-time (default): the game tick counter (R13's t=), where 1 tick = 1 ms
- *     by the game's own convention (RVA_TIME_STEP = 0.001f in FUN_0086da39).
- *   realtime: QueryPerformanceCounter.
+ * Clock: realtime wall-clock (QueryPerformanceCounter -> ms, GetTickCount
+ *   fallback). R16 Part A1: the DAL s_tick is a per-Present FRAME counter, not
+ *   a millisecond game clock, so game-time-based rates scaled with FPS; the
+ *   legacy UseGameTime setting is kept parsed-but-cosmetic (never used as a
+ *   clock). A test-only override (tracker_set_clock_override) keeps the
+ *   deterministic harness; it is never active inside the game.
  * Rate = (v[cur]-v[prev]) / elapsed_seconds, EMA-smoothed (0.1/0.2/0.4).
  * Pause/freeze rules:
  *   - the tick/clock not advancing frame-to-frame => global freeze.
@@ -20,6 +22,16 @@
 
 static DWORD s_last_time = 0;
 static int   s_have_time = 0;
+static DWORD s_clock_override = 0;          /* test-only deterministic clock */
+static int   s_clock_override_on = 0;
+
+/* Harness hook (R16 A1): the rate-engine tests drive a synthetic timeline;
+ * the shipped DLL never sets this because clock_now() below is always the
+ * realtime QPC wall clock. */
+void tracker_set_clock_override(DWORD ms) {
+    s_clock_override = ms;
+    s_clock_override_on = 1;
+}
 
 void tracker_init(void) {
     tracker_reset();
@@ -34,12 +46,14 @@ void tracker_reset(void) {
         g_last_values[s] = 0.0f;
         g_last_ema[s] = 0.0f;
         g_slot_frozen[s] = 0;
+        g_ema_valid[s] = 0;
     }
     g_last_sample_tick = 0;
     g_paused = 0;
     g_values_valid = 0;
     s_last_time = 0;
     s_have_time = 0;
+    s_clock_override_on = 0;
 }
 
 static float ema_alpha(void) {
@@ -51,8 +65,9 @@ static float ema_alpha(void) {
 }
 
 static DWORD clock_now(void) {
-    if (g_settings.use_game_time)
-        return (DWORD)s_tick;
+    if (s_clock_override_on) return s_clock_override;
+    /* realtime wall-clock ms (R16 A1): s_tick is a present-frame counter, NOT
+     * a millisecond game clock — game-time deltas scaled the rate by FPS. */
     LARGE_INTEGER pc, freq;
     if (QueryPerformanceCounter(&pc) && QueryPerformanceFrequency(&freq) &&
         freq.QuadPart > 0)
@@ -121,12 +136,26 @@ void tracker_sample(DWORD current_tick, const float *values, int num_slots) {
             g_slot_frozen[s] = 0;
         }
 
-        int alive_ema = (g_last_ema[s] > 0.0001f);
+        /* liveness: a slot is "alive" once its EMA has been bootstrapped
+         * from a real sample. R16 A2: explicit valid-flag instead of an
+         * EMA-magnitude heuristic (so a genuinely-zero-rate slot still counts
+         * as alive and CAN be protected against spend spikes). */
+        int alive_ema = g_ema_valid[s];
 
         /* spending-spike skip: strongly negative rate vs current EMA;
          * keep the ring baseline fresh so the next delta is measured
          * against the post-spike value, but freeze the EMA. */
         if (alive_ema && inst < 0.0f && (-inst) > g_last_ema[s] * ratio) {
+            tracker_store_sample(s, now, v);
+            continue;
+        }
+
+        /* R16 B8 (ShowGains): when instant gains are disabled, a strongly
+         * positive jump is treated EXACTLY like a spend spike — the EMA does
+         * not jump up (it would be a lie to report +2k/min gold when the +N
+         * came in one frame from a trade/bonus). Baseline stays fresh. */
+        if (alive_ema && !g_settings.show_gains && inst > 0.0f &&
+            inst > g_last_ema[s] * ratio) {
             tracker_store_sample(s, now, v);
             continue;
         }
@@ -142,6 +171,10 @@ void tracker_sample(DWORD current_tick, const float *values, int num_slots) {
             g_last_ema[s] += alpha * (inst - g_last_ema[s]);
         } else {
             g_last_ema[s] = inst; /* bootstrap first rate */
+            /* only a REAL first rate (a delta exists in the ring) marks the
+             * slot live — the very first sample (count==0, inst==0) just lays
+             * down the baseline */
+            if (st->count >= 1) g_ema_valid[s] = 1;
         }
         tracker_store_sample(s, now, v);
     }

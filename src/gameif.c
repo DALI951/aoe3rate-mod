@@ -430,12 +430,14 @@ void observer_sample(void) {
         logger_debug("rates food=%.1f wood=%.1f coin=%.1f export=%.1f paused=%d",
                      rate_get_ema(2), rate_get_ema(1), rate_get_ema(0),
                      rate_get_ema(7), g_paused);
+        /* R13 output: one RES line per tick, gated by DebugEnabled (R16 A3):
+         * the per-frame RES stream was writing ~1 line per frame into live
+         * games. Debug=0 keeps the log quiet (chain matches + errors only);
+         * Debug=1 restores it for calibration. */
+        dlog("RES t=%d food=%d wood=%d coin=%d export=%d player=%08X res=%08X",
+             s_tick,
+             rnd_i(v[2]), rnd_i(v[1]), rnd_i(v[0]), rnd_i(v[7]),
+             g_obs_player ? (unsigned)g_obs_player : 0u,
+             (unsigned)rr);
     }
-
-    /* R13 output: one RES line per tick */
-    dlog("RES t=%d food=%d wood=%d coin=%d export=%d player=%08X res=%08X",
-         s_tick,
-         rnd_i(v[2]), rnd_i(v[1]), rnd_i(v[0]), rnd_i(v[7]),
-         g_obs_player ? (unsigned)g_obs_player : 0u,
-         (unsigned)rr);
 }

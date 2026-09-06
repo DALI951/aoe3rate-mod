@@ -132,10 +132,13 @@ extern float g_last_values[MAX_SLOTS];
 extern int   g_values_valid;
 extern float g_last_ema[MAX_SLOTS];
 extern int   g_slot_frozen[MAX_SLOTS];
+extern int   g_ema_valid[MAX_SLOTS];   /* R16 A2: EMA bootstrapped (explicit liveness) */
+extern void  *g_font_dev;              /* R16 B1: device the font is bound to */
 
 void tracker_init(void);
 void tracker_reset(void);
 void tracker_sample(DWORD current_tick, const float *values, int num_slots);
+void tracker_set_clock_override(DWORD ms);   /* test-only deterministic clock (R16 A1) */
 
 /* ---- rate helpers ---- */
 float rate_get_ema(int slot);
@@ -174,6 +177,7 @@ void version_gate_check(void);
 void settings_init(void);
 void settings_load(void);
 void settings_save(void);
+void settings_poll_profile(void);   /* R16 A4: throttled 1/s DefaultProfile re-poll */
 
 /* ---- crash safety (re-arm + direct fault write) ---- */
 void ensure_fault_filter(void);

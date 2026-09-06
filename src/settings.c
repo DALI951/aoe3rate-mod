@@ -10,6 +10,9 @@
 static char g_ini_path[MAX_PATH];        /* ResourceRateMod.ini next to the DLL */
 static char g_profile_path[MAX_PATH];    /* active Users\DefaultProfile*.xml */
 static __int64 g_profile_mtime = 0;
+static int s_clock_noted = 0;            /* one-time "realtime clock" note (R16 A1) */
+static DWORD s_poll_last = 0;            /* 1s throttle for settings_poll_profile */
+static int   s_poll_have = 0;
 
 static void settings_defaults(void) {
     ModSettings *s = &g_settings;
@@ -190,7 +193,24 @@ static void profile_apply(void) {
     free(buf);
 }
 
+/* Re-poll the live DefaultProfile*.xml (hardware profile edits / match-start
+ * preferences) — throttled to once per second from present_hook so a running
+ * game picks up in-game <Setting> merges without hammering the disk. First
+ * call runs immediately (it is just a mtime-check + parse when changed). */
+void settings_poll_profile(void) {
+    DWORD now = GetTickCount();
+    if (s_poll_have && (DWORD)(now - s_poll_last) < 1000) return;
+    s_poll_last = now;
+    s_poll_have = 1;
+    profile_path_find();
+    profile_apply();
+}
+
 void settings_load(void) {
+    if (!s_clock_noted) {
+        s_clock_noted = 1;
+        dlog("clock: using realtime QPC (s_tick is a frame counter, not game time)");
+    }
     FILE *f = fopen(g_ini_path, "rb");
     if (f == NULL) {
         profile_path_find();

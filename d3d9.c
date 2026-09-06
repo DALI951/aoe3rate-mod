@@ -60,6 +60,8 @@ float g_last_values[MAX_SLOTS];
 int   g_values_valid     = 0;
 float g_last_ema[MAX_SLOTS];
 int   g_slot_frozen[MAX_SLOTS];
+int   g_ema_valid[MAX_SLOTS];   /* R16 A2: EMA bootstrapped per slot */
+void  *g_font_dev = NULL;       /* R16 B1: device the ID3DXFont is bound to */
 
 /* settings state */
 ModSettings g_settings;
@@ -96,6 +98,7 @@ typedef int  (STDMETHODCALLTYPE *DEV_RESET)(void *, const void *);
  * tracks the patched vtable so a post-Reset vtable swap still gets re-asserted. */
 static PRESENT_FN s_orig_present = NULL;
 static DEV_RESET s_orig_reset   = NULL;
+static volatile LONG g_in_present = 0;   /* R16 B7: re-entrancy tripwire */
 
 /* (patch_device_present forward-declared above) */
 
@@ -255,6 +258,17 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
     g_device = self;
     if (g_frames_since_reset < 0x7FFFFFFF) g_frames_since_reset++;
     ensure_fault_filter();   /* the game may have replaced our unhandled filter */
+
+    /* R16 B7: single-frame re-entrancy tripwire. If anything below (chain walk,
+     * observer, hotkey, overlay draw, profile poll) triggers a NESTED Present
+     * on this thread — e.g. a log-flush or d3dx9 device help — we must not run
+     * the overlay body again. Skip straight to the real Present. */
+    if (InterlockedCompareExchange(&g_in_present, 1, 0) != 0) {
+        set_step("present-reentrant");
+        PRESENT_FN re = s_orig_present;
+        return (re != NULL) ? re(self, a, b, hwnd, dirty) : (int)0x8876086c;
+    }
+
     set_step("locate");
     locate_resources();
 
@@ -264,6 +278,9 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
     set_step("hotkey");
     ui_check_hotkey();
 
+    set_step("profile-poll");
+    settings_poll_profile();
+
     set_step("draw-overlay");
     ui_draw();
 
@@ -272,17 +289,34 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
         ? s_orig_present(self, a, b, hwnd, dirty)
         : (int)0x8876086c;
     set_step("present-after");
+    InterlockedExchange(&g_in_present, 0);
     return hr;
 }
 
 /* Re-assert our Present/Reset hooks on THE ACTUAL device (never a stale stored
  * pointer). Originals are saved ONCE from the first patched vtable (R6/R13
  * semantics — the shape proven live on TAD's single device object). */
+static int s_second_vt_logged = 0;   /* R16 A5: log the second vtable once */
+
 static int patch_device_present(void *dev) {
     if (dev == NULL) return 0;
     void **vt = *(void ***)dev;
     if (vt == NULL) return 0;
     if (g_devvt != vt) {
+        if (s_orig_present != NULL) {
+            /* A DIFFERENT device vtable showed up after we already saved
+             * originals. Keep R6 semantics: single originals, ONE patched
+             * vtable — a second device is left untouched (its Present is not
+             * hooked; the overlay stays attached to the first device). Log it
+             * instead of silently skipping (R16 A5). */
+            if (!s_second_vt_logged) {
+                s_second_vt_logged = 1;
+                dlog("patch_device_present: second vtable %p seen (had %p) - "
+                     "not re-patched, overlay inactive on this device",
+                     vt, g_devvt);
+            }
+            return 0;
+        }
         DWORD old = 0;
         if (s_orig_present == NULL) {
             DWORD slot = (DWORD)(DWORD_PTR)&vt[17];
@@ -507,6 +541,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         settings_init();
         settings_load();
         tracker_init();
+        if (g_settings.start_hidden) g_panel_visible = 0;   /* R16 B9 */
 
         dlog("R14 DLL loaded base=%p real=%p version=%s reason=%s",
              g_base, (void *)g_real,

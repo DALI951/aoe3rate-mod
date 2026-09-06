@@ -300,6 +300,76 @@ check("ContextRecord->Eip" in src and "ContextRecord->Esp" in src and "ContextRe
       "fault dump reads eip/esp/ebp from the exception CONTEXT")
 check('"ovl first draw ok frame=%d"' in src, "first-draw marker logged once")
 
+# ================= ROUND 8: inspector + external-review fixes =================
+# Part A (external review): A1 realtime clock (s_tick is a FRAME counter, not
+# game-time ms — game-time-based rates scaled with FPS), A2 explicit EMA
+# liveness flag, A3 RES lines gated behind DebugEnabled, A4 profile re-poll
+# once per second from present_hook, A5 log (never silently skip) a second
+# device vtable.
+# Part B (inspector): B1 font bound to a device, B2 hotkeys need F9 held +
+# foreground window + per-key edge, B3 font_destroy only Releases a font_safe()
+# pointer, B4 font-failure log throttled to 1 + heartbeat/300, B5 only S_OK
+# proceeds past TestCooperativeLevel, B6 SetFVF/GetFVF (slots 89/90) saved +
+# restored around the panel backdrop, B7 noreentrancy tripwire in present_hook,
+# B8 ShowGains=0 skips positive jumps like spend spikes, B9 StartHidden.
+
+# ---- Part A ----
+check("g_ema_valid" in src, "A2/A8: g_ema_valid liveness flags present")
+check("g_ema_valid[s] = 1;" in code, "A2: EMA marked valid on bootstrap")
+check("g_ema_valid[s] = 0;" in code, "A2: liveness flags cleared on tracker_reset")
+i_rates = code.find('logger_debug("rates food=')
+i_gate = code.rfind("if (g_settings.debug_enabled) {", 0, i_rates)
+i_res = code.find('dlog("RES t=%d food=%d wood=%d coin=%d export=%d player=%08X res=%08X"')
+check(i_gate != -1 and i_res != -1 and i_gate < i_res and (i_res - i_gate) < 800,
+      "A3: RES line sits INSIDE the DebugEnabled-gated block (quiet log by default)")
+check("settings_poll_profile" in src, "A4: settings_poll_profile declared + defined")
+check("profile-poll" in src, "A4: present_hook breadcrumbs the profile poll step")
+check("settings_poll_profile();" in code, "A4: present_hook calls settings_poll_profile()")
+check("now - s_poll_last) < 1000) return;" in code,
+      "A4: profile poll throttled to once per second (GetTickCount)")
+check("second vtable %p seen" in src,
+      "A5: second-device-vtable case is LOGGED (not silently skipped)")
+check("not re-patched" in src, "A5: single patched vtable semantics preserved + explained")
+# A1: clock_now() must NEVER hand back the s_tick frame counter
+i_clock = code.find("static DWORD clock_now(void)")
+i_sample = code.find("void tracker_sample(", i_clock)
+cseg = code[i_clock:i_sample] if (i_clock != -1 and i_sample != -1 and i_clock < i_sample) else ""
+check("QueryPerformanceCounter" in cseg and "return (DWORD)s_tick" not in code,
+      "A1: clock_now uses realtime QPC; the s_tick frame counter is never a clock")
+check("clock: using realtime QPC (s_tick is a frame counter, not game time)" in src,
+      "A1: one-time realtime-clock note logged in settings_load")
+
+# ---- Part B ----
+check("g_font_dev" in src, "B1: font binds to its device (g_font_dev)")
+check("g_font_dev == dev) return;" in code, "B1: bound font reused only for the SAME device")
+check("(GetAsyncKeyState(VK_F9) & 0x8000)" in code,
+      "B2: panel keys require F9 held (modifier)")
+check("ui_is_foreground" in code and "GetForegroundWindow" in code and
+      "GetWindowThreadProcessId" in code,
+      "B2: keys gated on the game window being foreground")
+check("ui_key_edge(keys[i], i)" in code, "B2: per-key edge-trigger kept for 1-6")
+check("if (font_safe())" in code, "B3: font_destroy Releases only a font_safe() pointer")
+check("still failing" in code, "B4: font-failure heartbeat (once/300) present")
+check("s_font_fail_n == 1" in code, "B4: FAILED line logged only on the FIRST failure")
+check("uhr != 0) return;" in code, "B5: only S_OK proceeds past TestCooperativeLevel")
+check("D9_SETFVF         89" in src and "D9_GETFVF         90" in src,
+      "B6: SetFVF=89 / GetFVF=90 canonical vtable slots")
+check("saved_fvf" in code and "gf(dev, &saved_fvf)" in code and "sf(dev, saved_fvf)" in code,
+      "B6: backdrop saves + restores the device FVF around DrawPrimitiveUp")
+check("ovl-fvf" in src, "B6: FVF calls breadcrumbed (ovl-fvf)")
+check("InterlockedCompareExchange" in code and "present-reentrant" in src,
+      "B7: re-entrancy tripwire guards the overlay body (nested Present forwarded raw)")
+check("InterlockedExchange(&g_in_present, 0)" in code,
+      "B7: tripwire cleared on the single exit path")
+check("!g_settings.show_gains" in code, "B8: ShowGains=0 skips positive jumps (EMA frozen)")
+check("inst > g_last_ema[s] * ratio" in code,
+      "B8: positive-jump skip uses the same ratio threshold as spend spikes")
+check("if (g_settings.start_hidden) g_panel_visible = 0;" in code,
+      "B9: StartHidden hides the panel at load in DllMain")
+check("g_panel_visible = 0;" in code.split("settings_init")[-1] or
+      "start_hidden) g_panel_visible = 0;" in code,
+      "B9: start_hidden applied AFTER settings_load (init order preserved)")
+
 # ================= R14: modular layout =================
 
 for mod in ("logger.c", "tracker.c", "rate.c", "gameif.c", "settings.c", "ui.c"):

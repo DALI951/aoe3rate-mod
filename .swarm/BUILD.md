@@ -1,3 +1,33 @@
+# BUILD — ROUND 8 (REWORK, 2026-09-07) — EXTERNAL REVIEW (A1-A5) + INSPECTOR (B1-B9)
+
+## ROUND SUMMARY
+No crash this round — R8 is a hardening/pass two-review pass over the R7 build:
+- **Part A (external review):** A1 the rate clock was WRONG — `s_tick` is the per-Present FRAME counter, not millisecond game time, so game-time-based rates scaled with FPS; switched to realtime QPC (+ GetTickCount fallback), kept `UseGameTime` parsed-but-cosmetic, one-time log note. A2 added an explicit `g_ema_valid[MAX_SLOTS]` liveness flag (replaces the EMA-magnitude heuristic). A3 the per-tick `RES t=...` stream is now gated behind `[Debug] Enabled=1` (quiet log by default). A4 added `settings_poll_profile()` (1/sec-throttled re-poll of `Users\DefaultProfile*.xml`) called from present_hook with a `profile-poll` breadcrumb. A5 a second device vtable is now LOGGED (`second vtable %p seen (had %p) - not re-patched, overlay inactive on this device`) instead of silently skipped.
+- **Part B (inspector):** B1 `g_font_dev` binds the font to its device (a bound font for a different device is destroyed first). B2 panel hotkeys 1-6 now require F9 HELD + game-window foreground + per-key edge (no phantom toggles in chat / alt-tab); F9 toggle stays edge-triggered. B3 `font_destroy` Releases only through a `font_safe()` pointer. B4 font-create-failure logged once, then a heartbeat every 300 failures. B5 only `S_OK` proceeds past TestCooperativeLevel (`uhr != 0` → abort). B6 panel backdrop now saves/restores the device FVF via GetFVF/SetFVF vtable slots **89/90** (canonical DX9 vtable) around `DrawPrimitiveUp`, breadcrumbed `ovl-fvf`. B7 present_hook got an `InterlockedCompareExchange` re-entrancy tripwire (nested Present → forwarded raw, `present-reentrant` step). B8 `ShowGains=0` now treats strongly positive jumps like spend spikes (EMA frozen, baseline fresh, same ratio). B9 `[General] StartHidden=1` hides the panel at load.
+
+## The A1 fix (most important)
+- `src/tracker.c` `clock_now()`: formerly `if (use_game_time) return (DWORD)s_tick;` → now ALWAYS realtime (`QueryPerformanceCounter` → ms, `GetTickCount` fallback). Verified live definition: `s_tick++` in `observer_sample()` (src/gameif.c) — one increment per present frame, no ms meaning (the game's own `FUN_0086da39 * RVA_TIME_STEP=0.001f` multiplies per-tick deltas, but never produces a ms counter). Real-time EMA deltas are now `ms/1000` seconds regardless of FPS. `tracker_set_clock_override(ms)` keeps the deterministic harness; `tracker_reset` clears it.
+
+## File changes
+- `src/tracker.c` — realtime clock (A1), `tracker_set_clock_override` (A1), `g_ema_valid` liveness flag (A2, valid only after a real first rate — the very first sample lays down the baseline without marking alive), ShowGains=0 positive-jump skip (B8).
+- `src/settings.c` — one-time `clock: using realtime QPC (s_tick is a frame counter, not game time)` note (A1); `settings_poll_profile()` 1/s throttle (A4).
+- `src/gameif.c` — `RES t=...` + `rates ...` both under `if (g_settings.debug_enabled)` (A3).
+- `src/state.h` — externs: `g_ema_valid`, `g_font_dev`, `tracker_set_clock_override`, `settings_poll_profile`.
+- `src/ui.c` — `g_font_dev` binding + `font_destroy` NULLs it (B1/B3); hotkeys F9-held + foreground + edge (B2); failure log once + every-300 heartbeat (B4); `uhr != 0` TCL gate (B5); `D9_SETFVF 89 / D9_GETFVF 90` + save/restore around the backdrop + `ovl-fvf` breadcrumbs (B6); `font_safe()` gate inside `font_destroy` (B3).
+- `d3d9.c` — present_hook re-entrancy tripwire + `present-reentrant` step + single-exit clear (B7); `profile-poll` step + `settings_poll_profile()` call (A4); `patch_device_present` second-vtable log (A5); DllMain `StartHidden` → `g_panel_visible = 0` after `settings_load()` (B9); `g_ema_valid`, `g_font_dev` definitions.
+- `tests/test_rate_engine.c` — `ts()` clock-override helper (replaces the direct s_tick timeline), `show_gains=1` default, new ShowGains=0 skip test; realtime QPC test kept.
+- `tests/test_d3d9_actual.c` — observer log test sets `debug_enabled=1` (RES is gated); per-tick delta now `+2` (RES + paired `rates` line).
+- `tests/test_source_contract.py` — round-8 asserts (A1 QPC/no-s_tick-clock + note, A2 valid-flag lifecycle, A3 RES inside debug gate, A4 poll throttle + breadcrumb, A5 log string, B1 bound font, B2 F9+foreground+edge, B3 safe release, B4 heartbeat, B5 S_OK-only, B6 slots 89/90 + saved_fvf + ovl-fvf, B7 tripwire + single exit, B8 skip threshold, B9 start_hidden order).
+
+## Build / harnesses (this round)
+- Build rc=0, zero warnings, VERIFY PASS (i386 PE32, imports KERNEL32/USER32/msvcrt, 11 exports).
+- d3d9.dll = **142,052 B**, SHA256 `226c947dd77ca1fd851ac5fd4ef5e8e7f184bb59fbddf2ec5483f14a500190a0`, deployed byte-identical to game dir + tests\d3d9.dll (verified identical on all 3 copies); old d3d9mod.log deleted.
+- Harnesses: test_d3d9_actual.exe FAILURES 0 · test_rate_engine.exe FAILURES 0 · test_source_contract.py PASS (0 failures) · test_pe_structure.py FAILURES 0.
+
+> NOTE for the live test: with default settings (`[Debug] Enabled=0`) the log is now QUIET per frame — only chain/matches/errors and one-time notes. Set `[Debug] Enabled=1` to restore the per-tick `RES t=...` lines for calibration. RES/rates lines unchanged in format; Rate display unit untouched (`/min` by default).
+
+---
+
 # BUILD — ROUND 7 (REWORK, 2026-09-06) — CRASH MOVED TO ovl-panel: IT'S THE FONT. LAZY RE-CREATE + STRICT NULL + DOUBLE-GUARD
 
 ## ROUND SUMMARY
