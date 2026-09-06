@@ -35,16 +35,50 @@ void set_step(const char *s) {
     g_step[n] = '\0';
 }
 
+/* Direct file append + flush via the Win32 API: usable even if the CRT heap
+ * is corrupted by the crash. Same path/format as dlog ("d3d9mod.log"). */
+static void fault_write_raw(const char *line) {
+    char path[MAX_PATH];
+    if (GetModuleFileNameA(NULL, path, MAX_PATH) == 0) return;
+    char *slash = strrchr(path, '\\');
+    if (slash != NULL) { slash[1] = '\0'; lstrcatA(path, "d3d9mod.log"); }
+    else lstrcpyA(path, "d3d9mod.log");
+    HANDLE h = CreateFileA(path, FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(h, line, (DWORD)strlen(line), &w, NULL);
+    FlushFileBuffers(h);
+    CloseHandle(h);
+}
+
 long WINAPI fault_filter(struct _EXCEPTION_POINTERS *ep) {
     DWORD addr = 0, code = 0;
     if (ep != NULL && ep->ExceptionRecord != NULL) {
         addr = (DWORD)(DWORD_PTR)ep->ExceptionRecord->ExceptionAddress;
         code = ep->ExceptionRecord->ExceptionCode;
     }
+    char line[224];
+    _snprintf(line, sizeof(line),
+              "FAULT addr=%08X breadcrumb=%s code=%08X\r\n",
+              (unsigned)addr, (const char *)g_step, (unsigned)code);
+    fault_write_raw(line);   /* Win32 direct: survives heap/CRT damage */
     dlog("FAULT addr=%08X breadcrumb=%s code=%08X",
          (unsigned)addr, (const char *)g_step, (unsigned)code);
-    ExitProcess(0);
+    ExitProcess(code ? code : 1);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* The game (or another DLL) may replace SetUnhandledExceptionFilter after we
+ * install it at DllMain. Re-pin it every present frame so a crash ALWAYS yields
+ * our FAULT line. A vectored handler (installed in DllMain) is the backstop
+ * that cannot be replaced. */
+void ensure_fault_filter(void) {
+    if (s_prev_filter == NULL)
+        s_prev_filter = SetUnhandledExceptionFilter(fault_filter);
+    else
+        SetUnhandledExceptionFilter(fault_filter);
 }
 
 /* ---- guarded reads ---- */
@@ -281,22 +315,27 @@ static int rnd_i(float x) {
 void observer_sample(void) {
     DWORD ctx   = g_ctx ? (DWORD)(DWORD_PTR)g_ctx : 0;
     int   n     = ctx ? (int)safe_r32(ctx + OFF_CTX_PLAYERCNT) : 0;
+    int   chain_ok = (ctx != 0) && (n > 0) &&
+                     (g_res != NULL) && (g_inc != NULL);
 
-    /* match-start detection */
-    int match_start = ((s_last_ctx == 0) && (ctx != 0)) ||
-                      (g_obs_player != 0 && g_obs_player != s_last_player) ||
-                      (n != s_last_n);
-    if (match_start) {
-        dlog("--- match start n=%d player=%08X res=%08X ---",
-             n,
-             g_obs_player ? (unsigned)g_obs_player : 0u,
-             g_res ? (unsigned)(DWORD_PTR)g_res : 0u);
+    /* match-start: only on a VALID chain — loading/menu (n==0 or broken
+     * chain) never emits the separator or resets the engine. */
+    if (chain_ok) {
+        int match_start = (s_last_ctx == 0) ||
+                          (g_obs_player != 0 && g_obs_player != s_last_player) ||
+                          (n != s_last_n);
+        if (match_start) {
+            dlog("--- match start n=%d player=%08X res=%08X ---",
+                 n,
+                 (unsigned)g_obs_player,
+                 (unsigned)(DWORD_PTR)g_res);
+            s_snap_have = 0;
+            s_tick = 0;
+            tracker_reset();
+        }
         s_last_ctx = ctx;
         s_last_player = g_obs_player;
         s_last_n = n;
-        s_snap_have = 0;
-        s_tick = 0;
-        tracker_reset();
     }
 
     s_tick++;

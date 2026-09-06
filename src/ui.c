@@ -6,6 +6,9 @@
  *  - Draw BEFORE original Present (hooked in d3d9.c). Explicit backbuffer RT via
  *    GetBackBuffer + SetRenderTarget; render states saved/restored.
  *  - TestCooperativeLevel guard; Reset hook (slot 16) -> font invalidate/recreate.
+ *  - Font is created ONCE at device-create and re-created on a successful
+ *    Reset — NEVER inside the draw path (mid-frame D3DXCreateFontA was the R14
+ *    match-start crash). ui_draw skips cleanly when no font is present.
  *  - Crash-proof: every call null-guarded; overlay disabled gracefully if
  *    d3dx9_25.dll or the font fails.
  *  - Panel hidden in menus (n==0 => g_res==NULL) and frozen while paused
@@ -106,16 +109,7 @@ void ui_init(void) {
 }
 
 void ui_on_reset(void) {
-    if (g_font != NULL) {
-        void **vt = *(void ***)g_font;
-        if (vt != NULL) {
-            VF_HR onlost = (VF_HR)vt[FONT_ONLOSTDEVICE];
-            if (onlost) onlost(g_font);
-            VF_HR rel = (VF_HR)vt[2];
-            if (rel) rel(g_font);
-        }
-        g_font = NULL;
-    }
+    ui_release_font();
     dlog("reset -> font invalidated");
 }
 
@@ -281,8 +275,10 @@ static void ui_draw_panel(void *dev) {
     end(g_font);
 }
 
-static void ui_recreate_font(void *dev) {
+void ui_create_font(void *dev) {
     if (g_font != NULL) return;
+    if (dev == NULL) return;
+    if (!g_ui_ready) return;
     void **vt = *(void ***)dev;
     if (vt == NULL) return;
     PFN_CREATEFONT cf = (PFN_CREATEFONT)(DWORD_PTR)
@@ -300,51 +296,55 @@ static void ui_recreate_font(void *dev) {
     if (hr >= 0 && font != NULL) {
         g_font = font;
         if (!g_ui_logged) { dlog("UI: font created size=%d face=%s", size, face); g_ui_logged = 1; }
-    } else if (!g_ui_logged) {
+    } else {
         dlog("UI: D3DXCreateFontA failed hr=%#010x", (unsigned)hr);
-        g_ui_logged = 1;
     }
 }
 
 void ui_draw(void) {
+    set_step("ovl-start");
     if (!g_settings.enabled) return;
     if (!g_version_ok) return;           /* version gate failed -> no overlay */
     if (!g_panel_visible) return;
+    if (!g_values_valid) return;         /* no sampled RES yet -> no overlay */
     if (g_res == NULL) return;           /* menu/loading (n==0) -> no overlay */
     if (g_device == NULL) return;
     if (!g_ui_ready) return;             /* d3dx9_25.dll missing -> graceful */
-    void *dev = g_device;
+    if (g_font == NULL) return;          /* font owned by device-create/Reset */
 
+    void *dev = g_device;
     void **vt = *(void ***)dev;
     if (vt == NULL) return;
 
     /* cooperative level guard */
+    set_step("ovl-tcl");
     VF_HR tcl = (VF_HR)vt[D9_TESTCOOPLEVEL];
     if (tcl != NULL) {
         int hr = tcl(dev);
         DWORD uhr = (DWORD)(unsigned long)hr;
-        if (uhr == 0x88760868u) return;    /* D3DERR_DEVICELOST */
-        if (uhr == 0x88760869u) {          /* D3DERR_DEVICENOTRESET */
-            ui_release_font();
-            return;
-        }
+        if (uhr == 0x88760868u) return;    /* D3DERR_DEVICELOST: no draw */
+        if (uhr == 0x88760869u) return;    /* D3DERR_DEVICENOTRESET: no draw
+                                              (font re-created by the Reset hook) */
     }
 
-    ui_recreate_font(dev);
-    if (g_font == NULL) return;
-
-    /* explicit backbuffer render target + render-state save/restore */
+    /* RT switch only when BOTH the previous target and the backbuffer are
+     * captured — a failed GetBackBuffer/GetRenderTarget must never NULL the
+     * device's target. */
+    set_step("ovl-rt");
     void *bb = NULL, *prev_rt = NULL;
+    VF_GETRT grt = (VF_GETRT)vt[D9_GETRENDERTARGET];
     VF_GETBB gbb = (VF_GETBB)vt[D9_GETBACKBUFFER];
     VF_SETRT srt = (VF_SETRT)vt[D9_SETRENDERTARGET];
+    if (grt == NULL || gbb == NULL || srt == NULL) return;
+    if (grt(dev, 0, &prev_rt) < 0 || prev_rt == NULL) return;
+    if (gbb(dev, 0, 0, &bb) < 0 || bb == NULL) return;
+    srt(dev, 0, bb);
+
+    /* render-state save / set / restore (SET only after a captured RT) */
+    set_step("ovl-states");
+    DWORD st_z = 1, st_zw = 1, st_st = 0, st_ab = 0, st_sb = 0, st_db = 0, st_li = 1;
     VF_GETSTATE grs = (VF_GETSTATE)vt[D9_GETRENDERSTATE];
     VF_SETSTATE srs = (VF_SETSTATE)vt[D9_SETRENDERSTATE];
-    VF_GETRT grt = (VF_GETRT)vt[D9_GETRENDERTARGET];
-    if (grt != NULL) grt(dev, 0, &prev_rt);
-    if (gbb != NULL) gbb(dev, 0, 0, &bb);
-    if (bb != NULL && srt != NULL) srt(dev, 0, bb);
-
-    DWORD st_z = 1, st_zw = 1, st_st = 0, st_ab = 0, st_sb = 0, st_db = 0, st_li = 1;
     if (grs != NULL) {
         grs(dev, D3DRS_ZENABLE, &st_z);
         grs(dev, D3DRS_ZWRITEENABLE, &st_zw);
@@ -364,14 +364,19 @@ void ui_draw(void) {
         srs(dev, D3DRS_LIGHTING, 0);
     }
 
+    /* scene + panel: EndScene is ALWAYS called once BeginScene succeeded */
+    set_step("ovl-begin");
     VF_HR beg = (VF_HR)vt[D9_BEGINSCENE];
     VF_HR end = (VF_HR)vt[D9_ENDSCENE];
-    if (beg != NULL && beg(dev) >= 0) {
+    if (beg != NULL && end != NULL && beg(dev) >= 0) {
+        set_step("ovl-panel");
         ui_draw_panel(dev);
-        if (end != NULL) end(dev);
+        set_step("ovl-end");
+        end(dev);
     }
 
-    /* restore render states + RT */
+    /* restore render states (reverse), then the RT, then release surfaces */
+    set_step("ovl-restore");
     if (srs != NULL) {
         srs(dev, D3DRS_LIGHTING, st_li);
         srs(dev, D3DRS_DESTBLEND, st_db);
@@ -381,12 +386,18 @@ void ui_draw(void) {
         srs(dev, D3DRS_ZWRITEENABLE, st_zw);
         srs(dev, D3DRS_ZENABLE, st_z);
     }
-    if (srt != NULL && prev_rt != NULL) srt(dev, 0, prev_rt);
-    if (bb != NULL) {
+    srt(dev, 0, prev_rt);
+    {
         void **svt = *(void ***)bb;
         if (svt != NULL) {
             VF_HR rel = (VF_HR)svt[2];
             if (rel) rel(bb);
         }
+        void **pvt = *(void ***)prev_rt;
+        if (pvt != NULL) {
+            VF_HR rel = (VF_HR)pvt[2];
+            if (rel) rel(prev_rt);
+        }
     }
+    set_step("ovl-done");
 }

@@ -152,6 +152,7 @@ static int STDMETHODCALLTYPE w_create_device(void *self, UINT adapter, UINT type
         int patched = patch_device_present(*ppdev);
         dlog("CreateDevice hr=%#010x dev=%p patched=%s",
              (unsigned)hr, *ppdev, patched ? "yes" : "no");
+        ui_create_font(*ppdev);   /* font at device-create, never mid-frame */
     }
     return hr;
 }
@@ -164,6 +165,7 @@ static int STDMETHODCALLTYPE w_create_device_ex(void *self, UINT adapter, UINT t
         int patched = patch_device_present(*ppdev);
         dlog("CreateDeviceEx hr=%#010x dev=%p patched=%s",
              (unsigned)hr, *ppdev, patched ? "yes" : "no");
+        ui_create_font(*ppdev);   /* font at device-create, never mid-frame */
     }
     return hr;
 }
@@ -211,6 +213,7 @@ static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
     ui_on_reset();
     int hr = (s_orig_reset != NULL) ? s_orig_reset(self, pp) : (int)0x8876086c;
     patch_device_present(self);
+    if (hr >= 0) ui_create_font(self);   /* re-create font on successful Reset */
     set_step("reset-done");
     return hr;
 }
@@ -218,6 +221,7 @@ static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
 static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT *b,
         HWND hwnd, const void *dirty) {
     g_device = self;
+    ensure_fault_filter();   /* the game may have replaced our unhandled filter */
     set_step("locate");
     locate_resources();
 
@@ -442,6 +446,9 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         g_step[0] = '\0';
         if (s_prev_filter == NULL)
             s_prev_filter = SetUnhandledExceptionFilter(fault_filter);
+        /* second-chance vectored handler: cannot be replaced by the game's own
+         * SetUnhandledExceptionFilter calls, so a crash ALWAYS logs FAULT. */
+        AddVectoredExceptionHandler(0, fault_filter);
         set_step("dllmain");
 
         /* load real d3d9.dll */
