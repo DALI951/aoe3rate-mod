@@ -1,8 +1,11 @@
 *.log
-d3d9.dll
-d3dx9_25.dll
-tests/d3d9.dll
-tests/*.exe
-Temp/
+*.exe
+*.dll
 *.o
 *.obj
+*.d
+*.log
+d3dx9_25.dll
+Temp/
+build_log.txt
+build_test.txt
