@@ -29,6 +29,7 @@ void   *g_res    = NULL;
 void   *g_inc    = NULL;
 void   *g_device = NULL;
 void  **g_devvt  = NULL;
+int     g_frames_since_reset = 0;   /* cooldown: no overlay RT work right after Create/Reset */
 
 int   g_player_idx = -1;
 int   s_snap_have  = 0;
@@ -152,6 +153,7 @@ static int STDMETHODCALLTYPE w_create_device(void *self, UINT adapter, UINT type
         int patched = patch_device_present(*ppdev);
         dlog("CreateDevice hr=%#010x dev=%p patched=%s",
              (unsigned)hr, *ppdev, patched ? "yes" : "no");
+        g_frames_since_reset = 0;
         ui_create_font(*ppdev);   /* font at device-create, never mid-frame */
     }
     return hr;
@@ -165,6 +167,7 @@ static int STDMETHODCALLTYPE w_create_device_ex(void *self, UINT adapter, UINT t
         int patched = patch_device_present(*ppdev);
         dlog("CreateDeviceEx hr=%#010x dev=%p patched=%s",
              (unsigned)hr, *ppdev, patched ? "yes" : "no");
+        g_frames_since_reset = 0;
         ui_create_font(*ppdev);   /* font at device-create, never mid-frame */
     }
     return hr;
@@ -209,6 +212,7 @@ static D3D9W *wrap_d3d9(void *real) {
 
 static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
     g_device = self;
+    g_frames_since_reset = 0;
     set_step("reset-hook");
     ui_on_reset();
     int hr = (s_orig_reset != NULL) ? s_orig_reset(self, pp) : (int)0x8876086c;
@@ -221,6 +225,7 @@ static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
 static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT *b,
         HWND hwnd, const void *dirty) {
     g_device = self;
+    if (g_frames_since_reset < 0x7FFFFFFF) g_frames_since_reset++;
     ensure_fault_filter();   /* the game may have replaced our unhandled filter */
     set_step("locate");
     locate_resources();

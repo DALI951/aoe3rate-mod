@@ -54,6 +54,8 @@ extern void   *g_res;
 extern void   *g_inc;
 extern void   *g_device;
 extern void  **g_devvt;
+extern int     g_frames_since_reset;
+#define RESET_COOLDOWN_FRAMES 30   /* ~0.5s @60fps of no-draw after Create/Reset */
 extern int     g_player_idx;
 extern int     s_snap_have;
 extern DWORD   g_obs_player;

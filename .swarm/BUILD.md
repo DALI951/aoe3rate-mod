@@ -1,3 +1,53 @@
+# BUILD — ROUND 4 (REWORK, 2026-09-05) — CRASH ON FIRST FRAME AFTER DEVICE RESET (ovl-rt AV)
+
+## ROUND SUMMARY
+Dali's live log (R14.3):
+```
+CreateDevice hr=0000000000 dev=0cc38d60 patched=yes
+UI: font created size=14 face=Georgia
+chain ... ctx==0 (x4)
+reset -> font invalidated
+chain game=04AAF000 ctx=059E0000 n=3 player=0F6F7800 res=1286A300 [human-p1]
+--- match start n=3 ...
+RES t=1 ...
+FAULT addr=774EFF25 breadcrumb=ovl-rt code=C0000005   (x4, then process dies)
+```
+`ovl-rt` = the overlay's GetBackBuffer/SetRenderTarget step in `ui_draw()`; `0xC0000005` = a real access violation inside d3d9.dll itself — the device was in a transitional state right after Reset. The overlay drew on the very frame the match started.
+
+## ROOT CAUSE (one paragraph)
+After a D3D9 device Reset the device object is in a transitional state; calling `GetBackBuffer`/`SetRenderTarget` on it before it settles faults inside d3d9.dll (AV at `774EFF25`). Two aggravators: (1) the font was actually re-created by the Reset hook but the creation line was suppressed by a once-only `g_ui_logged` latch — so the log misled us into thinking the font was missing, when in fact `ui_draw` ran its whole RT dance on a device that had been reset the same frame; (2) no cooldown existed between Reset success and the first overlay draw. Dalan's draw ordering was technically correct (font checked before RT calls) but there was no safety delay and no HRESULT acceptance test on `SetRenderTarget`.
+
+## THE FIX (exact semantics)
+1. **Post-Reset cooldown:** new global `g_frames_since_reset` (defined in `d3d9.c`, `extern` in `state.h`, `RESET_COOLDOWN_FRAMES 30` ≈ 0.5s @60fps). Zeroed on every `CreateDevice`/`CreateDeviceEx` success and at the top of `reset_hook`; incremented once per `present_hook` frame. `ui_draw()` returns immediately while `g_frames_since_reset < RESET_COOLDOWN_FRAMES` — no GetBackBuffer/SetRenderTarget/BeginScene until the device has settled. The check sits AFTER the `g_font == NULL` guard (font-first) and BEFORE the `ovl-tcl`/`ovl-rt` steps.
+2. **Font-first ordering (confirmed):** `if (g_font == NULL) return;` remains the first device guard, before ANY RT manipulation (GetBackBuffer, SetRenderTarget, state save, BeginScene).
+3. **Font re-creation on Reset + honest logging:** the Reset hook already re-creates the font via `ui_create_font(self)` when `hr >= 0`; the once-only `g_ui_logged` latch is REMOVED so every create logs `UI: font created size=.. face=..` — the post-Reset path is now visible in `d3d9mod.log`. (In the failing log, the font HAD been re-created — that's why execution reached `ovl-rt` at all; the suppressed log was the red herring.)
+4. **HRESULT checks on all RT calls in `ui_draw`:** `GetRenderTarget`, `GetBackBuffer` already bail; new — `SetRenderTarget(dev, 0, bb)` failure now restores the previous RT, releases both surfaces and skips the frame (never continues into BeginScene/DrawText on a failed RT setup).
+5. All prior round fixes kept intact (log-only vectored handler + benign-code filter, font at device-create only, both-surfaces release, match-start needs a valid chain, `ovl-*` breadcrumbs).
+
+## FILES CHANGED
+- `src/ui.c` — cooldown gate in `ui_draw`; `SetRenderTarget` HRESULT bail (restore prev RT + release + skip); `g_ui_logged` removed, every font create logged.
+- `src/state.h` — `extern int g_frames_since_reset;` + `RESET_COOLDOWN_FRAMES 30`.
+- `d3d9.c` — global `g_frames_since_reset`; zeroed in `w_create_device`/`w_create_device_ex`/`reset_hook`; incremented in `present_hook`.
+- `tests/test_source_contract.py` — round-4 asserts: cooldown define + increment + triple zero, font-first guard, cooldown-before-`ovl-rt` ordering, unconditional font-create log.
+
+## BUILD RESULT
+- `cmd /c build\build.bat` → **rc=0, ZERO warnings**, verify_pe PASS (i386, PE32, imports ⊆ {KERNEL32, USER32, msvcrt}, **11 exports**)
+- **d3d9.dll = 137,179 B, SHA256 `f55f556d6af25bb585b5de23578a2f0b254896e254cdf93867f6ed316ef97817`** (`d3d9.sha256` updated)
+- **Deployed byte-identical**: repo root = game dir = `tests\d3d9.dll` (hashes equal); old game `d3d9mod.log` deleted. Game NOT launched.
+
+## HARNESS RESULTS (all green)
+- `tests\test_d3d9_actual.exe` — ALL CHECKS PASSED
+- `tests\test_rate_engine.exe` — FAILURES: 0
+- `tests\test_source_contract.py` — SOURCE-CONTRACT: PASS (incl. new round-4 checks)
+- `tests\test_pe_structure.py` — FAILURES: 0
+
+## WHAT DALI TESTS NEXT (live)
+1. Game must reach the main menu (no load-time FAULT).
+2. Start a skirmish (the game's Reset + match start): the overlay must NOT appear instantly, then fade in ~0.5s later (`UI: font created` must ALSO appear in the post-Reset section of `d3d9mod.log` this time), no `FAULT breadcrumb=ovl-rt` line.
+3. If a FAULT line still appears, send it — it proves a genuinely unhandled fatal and gives us the real addr.
+
+---
+
 # BUILD — ROUND 3 (REWORK, 2026-09-06) — GAME WON'T START (BENIGN-EXCEPTION KILL)
 
 ## ROUND SUMMARY

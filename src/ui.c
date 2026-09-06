@@ -76,7 +76,6 @@ typedef int (STDMETHODCALLTYPE *VF_DRAWTEXT)(void *self, const char *text,
 static HMODULE g_d3dx = NULL;
 static void   *g_font = NULL;
 static int     g_ui_ready = 0;
-static int     g_ui_logged = 0;
 static unsigned short g_key_prev[8];
 
 typedef int (STDMETHODCALLTYPE *PFN_CREATEFONT)(void *dev, int h, UINT w, UINT wt,
@@ -284,7 +283,7 @@ void ui_create_font(void *dev) {
     PFN_CREATEFONT cf = (PFN_CREATEFONT)(DWORD_PTR)
         GetProcAddress(g_d3dx, "D3DXCreateFontA");
     if (cf == NULL) {
-        if (!g_ui_logged) { dlog("UI: D3DXCreateFontA missing"); g_ui_logged = 1; }
+        dlog("UI: D3DXCreateFontA missing");
         return;
     }
     const char *face = (g_settings.font_name[0] != '\0')
@@ -295,7 +294,7 @@ void ui_create_font(void *dev) {
     int hr = cf(dev, -size, 0, 400, 1, 0, 0, 1, 0, 0, face, &font);
     if (hr >= 0 && font != NULL) {
         g_font = font;
-        if (!g_ui_logged) { dlog("UI: font created size=%d face=%s", size, face); g_ui_logged = 1; }
+        dlog("UI: font created size=%d face=%s", size, face);  /* every create, incl. post-Reset */
     } else {
         dlog("UI: D3DXCreateFontA failed hr=%#010x", (unsigned)hr);
     }
@@ -311,6 +310,8 @@ void ui_draw(void) {
     if (g_device == NULL) return;
     if (!g_ui_ready) return;             /* d3dx9_25.dll missing -> graceful */
     if (g_font == NULL) return;          /* font owned by device-create/Reset */
+    if (g_frames_since_reset < RESET_COOLDOWN_FRAMES) return; /* device settling
+                                          after Create/Reset before RT calls */
 
     void *dev = g_device;
     void **vt = *(void ***)dev;
@@ -338,7 +339,16 @@ void ui_draw(void) {
     if (grt == NULL || gbb == NULL || srt == NULL) return;
     if (grt(dev, 0, &prev_rt) < 0 || prev_rt == NULL) return;
     if (gbb(dev, 0, 0, &bb) < 0 || bb == NULL) return;
-    srt(dev, 0, bb);
+    if (srt(dev, 0, bb) < 0) {
+        /* SetRenderTarget failed -> keep the device target untouched: restore
+         * the previous RT and release both surfaces, then skip this frame. */
+        srt(dev, 0, prev_rt);
+        void **bvt = *(void ***)bb;
+        if (bvt != NULL) { VF_HR brel = (VF_HR)bvt[2]; if (brel) brel(bb); }
+        void **pvt = *(void ***)prev_rt;
+        if (pvt != NULL) { VF_HR prel = (VF_HR)pvt[2]; if (prel) prel(prev_rt); }
+        return;
+    }
 
     /* render-state save / set / restore (SET only after a captured RT) */
     set_step("ovl-states");

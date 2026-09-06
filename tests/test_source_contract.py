@@ -201,6 +201,24 @@ check("EXCEPTION_CONTINUE_SEARCH" in seg,
 check("fault_filter" in src and "ExitProcess" in src,
       "fatal exit lives on the legacy unhandled-filter path only")
 
+# ================= Round 4: post-Reset cooldown + draw ordering =================
+
+check("RESET_COOLDOWN_FRAMES" in src, "RESET_COOLDOWN_FRAMES defined (state.h)")
+check("g_frames_since_reset" in src and "g_frames_since_reset++" in src,
+      "present_hook increments g_frames_since_reset every frame")
+check("g_frames_since_reset = 0;" in src and src.count("g_frames_since_reset = 0;") >= 3,
+      "counter zeroed on CreateDevice / CreateDeviceEx / Reset")
+check("g_font == NULL) return;" in src, "ui_draw guards font-first before RT work")
+check("g_frames_since_reset < RESET_COOLDOWN_FRAMES" in src,
+      "ui_draw waits out the post-Reset cooldown before RT setup")
+# set-step ordering inside ui_draw: rt/tcl must come AFTER the cooldown check
+i_rt = src.find("set_step(\"ovl-rt\")")
+i_cd = src.find("g_frames_since_reset < RESET_COOLDOWN_FRAMES")
+check(i_rt != -1 and i_cd != -1 and i_cd < i_rt,
+      "cooldown check precedes the ovl-rt (GetBackBuffer/SetRenderTarget) step")
+check('dlog("UI: font created size=%d face=%s"' in src,
+      "font creation logged on EVERY create (post-Reset path visible in log)")
+
 # ================= R14: modular layout =================
 
 for mod in ("logger.c", "tracker.c", "rate.c", "gameif.c", "settings.c", "ui.c"):
