@@ -142,7 +142,7 @@ check("D9_ENDSCENE       42" in src, "EndScene device slot 42")
 check("D9_GETRENDERTARGET 38" in src, "GetRenderTarget device slot 38")
 check("D9_DRAWPRIMITIVEUP 83" in src, "DrawPrimitiveUp device slot 83")
 check("reset_hook" in src and "ui_on_reset(" in src,
-      "Reset hook invalidates/recreates the font")
+      "Reset hook invalidates the font (lazy re-create on present path)")
 check("reset dev=%p" in src, "Reset hook logs the ACTUAL device (reset dev=%p)")
 check("g_version_ok) return;" in src or "if (!g_version_ok) return;" in src,
       "ui_draw is disabled when the version gate fails")
@@ -217,8 +217,47 @@ i_rt = src.find("ovl-grt")
 i_cd = src.find("g_frames_since_reset < RESET_COOLDOWN_FRAMES")
 check(i_rt != -1 and i_cd != -1 and i_cd < i_rt,
       "cooldown check precedes the ovl-grt (GetRenderTarget) step")
-check('dlog("UI: font created size=%d face=%s"' in src,
-      "font creation logged on EVERY create (post-Reset path visible in log)")
+check('dlog("UI: font created size=%d face=%s font=%p"' in src,
+      "font creation logged on EVERY create with the font pointer (post-Reset path visible)")
+
+# ================= Round 7: font lifecycle — never create inside Reset =================
+# Crash forensics: round-6 build drew overlay again but died at ovl-panel with
+# eip=000000D8 (a virtual call through a NULL/dangling object) on BOTH runs. The
+# font was created inside reset_hook while the device is still NOTRESET ->
+# D3DXCreateFontA returned a broken object / D3DXFont died on the first real
+# DrawText. Fix: font_destroy (strict NULL), NO creation in reset_hook, LAZY
+# re-create on the present path guarded by TestCooperativeLevel == OK, and a
+# VirtualQuery double-guard right before the font's Begin.
+
+# (1) font_destroy is the only free path and clears g_font immediately
+check("font_destroy" in src and "font_destroy(void)" in src,
+      "font_destroy helper exists (the only way the font is freed)")
+i_d = src.find("static void font_destroy(void)")
+i_e = src.find("void ui_init(void)", i_d)
+seg = src[i_d:i_e] if (i_d != -1 and i_e != -1 and i_d < i_e) else ""
+check('g_font = NULL;' in seg and 'rel(g_font)' in seg,
+      "font_destroy Releases via the font vtable AND NULLs g_font immediately")
+# (2) reset_hook must NOT create the font (device is NOTRESET during Reset)
+i_r = code.find("reset_hook(void *self, const void *pp) {")
+i_rb = code.find("set_step(\"reset-done\")", i_r)
+rseg = code[i_r:i_rb] if (i_r != -1 and i_rb != -1 and i_r < i_rb) else code
+check("ui_create_font" not in rseg and "D3DXCreateFontA" not in rseg,
+      "reset_hook never creates the font (lazy re-create only)")
+check("ui_on_reset(self)" in rseg, "reset_hook still calls ui_on_reset (invalidate + log)")
+# (3) lazy create in the present path AFTER TestCooperativeLevel == OK
+i_create = code.find("ui_create_font(dev);")
+i_tcl = code.find("0x88760869u")
+check(i_create != -1 and i_tcl != -1 and i_tcl < i_create,
+      "lazy font creation happens AFTER the TCL==OK check in ui_draw")
+check('if (g_font == NULL) {' in code and "ui_create_font(dev);" in code,
+      "font created only when g_font == NULL on the present path")
+check("if (g_font == NULL) return;" in code,
+      "font-first guard kept: create failure skips the frame")
+# (4) honest create log (never claim success on failure)
+check('UI: font create FAILED hr=0x%08X' in src, "failed create logged as FAILED")
+# (5) VirtualQuery double-guard right before the font Begin
+check("font_safe" in src and "VirtualQuery(g_font" in src and "VirtualQuery(vt" in src,
+      "panel re-verifies font object + vtable are mapped readable before Begin")
 
 # ================= Round 6: revert per-vtable originals; drop RT-switch =================
 # Crash forensics: FAULT breadcrumb=ovl-srt (SetRenderTarget) with garbage

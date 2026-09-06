@@ -180,7 +180,7 @@ void ensure_fault_filter(void);
 
 /* ---- UI ---- */
 void ui_init(void);
-void ui_create_font(void *dev);   /* device-create + Reset only, never mid-frame */
+void ui_create_font(void *dev);   /* device-create + lazy present-path (TCL==OK) only */
 void ui_draw(void);
 void ui_on_reset(void *dev);
 void ui_toggle_panel(void);

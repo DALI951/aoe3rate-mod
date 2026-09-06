@@ -234,7 +234,11 @@ static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
     ui_on_reset(self);   /* logs "reset dev=%p -> font invalidated" */
     int hr = (s_orig_reset != NULL) ? s_orig_reset(self, pp) : (int)0x8876086c;
     patch_device_present(self);   /* re-assert slots 16/17 on the ACTUAL device */
-    if (hr >= 0) ui_create_font(self);   /* re-create font on successful Reset */
+    /* NO font creation here (round-7 fix): the device is still in NOTRESET
+     * limbo during Reset — D3DXCreateFontA here FAILS or returns a broken
+     * object (live fault: eip=000000D8 at ovl-panel = call through a dangling
+     * font). The font is re-created LAZILY on the next present frame, only
+     * after TestCooperativeLevel returns OK (device truly up). */
     set_step("reset-done");
     return hr;
 }

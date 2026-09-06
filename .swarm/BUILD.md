@@ -1,3 +1,44 @@
+# BUILD — ROUND 7 (REWORK, 2026-09-06) — CRASH MOVED TO ovl-panel: IT'S THE FONT. LAZY RE-CREATE + STRICT NULL + DOUBLE-GUARD
+
+## ROUND SUMMARY
+Confirmed in `d3d9mod.log` (both runs, killed twice each):
+```
+11: reset dev=0cca2b20 -> font invalidated
+12: UI: font created size=14 face=Georgia      <- created INSIDE reset_hook, device still NOTRESET
+15: RES t=1 food=0 wood=0 coin=0 export=0
+16: FAULT addr=000000D8 eip=000000D8 ... breadcrumb=ovl-panel code=C0000005 dev=0CCA2B20 vt=0CCA5A7C slot=83
+```
+Genuine progress: `ovl-grt`/`ovl-begin` never appear — the RT step is FIXED. New crash: `eip=000000D8` = a virtual call through a NULL/dangling object, inside `ovl-panel` (the D3DXFont Begin→DrawText→End block). `dev=0CCA2B20` is the real device (instrumentation sane). **Root cause:** the font is created inside `reset_hook` DURING `Reset` while the device is in NOTRESET limbo — `D3DXCreateFontA` fails (log printed "font created" unconditionally) or returns a broken object; first DrawText on it → call through NULL → `eip=0xD8`. The R6/R7-proven behavior was LAZY re-create: Reset only invalidates; the font is (re)created on the NEXT present frame only when TestCooperativeLevel == OK.
+
+## The fix
+### 1. reset_hook (d3d9.c) — NO font creation
+- log `reset dev=%p -> font invalidated`; destroy font via `ui_on_reset` → `font_destroy()` (Release via font vtable + **g_font = NULL immediately**); forward to real Reset (`s_orig_reset`); re-assert hooks on actual `self`; return. `ui_create_font(self)` line REMOVED from the hook.
+
+### 2. Lazy creation on the present path (ui_draw, src/ui.c)
+After the cooldown and `TestCooperativeLevel` (LOST/NOTRESET already bail), if `g_font == NULL` → `ui_create_font(dev)`:
+- `hr == 0 && font != NULL` → `g_font = font`, log `UI: font created size=%d face=%s font=%p` (**includes the pointer** so a fresh object is provable).
+- else → `g_font = NULL` (never leave a dangling non-NULL font) and log `UI: font create FAILED hr=0x%08X` (the unconditional "created" message is gone).
+- then the existing font-first guard `if (g_font == NULL) return;` skips the frame.
+
+### 3. Double-guard in ovl-panel (`font_safe()`)
+Immediately before the font's `Begin`, `font_safe()` re-verifies `g_font != NULL` AND `VirtualQuery`-guards both `g_font` and its vtable pointer are mapped readable `MEM_COMMIT` with no `PAGE_GUARD`/`PAGE_NOACCESS`; if bad → `logger_debug` once and skip, never call through it.
+
+### 4. Kept from round 6
+No SetRenderTarget/GetBackBuffer; GetRenderTarget current-RT flow; breadcrumbs `ovl-tcl/grt/states/begin/panel/end/restore/done`; cooldown 30f; g_values_valid; TCL guard; rich FAULT dump; first-draw marker; zero-touch Enabled=0.
+
+## File changes
+- `src/ui.c` — `font_destroy()` (renamed from `ui_release_font`, drops the risky OnLostDevice call, preserves the immediate `g_font = NULL`); `font_safe()` helper + `g_font_guard_warned`; `ui_draw` lazy-create after TCL; `ui_create_font` honest hr check + `font=%p` + FAILED log; `ui_draw_panel` double-guard gate.
+- `d3d9.c` — `reset_hook`: removed `if (hr >= 0) ui_create_font(self)`.
+- `src/state.h` — `ui_create_font` comment updated (device-create + lazy present path).
+- `tests/test_source_contract.py` — round-7 asserts: `font_destroy` NULLs `g_font`; `reset_hook` segment never calls `ui_create_font`/`D3DXCreateFontA`; lazy create after `0x88760869u`; `font_safe` VirtualQuery double-guard; create FAILED log string.
+
+## Build / harnesses (this round)
+- Build rc=0, zero warnings, VERIFY PASS (i386 PE32, imports KERNEL32/USER32/msvcrt, 11 exports).
+- d3d9.dll = **138,318 B**, SHA256 `a17033b201cc9bac222ec9f9febc4d3043fb4ba9416d85bd42162b0db4b76ad6`, deployed byte-identical to game dir + tests\d3d9.dll; old d3d9mod.log deleted.
+- Harnesses: test_d3d9_actual.exe ALL PASS · test_rate_engine.exe FAILURES 0 · test_source_contract.py PASS (0 failures) · test_pe_structure.py FAILURES 0.
+
+---
+
 # BUILD — ROUND 6 (REWORK, 2026-09-06) — REVERT PER-VTABLE MACHINERY + REMOVE SetRenderTarget/GetBackBuffer FROM THE DRAW PATH
 
 ## ROUND SUMMARY

@@ -5,10 +5,12 @@
  *  - ID3DXFont vtable: 12 Begin, 13 DrawTextA, 15 End, 16 OnLostDevice, 17 OnResetDevice.
  *  - Draw BEFORE original Present (hooked in d3d9.c). Explicit backbuffer RT via
  *    GetBackBuffer + SetRenderTarget; render states saved/restored.
- *  - TestCooperativeLevel guard; Reset hook (slot 16) -> font invalidate/recreate.
- *  - Font is created ONCE at device-create and re-created on a successful
- *    Reset — NEVER inside the draw path (mid-frame D3DXCreateFontA was the R14
- *    match-start crash). ui_draw skips cleanly when no font is present.
+ *  - TestCooperativeLevel guard; Reset hook (slot 16) -> font invalidate only.
+ *  - Font is created at device-create and re-created LAZILY on the first
+ *    present frame where TestCooperativeLevel == OK after a Reset (creating
+ *    inside Reset while the device is NOTRESET returns a broken/dangling
+ *    font — the round-7 eip=0xD8 ovl-panel crash). ui_draw skips cleanly
+ *    when no font is present.
  *  - Crash-proof: every call null-guarded; overlay disabled gracefully if
  *    d3dx9_25.dll or the font fails.
  *  - Panel hidden in menus (n==0 => g_res==NULL) and frozen while paused
@@ -72,18 +74,40 @@ typedef int (STDMETHODCALLTYPE *VF_DRAWTEXT)(void *self, const char *text,
 static HMODULE g_d3dx = NULL;
 static void   *g_font = NULL;
 static int     g_ui_ready = 0;
+static int     g_font_guard_warned = 0;
 static unsigned short g_key_prev[8];
+
+/* Returns 1 only when the font object and its vtable are safely dereferenceable:
+ * g_font non-NULL, reading *g_font won't fault, and the vtable pointed at is a
+ * committed, readable (non-guard/noaccess) region. Checking both regions makes a
+ * dangling/corrupted font fail BEFORE a virtual call instead of executing at
+ * garbage (eip=0xD8). */
+static int font_safe(void) {
+    if (g_font == NULL) return 0;
+    void **vt = *(void ***)g_font;
+    if (vt == NULL) return 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery(g_font, &mbi, sizeof(mbi)) ||
+        mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
+    if (!VirtualQuery(vt, &mbi, sizeof(mbi)) ||
+        mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return 0;
+    return 1;
+}
 
 typedef int (STDMETHODCALLTYPE *PFN_CREATEFONT)(void *dev, int h, UINT w, UINT wt,
         UINT mip, int italic, DWORD charset, DWORD outprec, DWORD qual, DWORD pitch,
         const char *face, void **out);
 
-static void ui_release_font(void) {
+/* The ONLY way the font object gets freed. Strict NULL discipline: g_font is
+ * cleared immediately after Release so no code can ever call through a dangling
+ * font vtable (round-7 crash was exactly that: font created inside Reset ->
+ * broken object -> eip=000000D8 at ovl-panel). */
+static void font_destroy(void) {
     if (g_font != NULL) {
         void **vt = *(void ***)g_font;
         if (vt != NULL) {
-            VF_HR onlost = (VF_HR)vt[FONT_ONLOSTDEVICE];
-            if (onlost) onlost(g_font);
             VF_HR rel = (VF_HR)vt[2];
             if (rel) rel(g_font);
         }
@@ -104,7 +128,7 @@ void ui_init(void) {
 }
 
 void ui_on_reset(void *dev) {
-    ui_release_font();
+    font_destroy();
     dlog("reset dev=%p -> font invalidated", dev);
 }
 
@@ -190,6 +214,16 @@ static void ui_format_rate(char *out, size_t n, float rate) {
 }
 
 static void ui_draw_panel(void *dev) {
+    /* double-guard (round-7): never call through the font unless the object AND
+     * its vtable are actually mapped readable. A broken/dangling font faults
+     * with eip = small offset (live: eip=000000D8 at ovl-panel). */
+    if (!font_safe()) {
+        if (!g_font_guard_warned) {
+            g_font_guard_warned = 1;
+            logger_debug("UI: font guard failed - panel skipped");
+        }
+        return;
+    }
     if (g_font == NULL) return;
     void **vt = *(void ***)g_font;
     if (vt == NULL) return;
@@ -288,11 +322,12 @@ void ui_create_font(void *dev) {
              ? g_settings.font_size : 14;
     void *font = NULL;
     int hr = cf(dev, -size, 0, 400, 1, 0, 0, 1, 0, 0, face, &font);
-    if (hr >= 0 && font != NULL) {
+    if (hr == 0 && font != NULL) {
         g_font = font;
-        dlog("UI: font created size=%d face=%s", size, face);  /* every create, incl. post-Reset */
+        dlog("UI: font created size=%d face=%s font=%p", size, face, font);
     } else {
-        dlog("UI: D3DXCreateFontA failed hr=%#010x", (unsigned)hr);
+        g_font = NULL;   /* never leave a dangling/non-NULL font on failure */
+        dlog("UI: font create FAILED hr=0x%08X", (unsigned)(DWORD)(unsigned long)hr);
     }
 }
 
@@ -314,7 +349,6 @@ void ui_draw(void) {
     if (g_res == NULL) return;           /* menu/loading (n==0) -> no overlay */
     if (g_device == NULL) return;
     if (!g_ui_ready) return;             /* d3dx9_25.dll missing -> graceful */
-    if (g_font == NULL) return;          /* font owned by device-create/Reset */
     if (g_frames_since_reset < RESET_COOLDOWN_FRAMES) return; /* device settling
                                           after Create/Reset before RT calls */
 
@@ -330,8 +364,17 @@ void ui_draw(void) {
         DWORD uhr = (DWORD)(unsigned long)hr;
         if (uhr == 0x88760868u) return;    /* D3DERR_DEVICELOST: no draw */
         if (uhr == 0x88760869u) return;    /* D3DERR_DEVICENOTRESET: no draw
-                                              (font re-created by the Reset hook) */
+                                              (font re-created lazily below) */
     }
+
+    /* LAZY font creation (round-7 fix): the font is NEVER created inside the
+     * Reset hook — the device is still NOTRESET there and D3DXCreateFontA
+     * fails/returns a broken object. Now TCL==OK just proved the device is
+     * truly usable, so (re)create if needed. Fails -> skip the frame. */
+    if (g_font == NULL) {
+        ui_create_font(dev);
+    }
+    if (g_font == NULL) return;          /* font-first guard: none -> no overlay */
 
     /* Draw ON THE GAME'S CURRENT render target — no SetRenderTarget /
      * GetBackBuffer anywhere in the draw path (round-5 crash sites ovl-srt /
