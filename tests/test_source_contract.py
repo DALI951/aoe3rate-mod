@@ -137,10 +137,9 @@ check("FONT_ONLOSTDEVICE 16" in src, "ID3DXFont OnLostDevice=16 vtable slot")
 check("FONT_ONRESETDEVICE 17" in src, "ID3DXFont OnResetDevice=17 vtable slot")
 check("D9_TESTCOOPLEVEL  3" in src, "TestCooperativeLevel device slot 3")
 check("D9_RESET          16" in src, "Reset device hook slot 16")
-check("D9_GETBACKBUFFER  18" in src, "GetBackBuffer device slot 18")
 check("D9_BEGINSCENE     41" in src, "BeginScene device slot 41")
 check("D9_ENDSCENE       42" in src, "EndScene device slot 42")
-check("D9_SETRENDERTARGET 37" in src, "SetRenderTarget device slot 37")
+check("D9_GETRENDERTARGET 38" in src, "GetRenderTarget device slot 38")
 check("D9_DRAWPRIMITIVEUP 83" in src, "DrawPrimitiveUp device slot 83")
 check("reset_hook" in src and "ui_on_reset(" in src,
       "Reset hook invalidates/recreates the font")
@@ -221,34 +220,46 @@ check(i_rt != -1 and i_cd != -1 and i_cd < i_rt,
 check('dlog("UI: font created size=%d face=%s"' in src,
       "font creation logged on EVERY create (post-Reset path visible in log)")
 
-# ================= Round 5: per-vtable originals + crash instrumentation =================
+# ================= Round 6: revert per-vtable originals; drop RT-switch =================
+# Crash forensics: FAULT breadcrumb=ovl-srt (SetRenderTarget) with garbage
+# dev=6F8F4EC0 vt=0 slot=37 pointed at the round-5 per-vtable machinery + the
+# GetBackBuffer/SetRenderTarget switch. Round 6 reverts to the proven
+# single-global-original pair and removes srt/gbb from the draw path.
 
-check("s_ovtab" in src and "OVTAB_MAX" in src,
-      "per-vtable original Present/Reset table present")
-check("resolve_orig_present" in src and "resolve_orig_reset" in src,
-      "hooks resolve originals per CURRENT device vtable")
-check("s_ovtab[k] = s_ovtab[k + 1];" in src,
-      "vtable table evicts oldest entry when full (multi-device safe)")
-check("patch_device_present(self);" in src,
-      "Reset hook re-patches the ACTUAL device passed to Reset (not a stored ptr)")
-n_trace = src.count("set_trace(dev, vt, D9_GETRENDERTARGET, \"ovl-grt\")")\
-        + src.count("set_trace(dev, vt, D9_GETBACKBUFFER, \"ovl-gbb\")")\
-        + src.count("set_trace(dev, vt, D9_SETRENDERTARGET, \"ovl-srt\")")
-check(n_trace == 3, "per-call breadcrumbs ovl-grt/ovl-gbb/ovl-srt set before each RT call")
-check('set_trace(dev, vt, D9_TESTCOOPLEVEL, "ovl-tcl")' in src,
-      "TCL guard breadcrumb preceeds the RT calls")
-check("ContextRecord->Eip" in src and "ContextRecord->Esp" in src and "ContextRecord->Ebp" in src,
-      "fault dump reads eip/esp/ebp from the exception CONTEXT")
-check('stk=' in src, "fault dump includes the stack dwords (stk=...)")
-check("g_fault_dev" in src and "g_fault_vt" in src and "g_fault_slot" in src,
-      "fault dump records device/vtable/slot of the dying call")
-check('"ovl first draw ok frame=%d"' in src, "first-draw marker logged once")
+# d3d9.c (code): single-slot originals saved once, no per-vtable table anywhere
+check("s_ovtab" not in code and "OVTAB_MAX" not in code and "resolve_orig_present" not in code
+      and "resolve_orig_reset" not in code,
+      "round-5 per-vtable originals table + resolve_orig_* REMOVED from d3d9.c")
+check("static PRESENT_FN s_orig_present = NULL;" in code.replace("  "," ") or
+      "s_orig_present = NULL;" in code,
+      "single global s_orig_present restored (saved once)")
+check('if (s_orig_present == NULL)' in code,
+      "original Present saved ONCE from the first patched vtable (R6 guard)")
+check('if (s_orig_reset == NULL)' in code and 'ui_on_reset(self)' in code,
+      "original Reset saved once; reset re-assert logs the ACTUAL device")
+# ui.c (src): no srt/gbb anywhere in the draw path (check the comment-stripped
+# TU so my own explanatory doc text can't false-positive)
+check("ovl-srt" not in code and "ovl-gbb" not in code,
+      "SetRenderTarget/GetBackBuffer breadcrumbs (ovl-srt/ovl-gbb) REMOVED")
+check("D9_SETRENDERTARGET" not in src and "D9_GETBACKBUFFER" not in src,
+      "no SetRenderTarget/GetBackBuffer vtable use remains in ui.c")
+check('grt(dev, 0, &cur) != 0' in src or 'grt(dev, 0, &cur) != 0)' in src,
+      "GetRenderTarget hard-checked (hr==0)")
+check("cur == NULL" in src, "GetRenderTarget surface NULL-checked")
+check("VirtualQuery(cur" in src, "GetRenderTarget surface VirtualQuery-guarded before use")
+check("ovl-begin" in src and "ovl-end" in src and "ovl-restore" in src,
+      "draw breadcrumbs chain kept (begin/end/restore; no srt)")
+check("ovl-tcl" in src and "ovl-grt" in src,
+      "TCL + GetRenderTarget breadcrumbs retained")
 # zero-touch Enabled path: present_hook forwards before ANY other work
 i_p = code.find("int STDMETHODCALLTYPE present_hook")
 i_e = code.find("!g_settings.enabled", i_p)
 i_l = code.find("locate_resources()", i_p)
 check(i_p != -1 and i_e != -1 and i_l != -1 and i_e < i_l,
       "Enabled=0 zero-touch: present_hook forwards before observer/overlay work")
+check("ContextRecord->Eip" in src and "ContextRecord->Esp" in src and "ContextRecord->Ebp" in src,
+      "fault dump reads eip/esp/ebp from the exception CONTEXT")
+check('"ovl first draw ok frame=%d"' in src, "first-draw marker logged once")
 
 # ================= R14: modular layout =================
 

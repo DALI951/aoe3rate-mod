@@ -1,3 +1,40 @@
+# BUILD — ROUND 6 (REWORK, 2026-09-06) — REVERT PER-VTABLE MACHINERY + REMOVE SetRenderTarget/GetBackBuffer FROM THE DRAW PATH
+
+## ROUND SUMMARY
+Round-5 live log (confirmed in `d3d9mod.log`, two independent runs, killed twice each):
+```
+FAULT addr=774EFF25 eip=774EFF25 esp=0019F9A8 ebp=0019F9AC stk=0F677800,0019F9BC,6F80AA3D,6F8F4EC4,... breadcrumb=ovl-srt code=C0000005 dev=6F8F4EC0 vt=00000000 slot=37
+```
+`ovl-srt` = dying inside **SetRenderTarget**; eip in ntdll (774EFF25) with d3d9.dll return addrs on the stack (6F80AA3D, 6F8F4EC4); `dev=6F8F4EC0 vt=0 slot=37` is garbage (dev is a code address in d3d9.dll, not a heap surface/device; vt=0) — bad arguments to the call (stale/garbage render-target surface or shifted stack). The game uses ONE device object per run (`dev=0ca74140`, `dev=0c8015a0` — one each); the round-5 per-vtable/resolve machinery was never exercised and is implicated in the wrong-pointer mess. R6/R7 drew LIVE on this game with a single global pair.
+
+## (a) Reverted to R6-proven hook semantics (d3d9.c)
+- **Removed** the round-5 per-vtable originals table: `s_ovtab`/`s_novtab`/`OVTAB_MAX`, `resolve_orig_present(self)`/`resolve_orig_reset(self)`, the evict-oldest path (`s_ovtab[k] = s_ovtab[k+1]`).
+- **Restored** single-slot globals `s_orig_present`/`s_orig_reset`, saved **ONCE** from the first patched device vtable via `if (s_orig_present == NULL)` / `if (s_orig_reset == NULL)` guards; `g_devvt` still tracked so a post-Reset vtable swap gets re-asserted on the ACTUAL device (`patch_device_present(self)` in `reset_hook`).
+- `reset_hook` keeps the `ui_on_reset(self)` → `reset dev=%p -> font invalidated` log for the ACTUAL device passed to Reset; re-patches `self` after the original Reset; re-creates the font on success.
+- `present_hook` zero-touch path (`Enabled=0`) forwards through `s_orig_present` directly (no resolve machinery).
+
+## (b) Draw path without RT switching (src/ui.c)
+New flow — draw on the game's CURRENT render target:
+```
+ovl-tcl    TestCooperativeLevel (LOST/NOTRESET -> skip frame)
+ovl-grt    GetRenderTarget(0, &cur)   [hardened: hr==0, cur != NULL,
+           VirtualQuery-guard cur (MEM_COMMIT, no PAGE_GUARD/NOACCESS)]
+ovl-states render-state save + set (Z/ZW/STENCIL off, ALPHABLEND SRCALPHA/INVSRCALPHA, LIGHTING off)
+ovl-begin  BeginScene
+ovl-panel  ui_draw_panel(dev)  (D3DXFont Begin -> DrawText rows -> End on current RT)
+ovl-end    EndScene
+ovl-restore restore render states (reverse) + Release(cur)
+ovl-done   first-draw marker + done breadcrumb
+```
+- **GetBackBuffer + SetRenderTarget removed entirely** — `ovl-srt` and `ovl-gbb` crash sites no longer exist. At Present time the device's current RT IS the backbuffer, so the HUD stays visible without any RT switch (same visibility logic as drawing before Present).
+- Any GetRenderTarget failure (non-0 hr, NULL surface, VirtualQuery reject) → skip the whole frame's draw BEFORE any state was changed (no half-restore possible).
+- The only `Release` is the `IDirect3DSurface9::Release` (vtable slot 2) on the `GetRenderTarget` reference we took.
+
+## (c) Kept from rounds 4-5 (all intact)
+font-first guard · n==0 hide · g_values_valid gate · RESET_COOLDOWN_FRAMES=30 post-Reset cooldown · TCL guard (0x88760868/69 skip) · render-state save/set/restore list · per-call breadcrumbs (now `ovl-tcl/ovl-grt/ovl-states/ovl-begin/ovl-panel/ovl-end/ovl-restore/ovl-done`) with `set_trace(dev,vt,slot,bc)` stashing `g_fault_dev/g_fault_vt/g_fault_slot` · richer FAULT dump (`eip/esp/ebp/stk=8 dwords/breadcrumb/code/dev/vt/slot`, VirtualQuery-guarded) · `ovl first draw ok frame=N` first-draw marker · zero-touch `Enabled=0` A/B path · explicit `STDMETHODCALLTYPE` (__stdcall) function-pointer casts for Present/Reset/GetRenderTarget/Release/Begin/DrawText/End.
+
+---
+
 # BUILD — ROUND 5 (REWORK, 2026-09-06) — PERSISTENT ovl-rt CRASH: PORT-UNRECOVERABLE, PER-VTABLE FIX + FULL CRASH INSTRUMENTATION
 
 ## ROUND SUMMARY

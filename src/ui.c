@@ -22,10 +22,8 @@
 /* ---------- D3D9 device vtable slots ---------- */
 #define D9_TESTCOOPLEVEL  3
 #define D9_RESET          16
-#define D9_GETBACKBUFFER  18
 #define D9_BEGINSCENE     41
 #define D9_ENDSCENE       42
-#define D9_SETRENDERTARGET 37
 #define D9_GETRENDERTARGET 38
 #define D9_SETRENDERSTATE 57
 #define D9_GETRENDERSTATE 58
@@ -63,9 +61,7 @@ typedef int (STDMETHODCALLTYPE *VF_HR)(void *self);
 typedef int (STDMETHODCALLTYPE *VF_HRRESET)(void *self, const void *pp);
 typedef int (STDMETHODCALLTYPE *VF_GETSTATE)(void *self, DWORD state, DWORD *v);
 typedef int (STDMETHODCALLTYPE *VF_SETSTATE)(void *self, DWORD state, DWORD v);
-typedef int (STDMETHODCALLTYPE *VF_GETBB)(void *self, UINT idx, DWORD tp, void **out);
 typedef int (STDMETHODCALLTYPE *VF_GETRT)(void *self, DWORD idx, void **out);
-typedef int (STDMETHODCALLTYPE *VF_SETRT)(void *self, DWORD idx, void *surf);
 typedef int (STDMETHODCALLTYPE *VF_DRAWUP)(void *self, DWORD prim, DWORD count,
         const void *data, DWORD stride);
 typedef int (STDMETHODCALLTYPE *VF_DRAWTEXT)(void *self, const char *text,
@@ -337,32 +333,33 @@ void ui_draw(void) {
                                               (font re-created by the Reset hook) */
     }
 
-    /* RT switch only when BOTH the previous target and the backbuffer are
-     * captured — a failed GetBackBuffer/GetRenderTarget must never NULL the
-     * device's target. Each individual call gets its own breadcrumb + trace
-     * (device/vtable/slot) so a fault names the EXACT dying call. */
-    void *bb = NULL, *prev_rt = NULL;
+    /* Draw ON THE GAME'S CURRENT render target — no SetRenderTarget /
+     * GetBackBuffer anywhere in the draw path (round-5 crash sites ovl-srt /
+     * ovl-gbb eliminated). At Present time the device's current RT IS the
+     * backbuffer, so the HUD stays visible (same visibility logic as drawing
+     * before Present). GetRenderTarget is hardened: hr==0, surface != NULL,
+     * and a VirtualQuery guard on the surface before any use; any check fails
+     * -> skip the whole frame. */
+    void *cur = NULL;
     VF_GETRT grt = (VF_GETRT)vt[D9_GETRENDERTARGET];
-    VF_GETBB gbb = (VF_GETBB)vt[D9_GETBACKBUFFER];
-    VF_SETRT srt = (VF_SETRT)vt[D9_SETRENDERTARGET];
-    if (grt == NULL || gbb == NULL || srt == NULL) return;
+    if (grt == NULL) return;
     set_trace(dev, vt, D9_GETRENDERTARGET, "ovl-grt");
-    if (grt(dev, 0, &prev_rt) < 0 || prev_rt == NULL) return;
-    set_trace(dev, vt, D9_GETBACKBUFFER, "ovl-gbb");
-    if (gbb(dev, 0, 0, &bb) < 0 || bb == NULL) return;
-    set_trace(dev, vt, D9_SETRENDERTARGET, "ovl-srt");
-    if (srt(dev, 0, bb) < 0) {
-        /* SetRenderTarget failed -> keep the device target untouched: restore
-         * the previous RT and release both surfaces, then skip this frame. */
-        srt(dev, 0, prev_rt);
-        void **bvt = *(void ***)bb;
-        if (bvt != NULL) { VF_HR brel = (VF_HR)bvt[2]; if (brel) brel(bb); }
-        void **pvt = *(void ***)prev_rt;
-        if (pvt != NULL) { VF_HR prel = (VF_HR)pvt[2]; if (prel) prel(prev_rt); }
-        return;
+    if (grt(dev, 0, &cur) != 0 || cur == NULL) return;
+    void **cvt = *(void ***)cur;
+    if (cvt == NULL) return;
+    VF_HR crel = (VF_HR)cvt[2];                    /* IDirect3DSurface9::Release (slot 2) */
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(cur, &mbi, sizeof(mbi)) ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & PAGE_NOACCESS) ||
+            (mbi.Protect & PAGE_GUARD)) {
+            if (crel != NULL) crel(cur);
+            return;
+        }
     }
 
-    /* render-state save / set / restore (SET only after a captured RT) */
+    /* render-state save / set (drawn on the current RT; restored at the end) */
     set_trace(dev, vt, D9_GETRENDERSTATE, "ovl-states");
     DWORD st_z = 1, st_zw = 1, st_st = 0, st_ab = 0, st_sb = 0, st_db = 0, st_li = 1;
     VF_GETSTATE grs = (VF_GETSTATE)vt[D9_GETRENDERSTATE];
@@ -386,7 +383,8 @@ void ui_draw(void) {
         srs(dev, D3DRS_LIGHTING, 0);
     }
 
-    /* scene + panel: EndScene is ALWAYS called once BeginScene succeeded */
+    /* scene + panel on the current RT: EndScene is ALWAYS called once
+     * BeginScene succeeded */
     set_trace(dev, vt, D9_BEGINSCENE, "ovl-begin");
     VF_HR beg = (VF_HR)vt[D9_BEGINSCENE];
     VF_HR end = (VF_HR)vt[D9_ENDSCENE];
@@ -397,8 +395,9 @@ void ui_draw(void) {
         end(dev);
     }
 
-    /* restore render states (reverse), then the RT, then release surfaces */
-    set_trace(dev, vt, D9_SETRENDERTARGET, "ovl-restore");
+    /* restore render states (reverse) — unreachable failure left none open,
+     * since every early-return above happens BEFORE any state was changed */
+    set_trace(dev, vt, D9_GETRENDERTARGET, "ovl-restore");
     if (srs != NULL) {
         srs(dev, D3DRS_LIGHTING, st_li);
         srs(dev, D3DRS_DESTBLEND, st_db);
@@ -408,19 +407,7 @@ void ui_draw(void) {
         srs(dev, D3DRS_ZWRITEENABLE, st_zw);
         srs(dev, D3DRS_ZENABLE, st_z);
     }
-    srt(dev, 0, prev_rt);
-    {
-        void **svt = *(void ***)bb;
-        if (svt != NULL) {
-            VF_HR rel = (VF_HR)svt[2];
-            if (rel) rel(bb);
-        }
-        void **pvt = *(void ***)prev_rt;
-        if (pvt != NULL) {
-            VF_HR rel = (VF_HR)pvt[2];
-            if (rel) rel(prev_rt);
-        }
-    }
+    if (crel != NULL) crel(cur);   /* release our GetRenderTarget reference */
     if (!g_ovl_first_done) { g_ovl_first_done = 1; dlog("ovl first draw ok frame=%d", g_frames_since_reset); }
     set_step("ovl-done");
 }
