@@ -1,3 +1,40 @@
+# BUILD — ROUND 18 (2026-09-07) — RESEARCH DOCUMENTATION (no code changes to d3d9.c/src)
+
+## ROUND SUMMARY
+Research round — **NO code changes**. d3d9.c and src/ were NOT touched. New file
+`RESEARCH_UI_MODDING.md` records the community research (web research done by the orchestration team):
+how the AoE3 legacy community mods the UI, whether Dali's live resource-rate HUD already exists, and
+the community's engine-level techniques. Current build remains the R17 build
+`97fc2adf5a8780aab2463561acee43ce0567cfd39281c8666dc2c39e56a21f31` (152,736 B) — not rebuilt, not
+redeployed.
+
+## KEY FINDINGS (persisted in RESEARCH_UI_MODDING.md)
+- **Community UI mods are XML/XMB file-swaps**, not DLL injection: extract `ui*.xml.xmb` from `data*.bar`
+  with AoE3Ed / Resource-Manager, edit XML, drop the loose file into `<game>/data/` (uninstall = delete;
+  ESO-safe). Canonical files: `uimainnew.xml.xmb`, `uiminimappanelnew.xml`, `uiobjectives.xml.xmb`.
+- **The exact mod Dali wants does NOT already exist** — the resource gather-rate-per-second display is a
+  KNOWN UNFULFILLED feature request (DE forum thread 120838 from 2021); the ESOC Gathering Rates wiki only
+  documents static theory rates; no community mod ships a LIVE per-game rate HUD for legacy TAD. Genuinely
+  novel. The XML layer has no scripting to compute time-derivatives of your own stock — only our DLL can.
+- **Community engine-level technique = direct exe binary patching** (AoE3 UnHardcode Patch, per-version
+  offsets + a plugin DLL in `Startup\uhc.cfg`), NOT a d3d9 proxy DLL. Our approach has no precedent in
+  this community — hard, but new. Fallback B documented (exe-patch on our already-verified addresses).
+- **Multiplayer fairness norm validates the design:** read-only presentational HUD changes are treated as
+  fair (neuron's minimalist UI explicitly blocked input buttons as "unfair advantage"). Our overlay is
+  client-side, read-only, injects no game inputs.
+- **Recommendation: keep the DLL path** (only way to show live rates); the remaining bug is purely
+  "where does the in-match Present live" — the R17 tracer (`present-path dev=/sw=/scene=`) answers it
+  with one more log. Fallback A = a static XML HUD (community-style) for a quick visible win while the
+  DLL render path finishes.
+
+## FILES CHANGED THIS ROUND
+- `RESEARCH_UI_MODDING.md` (ADDED — the research summary, verbatim from the orchestration team).
+- `.swarm/BUILD.md` (this section).
+- `README.md` (added a single "## Research" line pointing at the research file — if the repo links it).
+- NO changes to `d3d9.c`, `src/*`, `tests/*`, or build scripts.
+
+---
+
 # BUILD — ROUND 17 (2026-09-07) — TWO DECISIVE INSTRUMENTS: EAGER IMPLICIT-SWAPCHAIN CAPTURE + ENDSCENE PROBE (the fullscreen Present handoff, proven not theorized)
 
 ## ROUND SUMMARY

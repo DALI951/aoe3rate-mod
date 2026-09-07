@@ -247,3 +247,9 @@ VERIFIED_ADDRESSES.md  address notes
 | R13 | Observer-only proxy — verified vs HUD 2026-09-06 | 83,272 B `E6F79C46EF26FD430D3366B06418752B5E3E59870116295DF3BF75DA5D7DF6D0` |
 
 Full round-by-round detail: `.swarm/BUILD.md`.
+
+## Research
+
+See [RESEARCH_UI_MODDING.md](RESEARCH_UI_MODDING.md) — how the AoE3 modding community modifies the UI
+(XML/XMB file-swaps, not DLL injection), whether a live resource-rate HUD already exists (it does not —
+our approach is novel), and the community's engine-level technique (exe patching).
