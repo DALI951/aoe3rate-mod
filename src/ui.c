@@ -93,7 +93,7 @@ static int     g_ui_ready = 0;
 static int     g_font_guard_warned = 0;
 static int     s_font_fail_n = 0;   /* consecutive font-create fails (R16 B4) */
 static DWORD   s_ovl_draws = 0;     /* R10: completed overlay draws (600-frame heartbeat) */
-static unsigned int s_ovl_abort_n = 0;  /* R13: consecutive frame aborts at the 4 draw-path early returns */
+static unsigned int s_ovl_abort_n = 0;  /* R13/R14: consecutive frame aborts at the 8 pre-RT gates + 4 RT stages */
 static unsigned short g_key_prev[17];  /* 6 plain toggles + indices 6/7 (F9/scratch) + 9 Alt toggles (R11) */
 
 static void set_trace(void *dev, void **vt, int slot, const char *step);
@@ -561,12 +561,17 @@ static void set_trace(void *dev, void **vt, int slot, const char *step) {
     set_step(step);
 }
 
-/* R13: silent-stop detector — counts CONSECUTIVE frames that die at the four
- * draw-path early returns (grt-missing / grt-fail / surface-bad / guard-fail).
- * After 60 consecutive aborts (~1s at 60fps) it logs ONCE per burst (not per
- * frame, NOT debug-gated), so a dead overlay can never again look like a stale
- * deployment or plain silence. The counter resets on the first draw that
- * completes (reaches the heartbeat bump below). */
+/* R14: silent-stop detector (generalized) — one counter + helper covering
+ * BOTH the six/eight PRE-RT gates below (enabled/version/panel/values/res/
+ * device/ui_ready/cooldown) AND the four RT stages (grt-missing / grt-fail /
+ * surface-bad / guard-fail). Live fact: the R13 build detected zero RT-stage
+ * aborts while the panel vanished AFTER 'ovl first draw ok' + a clean
+ * 'ovl diag rt=.. rect=12,12:250x141 alpha=0xD9' — yet no heartbeat either.
+ * That can only be a GATE killing the draw every frame (those were silent in
+ * R13 — the detector's blind spot). After 60 CONSECUTIVE aborts (~1s at
+ * 60fps) it logs ONCE per burst (not per frame, NOT debug-gated), naming the
+ * exact stage, so the killer gate/stage is never ambiguous again. The counter
+ * resets on the first draw that completes (reaches the heartbeat bump below). */
 static void ovl_abort_stop(const char *stage) {
     s_ovl_abort_n++;
     if (s_ovl_abort_n == 60) {
@@ -577,15 +582,14 @@ static void ovl_abort_stop(const char *stage) {
 
 void ui_draw(void) {
     set_step("ovl-start");
-    if (!g_settings.enabled) return;
-    if (!g_version_ok) return;           /* version gate failed -> no overlay */
-    if (!g_panel_visible) return;
-    if (!g_values_valid) return;         /* no sampled RES yet -> no overlay */
-    if (g_res == NULL) return;           /* menu/loading (n==0) -> no overlay */
-    if (g_device == NULL) return;
-    if (!g_ui_ready) return;             /* d3dx9_25.dll missing -> graceful */
-    if (g_frames_since_reset < RESET_COOLDOWN_FRAMES) return; /* device settling
-                                          after Create/Reset before RT calls */
+    if (!g_settings.enabled) { ovl_abort_stop("enabled"); return; }
+    if (!g_version_ok) { ovl_abort_stop("version"); return; }
+    if (!g_panel_visible) { ovl_abort_stop("panel"); return; }
+    if (!g_values_valid) { ovl_abort_stop("values"); return; }
+    if (g_res == NULL) { ovl_abort_stop("res"); return; }
+    if (g_device == NULL) { ovl_abort_stop("device"); return; }
+    if (!g_ui_ready) { ovl_abort_stop("ui_ready"); return; }
+    if (g_frames_since_reset < RESET_COOLDOWN_FRAMES) { ovl_abort_stop("cooldown"); return; }
 
     void *dev = g_device;
     void **vt = *(void ***)dev;

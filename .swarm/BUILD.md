@@ -1,3 +1,67 @@
+# BUILD — ROUND 14 (2026-09-07) — TWO EVIDENCE-DRIVEN FIXES (tracker cadence bug + gate-stage stop detector)
+
+## ROUND SUMMARY
+No crash this round (game NOT launched). Two findings, both from live logs + code review:
+- **FINDING A (proven tracker bug, hard-rule override):** src/tracker.c:107-112 — the NOT-due
+  branch of the sample-cadence gate did `s_last_time = now`, resetting the interval accumulator on
+  EVERY non-due frame. Result: `due` could only ever be true on the very first sample
+  (`!s_have_time`), so the tracker sampled EXACTLY ONCE per session and all rates froze at 0.
+- **FINDING B (detector blind spot):** the R13 silent-stop detector only covered the four RT stages
+  INSIDE ui_draw; the pre-RT gates killed the draw every frame in silence.
+
+## LIVE-LOG QUOTE (the last log, 4503 B, three full sessions — R13-era binary, Debug=1 INI)
+Every one of the three sessions shows the same body after `--- match start n=3 ... ---`:
+```
+DBG rates food=0.0 wood=0.0 coin=0.0 export=0.0 paused=0
+RES t=1 food=0 wood=0 coin=0 export=0 player=0F607800 res=1286A080   <- EXACTLY ONE, always t=1
+UI: font created size=14 face=Georgia font=02e7df18
+ovl first draw ok frame=459
+ovl diag rt=012699c0 rect=12,12:250x141 alpha=0xD9                    <- diag present, geometry fine
+```
+- **RES** appears once per session and only at `t=1` => FINDING A confirmed (cadence bug).
+- **heartbeats**: none in any session (draw never reaches the bump => but the R13 RT-stage detector
+  logged ZERO `ovl stop` too) => the draw dies at a GATE, not an RT stage (FINDING B's blind spot).
+- **Likeliest killer (pending gate-detector confirm on next run):** `g_res == NULL` — the chain
+  found during train/load (`ctx=059A0000 n=3 player=.. res=1286A080 inc=..`) may not survive the
+  real battle layout; `g_values_valid` (cleared by a mid-session reset) is the runner-up.
+- Note: `R14 DLL loaded base=..` is just DllMain's historical label (d3d9.c:653), not a round tag.
+
+## CHANGE LIST
+- **src/tracker.c:107-112 (FINDING A)** — the `s_last_time = now;` assignment is REMOVED from the
+  `!due` branch (kept `g_values_valid = 1; return;`). The interval accumulator now keeps growing
+  across non-due frames until `(now - s_last_time) >= interval`; the DUE path still sets
+  `s_last_time = now` (line ~190). A2 semantics verified unchanged: the first-ever sample still
+  only lays down the baseline (`g_ema_valid` needs `count>=1` checked BEFORE the store at lines
+  181 vs 183, so the first sample — count==0 — never marks a slot alive).
+- **src/ui.c (FINDING B)** — THE silent-stop detector is generalized to cover BOTH the pre-RT gates
+  AND the four RT stages (one counter `s_ovl_abort_n`, one helper `ovl_abort_stop(stage)`; stage
+  strings stay distinct). The eight gates now log once at 60 consecutive aborts:
+  `ovl stop: %u consecutive frame aborts at stage=<enabled|version|panel|values|res|device|ui_ready|cooldown> - overlay draw halted`.
+  Existing RT stages (`grt-missing|grt-fail|surface-bad|guard-fail`) unchanged. Counter still resets
+  on any completed draw (heartbeat bump). Gate semantics untouched — instrumentation only.
+- **tests/test_rate_engine.c** — NEW `test_rate_cadence_multi()` (R14 regression): frame-granularity
+  timeline via `tracker_set_clock_override` — first sample at T, two sub-interval frames (T+16/T+32),
+  then T+500 MUST be due (cadence accumulated past the sub-interval frames; the old bug would have
+  kept it !due). Pins `g_last_sample_tick` advancing T -> T+500 -> T+1000, raw 2.0/s each due, plus
+  the A2 liveness semantics (baseline-only on first sample, alive after the second real rate). The
+  existing Step-1 timeline was too coarse (every tick >= sample_ms apart) to ever exercise the bug.
+- **tests/test_source_contract.py** — new pins: the 8 gate stages each wired exactly once; no
+  `s_last_time = now` between `int due` and the due-path store (FINDING A regression pin). Stale pin
+  FLIPPED: `if (!g_version_ok) return;` -> the instrumentation form
+  `ovl_abort_stop("version")` + `!g_version_ok`. Nothing over-tightened.
+
+## BUILD / HARNESSES (this round)
+- Build rc=0, zero warnings (-Wall -Wextra), VERIFY PASS (i386 PE32, imports KERNEL32/USER32/msvcrt
+  only, 11 exports via d3d9.def — unchanged set).
+- d3d9.dll = **150,906 B**, SHA256 `29503e095c37c47d000f8788222ba3e9169e15d9a19b59e313ace01ee204c162`,
+  deployed byte-identical to repo root + game dir + tests\d3d9.dll (all 3 SHA256 equal); old
+  d3d9mod.log deleted. Game NOT launched.
+- Harnesses (rebuilt with i686-w64-mingw32-gcc 16.2.0, then run): test_rate_engine.exe FAILURES 0
+  (7 new R14 cadence asserts) · test_d3d9_actual.exe ALL D3D9 ACTUAL CHECKS PASSED ·
+  test_pe_structure.py FAILURES 0 · test_source_contract.py SOURCE-CONTRACT: PASS (R14 gate-stage
+  pins + FINDING-A pin + all R11/R12/R13 pins green).
+
+---
 # BUILD — ROUND 13 (2026-09-07) — DIAGNOSIS-DRIVEN HARDENING (silent-stop detector + unconditional diag)
 
 ## ROUND SUMMARY

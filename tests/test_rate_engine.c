@@ -177,6 +177,37 @@ static void test_rate_realtime(void) {
     g_settings.sample_ms = (int)SAMPLE_MS_DEFAULT;
 }
 
+/* ---- ROUND 14: multi-sample cadence (FINDING A regression) ----
+ * The live logs showed EXACTLY ONE "RES t=1" per 60s session: the old
+ * !due-branch `s_last_time = now` reset the interval accumulator every frame,
+ * so `due` could only ever fire on the very first sample. The Step-1 timeline
+ * was too coarse to catch it (every call was >= sample_ms apart), so this test
+ * drives FRAME-GRANULARITY ticks: two sub-interval frames then a frame that
+ * crossed T+sample_ms — that frame MUST sample (g_last_sample_tick advances
+ * twice) and the rate MUST be real. */
+static void test_rate_cadence_multi(void) {
+    g_settings.sample_ms = 500;
+    tracker_reset();
+    float a[8];
+    set_vals(a, 100.0f);  ts(1000, a);            /* T: first due (bootstrap) */
+    CHECK(g_last_sample_tick == 1000, "R14: first sample stored at T");
+    CHECK(g_ema_valid[0] == 0, "R14: first sample lays down baseline only, slot not marked alive (A2)");
+    set_vals(a, 100.0f);  ts(1016, a);            /* +16ms: !due (sub-interval) */
+    set_vals(a, 100.0f);  ts(1032, a);            /* +32ms: !due (sub-interval) */
+    /* T+500 crossed via two intermediate frames — the accumulator MUST have
+     * grown through them (the buggy size reset here would keep this !due) */
+    set_vals(a, 101.0f);  ts(1500, a);            /* T+500 => due */
+    CHECK(g_last_sample_tick == 1500,
+          "R14: cadence accumulates past sub-interval frames (second sample due)");
+    CHECK(FEQ(rate_get_raw(0), 2.0f), "R14: delta 1 over 500ms => raw 2.0/s");
+    set_vals(a, 101.0f);  ts(1516, a);            /* !due */
+    set_vals(a, 102.0f);  ts(2000, a);            /* 1500+500 => due again */
+    CHECK(g_last_sample_tick == 2000, "R14: third sample due on exact cadence");
+    CHECK(FEQ(rate_get_raw(0), 2.0f), "R14: steady 1/500ms holds raw 2.0/s");
+    CHECK(g_ema_valid[0] == 1, "R14: second real rate marks the slot alive (A2)");
+    g_settings.sample_ms = (int)SAMPLE_MS_DEFAULT;
+}
+
 /* ---- STEP 3: settings INI round-trip ---- */
 static void test_settings_ini(void) {
     char ini[MAX_PATH];
@@ -629,6 +660,8 @@ int main(void) {
     test_rate_game_time();
     printf("---\n");
     test_rate_realtime();
+    printf("---\n");
+    test_rate_cadence_multi();
     printf("---\n");
     test_settings_ini();
     printf("---\n");

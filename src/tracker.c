@@ -106,7 +106,12 @@ void tracker_sample(DWORD current_tick, const float *values, int num_slots) {
                    ? (DWORD)g_settings.sample_ms : SAMPLE_MS_DEFAULT;
     int due = !s_have_time || (now - s_last_time) >= interval;
     if (!due) {
-        s_last_time = now;
+        /* R14: the sample-cadence accumulator must KEEP GROWING every non-due
+         * frame until the interval elapses — s_last_time is only ever updated
+         * on the DUE path below. The old `s_last_time = now;` here reset the
+         * accumulator on EVERY non-due frame, so `due` could only ever fire on
+         * the very first sample (!s_have_time) — live proof: exactly one
+         * "RES t=1" line per 60s session, rates frozen at 0 forever. */
         g_values_valid = 1;
         return;
     }

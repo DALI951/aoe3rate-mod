@@ -155,7 +155,7 @@ check("D9_DRAWPRIMITIVEUP 83" in src, "DrawPrimitiveUp device slot 83")
 check("reset_hook" in src and "ui_on_reset(" in src,
       "Reset hook invalidates the font (lazy re-create on present path)")
 check("reset dev=%p" in src, "Reset hook logs the ACTUAL device (reset dev=%p)")
-check("g_version_ok) return;" in src or "if (!g_version_ok) return;" in src,
+check("!g_version_ok" in src and 'ovl_abort_stop("version")' in src,
       "ui_draw is disabled when the version gate fails")
 
 # ================= R14: rate engine =================
@@ -631,10 +631,29 @@ check(code.count('ovl stop: %u consecutive frame aborts at stage=') == 1,
 for stage in ("grt-missing", "grt-fail", "surface-bad", "guard-fail"):
     check(code.count('ovl_abort_stop("%s")' % stage) == 1,
           "R13: abort stage %s wired exactly once" % stage)
+# R14: the silent-stop detector was extended to the six/eight PRE-RT gates
+# (the R14 live blind spot — panel vanished after a clean diag with zero
+# heartbeats AND zero RT-stage ovl stop, so a GATE was killing the draw every
+# frame). Each gate stage must be wired exactly once; stage strings distinct
+# from the four RT stages above.
+for stage in ("enabled", "version", "panel", "values", "res", "device",
+              "ui_ready", "cooldown"):
+    check(code.count('ovl_abort_stop("%s")' % stage) == 1,
+          "R14: gate stage %s wired exactly once" % stage)
 check(code.count("ovl stop: reentrant-present for %u consecutive frames") == 1,
       "R13: reentrant-present stop detector exactly once")
 check("s_ovl_abort_n = 0;" in code and "s_re_present_n = 0;" in code,
       "R13: both stop detectors reset on a completed/normal frame")
+
+# R14 (FINDING A): the sample-cadence bug — `s_last_time = now` on the NOT-due
+# tracker path reset the interval accumulator every frame, so `due` could only
+# fire on the very first sample (live proof: exactly one RES t=1 line per 60s
+# session). Pin: between `int due` and the DUE-path store (the first
+# `s_last_time = now` after it), there must be NO further `s_last_time = now`.
+_t_i = src.find("int due")
+_t_store = src.find("s_last_time = now", _t_i)
+check(_t_i != -1 and _t_store > _t_i and "s_last_time = now" not in src[_t_i:_t_store],
+      "R14: no s_last_time reset between the cadence gate and the due-path store")
 
 # ================= R14: modular layout =================
 
