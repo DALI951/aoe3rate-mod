@@ -1,3 +1,90 @@
+# BUILD — ROUND 10 (2026-09-07) — ARMED/DISABLED STATUS + GDI VISIBLE FALLBACK + DRAW HEARTBEAT
+
+## ROUND SUMMARY
+No crash this round (game not launched). R10 closes the P0 spec gap from the R9 live
+expectations: if time ever ran with the overlay silently disabled this round makes it
+**visibly impossible**.
+- **Status line (once per load)** — DllMain emits exactly one line after `version_gate_check()`
+  and `ui_init()`: `OVERLAY ARMED`, `OVERLAY ARMED (ini missing: using defaults)`, or
+  `OVERLAY DISABLED: <reason>`. Reasons cover every disable path (`ver:<gate-reason>` wins,
+  then `d3dx9_25.dll not loadable`); ini-missing is a suffix, never a disable.
+  Pure helper `overlay_state_reason(version_ok, ui_ready, ini_missing)` + public
+  `overlay_disabled_reason()`.
+- **GDI visible fallback (P0)** — when the overlay is DISABLED, every frame draws a red
+  `Resource Rate Mod: disabled (<reason>)` line at the top-left of the largest visible
+  game window (found once via EnumWindows, cached). Zero new imports: SetBkMode/SetBkColor/
+  SetTextColor arrive via runtime `LoadLibraryA("gdi32.dll")` + GetProcAddress. Called from
+  `present_hook` AFTER the tripwire clear — outside B7's set/clear interval and the
+  `Enabled=0` zero-touch branch. No breadcrumb, no per-frame log: the red line IS the
+  visibility. No `-lgdi32` in build line, import table stays exactly
+  {KERNEL32, USER32, msvcrt}.
+- **Draw heartbeat** — every 600 completed overlay draws (~10s @ 60fps) ui_draw logs
+  `ovl heartbeat n=N frame=F res=.. food=.. wood=.. coin=.. export=..` (not debug-gated,
+  <= ~6 lines/min), proving the draw path still completes long after first frame.
+- **Harness P0 hardening** — contract pins the DllMain-only once-per-load call, the
+  tripwire-clear ordering, EXACT device/font vtable slot sets ({3,16,38,41,42,57,58,83,89,90}
+  and {14,16,17} — no new slots), dynamic-gdi32 use, and the heartbeat position; the actual-
+  code harness runs `overlay_state_reason` on all four precedence cases, exercises the real
+  EnumWindows/GDI draw on a visible window (return 1), the no-window safety (return 0, no
+  crash), the destroyed-window reuse (return 0), and the ARMED short-circuit (return 0).
+
+## LIVE EXPECTATIONS (verify against d3d9mod.log)
+```
+R14 DLL loaded base=00400000 real=.. version=OK reason=ok
+UI ready: d3dx9_25.dll loaded
+OVERLAY ARMED                       <- NEW, once per load
+...
+chain .. n=3 .. [human-p1]
+--- match start n=3 .. ---
+UI: font created size=14 face=Georgia font=..
+ovl first draw ok frame=..
+ovl heartbeat n=600 frame=.. res=1286A300 food=.. wood=.. coin=.. export=..
+(..repeats every 600 draws — proves long-run draw completion..)
+```
+A/B try-broken-check-triple (verify the DISABLED paths real before trusting ARMED):
+- **(a)** rename `age3y.exe` → `d3d9mod.log` must show `version=BYPASS reason=exe size=..`
+  + `OVERLAY DISABLED: ver:exe size=..` and a **red GDI line** appears in-game. Restore.
+- **(b)** move `d3dx9_25.dll` out of the game dir → must show
+  `OVERLAY DISABLED: d3dx9_25.dll not loadable` and the **red GDI line**. Restore.
+Zero `FAULT` lines throughout. `OVERLAY ARMED` / `OVERLAY DISABLED:` appears EXACTLY once
+per launch.
+
+## File changes
+- `src/ui.c` — R10: `ui_ready()` accessor; `s_ovl_draws` + 600-frame heartbeat after the
+  first-draw marker; `ui_gdi_fallback_draw()` + `ui_gdi_find_hwnd` (EnumWindows best-window
+  scan, cached) + 3 dynamic gdi32 procs (SetTextColor/SetBkColor/SetBkMode via
+  LoadLibraryA) + DrawTextA at (8,8), `DT_SINGLELINE` define added; `#ifdef SWARM_TEST`
+  `ui_test_set_ready` seam.
+- `d3d9.c` — R10: `g_ini_missing` global; static pure `overlay_state_reason()` +
+  `overlay_disabled_reason()` + `overlay_status_log()`; DllMain emits the one status line
+  after `ui_init()` before `dllmain-done`; `ui_gdi_fallback_draw()` called in `present_hook`
+  after the tripwire clear.
+- `src/settings.c` — R10: `g_ini_missing = 1;` in the fopen-failure branch (defaults still
+  loaded).
+- `src/state.h` — R10: `g_ini_missing` extern, `OVL_HEARTBEAT_FRAMES 600`, status/GDI/`ui_ready`
+  declarations, SWARM_TEST setter decl.
+- `tests/test_source_contract.py` — R10 P0 block: once-per-load positioning, hook-body
+  cleanliness, g_ini_missing placement, dynamic gdi32 + no `-lgdi32`, EXACT slot pins,
+  heartbeat order, status variants.
+- `tests/test_d3d9_actual.c` — R10 P0: state_reason precedence matrix; no-window safety;
+  visible-window smoke (return 1); destroyed-window (return 0); ARMED short-circuit
+  (return 0) via the SWARM_TEST seam.
+
+## Build / harnesses (this round)
+- Build rc=0, zero warnings (-Wall -Wextra), VERIFY PASS (i386 PE32, imports
+  KERNEL32/USER32/msvcrt only, 11 exports).
+- d3d9.dll = **145,229 B**, SHA256
+  `0f3e1bb3183d4e52900fecaf62fd04557a4de1ff7ff4077f8b129f006d27403a`, deployed byte-identical
+  to repo root + game dir + tests\d3d9.dll (all 3 SHA256 equal); old d3d9mod.log deleted.
+- Harnesses: test_d3d9_actual.exe ALL PASS (incl. new R10 P0 GDI/status checks) ·
+  test_rate_engine.exe FAILURES 0 · test_source_contract.py PASS (0 failures) ·
+  test_pe_structure.py FAILURES 0.
+
+> Game NOT launched this round. Next step = the live boss fight: run with `[Debug] Enabled=1`,
+> confirm the LIVE EXPECTATIONS block verbatim, then do A/B checks (a) and (b).
+
+---
+
 # BUILD — ROUND 9 (REWORK, 2026-09-07) — FONT VTABLE TRUTH + DEVICE-GATED BINDING + DRAIN CLAMP
 
 ## ROUND SUMMARY

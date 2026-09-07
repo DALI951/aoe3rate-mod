@@ -429,6 +429,76 @@ check("g_last_ema[s] > 0.0f ? g_last_ema[s] : 0.0f" in code,
 check("g_ema_valid" in code, "R9 re-check: explicit EMA liveness remains (A2)")
 check("ovl-panel-text" in src, "R9: font DrawTextA calls breadcrumbed (ovl-panel-text)")
 
+# ================= ROUND 10: ARMED/DISABLED status + GDI fallback + heartbeat =================
+# P0 of the spec-gap closure: status line (once/load), red GDI fallback when the
+# overlay is DISABLED, and a 600-frame heartbeat proving the draw path completes
+# long after first frame.
+
+# 1) status line: emitted EXACTLY once, from DllMain's DLL_PROCESS_ATTACH,
+#    between the version gate and the dllmain-done breadcrumb.
+check("OVERLAY ARMED" in src and "OVERLAY DISABLED:" in src,
+      "R10: ARMED / DISABLED status strings present in d3d9.c")
+i_vg = src.find("version_gate_check();")
+i_dd = src.find('set_step("dllmain-done")')
+i_st = src.find("overlay_status_log();")
+check(src.count("overlay_status_log();") == 1 and i_vg != -1 and i_st != -1 and i_dd != -1
+      and i_vg < i_st < i_dd,
+      "R10: overlay_status_log() called EXACTLY once, inside DLL_PROCESS_ATTACH (gate < call < done)")
+i_ph = code.find("static int STDMETHODCALLTYPE present_hook(void *self")
+i_ph_end = code.find("static int s_second_vt_logged", i_ph)
+pbody = code[i_ph:i_ph_end] if (i_ph != -1 and i_ph_end != -1 and i_ph < i_ph_end) else ""
+i_res = code.find("static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp)")
+i_res_end = code.find("static int STDMETHODCALLTYPE present_hook(void *self", i_res + 1)
+rbody = code[i_res:i_res_end] if (i_res != -1 and i_res_end != -1 and i_res < i_res_end) else ""
+i_cre = code.find("static int STDMETHODCALLTYPE w_create_device(void *self, UINT adapter, UINT type,")
+i_cre_end = code.find("static int STDMETHODCALLTYPE w_query_interface", i_cre)
+cbody = code[i_cre:i_cre_end] if (i_cre != -1 and i_cre_end != -1 and i_cre < i_cre_end) else ""
+check(all(("OVERLAY" not in b and "overlay_status_log" not in b and "overlay_disabled_reason" not in b)
+          for b in (pbody, rbody, cbody)),
+      "R10: no OVERLAY/status references inside present_hook/reset_hook/w_create_device bodies")
+check('"OVERLAY ARMED%s"' in src and "(ini missing: using defaults)" in src,
+      "R10: ARMED-with-ini-note variant present (ini missing is a suffix, never a disable)")
+check("g_ini_missing = 1;" in code, "R10: g_ini_missing set in settings_load's fopen-failure branch")
+
+# 2) pure helper + public wrapper; precedence version-first then d3dx9.
+check("overlay_state_reason(" in code, "R10: pure overlay_state_reason helper present")
+check('"d3dx9_25.dll not loadable"' in src,
+      "R10: d3dx9-disable reason string present")
+
+# 3) GDI fallback: defined in ui.c, dependency-free (dynamic gdi32), drawn AFTER
+#    the tripwire clear, body contains NO vtable-slot dispatch.
+check("int ui_gdi_fallback_draw(void)" in code, "R10: ui_gdi_fallback_draw defined in ui.c")
+i_gdi_call = pbody.find("ui_gdi_fallback_draw();")
+i_clrp = pbody.find("InterlockedExchange(&g_in_present, 0)")
+check(i_gdi_call != -1 and i_clrp != -1 and i_clrp < i_gdi_call,
+      "R10: ui_gdi_fallback_draw() called AFTER the tripwire clear in present_hook")
+i_gd = code.find("int ui_gdi_fallback_draw(void)")
+gbody = code[i_gd:] if i_gd != -1 else ""
+check('LoadLibraryA("gdi32.dll")' in src and "GetProcAddress(" in gbody,
+      "R10: gdi32 loaded DYNAMICALLY (SetTextColor/SetBkColor/SetBkMode via GetProcAddress)")
+with open(os.path.join(ROOT, "build", "build.bat"), "r", encoding="utf-8", errors="replace") as bat:
+    bb = bat.read()
+check("-lgdi32" not in bb, "R10: build.bat does NOT link gdi32 statically (import table stays clean)")
+
+# 4) no NEW vtable-slot constants: device D9_* and font FONT_* pinned EXACTLY.
+d9mac = set(int(v) for v in re.findall(r"#define D9_\w+\s+(\d+)", src))
+ftmac = set(int(v) for v in re.findall(r"#define FONT_\w+\s+(\d+)", src))
+check(d9mac == {3, 16, 38, 41, 42, 57, 58, 83, 89, 90},
+      "R10: device vtable slots pinned EXACTLY {3,16,38,41,42,57,58,83,89,90} (no additions)")
+check(ftmac == {14, 16, 17},
+      "R10: font vtable slots pinned EXACTLY {14,16,17} (no additions)")
+check("vt[" not in gbody, "R10: GDI fallback body contains NO device-vtable dispatch (vt[)")
+
+# 5) heartbeat: after the first-draw marker, before the ovl-done breadcrumb.
+check("OVL_HEARTBEAT_FRAMES" in src and "#define OVL_HEARTBEAT_FRAMES" in open(
+        os.path.join(ROOT, "src", "state.h"), "r", encoding="utf-8", errors="replace").read(),
+      "R10: OVL_HEARTBEAT_FRAMES defined (state.h) and used in ui.c")
+i_fd = src.find('"ovl first draw ok frame=%d"')
+i_hb = src.find("ovl heartbeat n=%u")
+i_od = src.find('set_step("ovl-done")')
+check(i_fd != -1 and i_hb != -1 and i_od != -1 and i_fd < i_hb < i_od,
+      "R10: heartbeat block sits between the first-draw marker and the ovl-done step")
+
 # ================= R14: modular layout =================
 
 for mod in ("logger.c", "tracker.c", "rate.c", "gameif.c", "settings.c", "ui.c"):

@@ -66,6 +66,7 @@
 #define DT_TOP    0x00000000
 #define DT_NOCLIP 0x00000100
 #define DT_CENTER 0x00000001
+#define DT_SINGLELINE 0x00000020   /* R10: GDI fallback uses it (USER32) */
 
 #define D3DPT_TRIANGLESTRIP 5
 #define D3DFVF_XYZRHW_DIFFUSE 0x0044
@@ -91,6 +92,7 @@ static void   *g_font = NULL;       /* g_font_dev extern lives in d3d9.c */
 static int     g_ui_ready = 0;
 static int     g_font_guard_warned = 0;
 static int     s_font_fail_n = 0;   /* consecutive font-create fails (R16 B4) */
+static DWORD   s_ovl_draws = 0;     /* R10: completed overlay draws (600-frame heartbeat) */
 static unsigned short g_key_prev[8];
 
 static void set_trace(void *dev, void **vt, int slot, const char *step);
@@ -148,6 +150,21 @@ void ui_init(void) {
     }
     dlog("UI ready: d3dx9_25.dll loaded");
 }
+
+/* R10: d3dx9_25.dll-loadability accessor for the ARMED/DISABLED status line and
+ * the GDI fallback gate (g_ui_ready stays file-static — no renames). */
+int ui_ready(void) {
+    return g_ui_ready;
+}
+
+#ifdef SWARM_TEST
+/* R10 harness seam: force the D3DX9-ready flag so the armed/disables branch of
+ * ui_gdi_fallback_draw can be driven deterministically (never compiled into the
+ * shipped d3d9.dll — SWARM_TEST only). */
+void ui_test_set_ready(int v) {
+    g_ui_ready = v ? 1 : 0;
+}
+#endif
 
 void ui_on_reset(void *dev) {
     font_destroy();
@@ -531,5 +548,86 @@ void ui_draw(void) {
     }
     if (crel != NULL) crel(cur);   /* release our GetRenderTarget reference */
     if (!g_ovl_first_done) { g_ovl_first_done = 1; dlog("ovl first draw ok frame=%d", g_frames_since_reset); }
+    /* ROUND 10 heartbeat: every 600 completed draws (~10s at 60fps) prove the
+     * draw path is STILL completing long after first-frame — not debug-gated
+     * (max ~6 lines/min), value/res reads reuse what ui_draw already has. */
+    s_ovl_draws++;
+    if ((s_ovl_draws % OVL_HEARTBEAT_FRAMES) == 0) {
+        dlog("ovl heartbeat n=%u frame=%d res=%p food=%0.0f wood=%0.0f coin=%0.0f export=%0.0f",
+             s_ovl_draws, g_frames_since_reset, g_res,
+             g_last_values[2], g_last_values[1], g_last_values[0], g_last_values[7]);
+    }
     set_step("ovl-done");
+}
+
+/* ========================= ROUND 10: GDI VISIBLE FALLBACK =========================
+ * When the overlay is DISABLED (version gate failed -> `ver:<reason>`, or
+ * d3dx9_25.dll not loadable) a USER32/GDI red text line is drawn on the top-left
+ * of the game window every frame, so "invisible failure" is impossible. Fully
+ * dependency-free: only USER32/KERNEL32 import-table symbols are used —
+ * SetBkMode/SetBkColor/SetTextColor come from gdi32.dll loaded DYNAMICALLY
+ * (cached), keeping the DLL import table exactly {KERNEL32, USER32, msvcrt}
+ * (verify_pe.py / test_pe_structure.py stay green; no -lgdi32 in build.bat).
+ * The best HWND is found ONCE per process (largest visible, non-minimized
+ * top-level window of this process); returns 0 quietly when unavailable.
+ * No new breadcrumbs, no dlog per frame — the drawn line IS the visibility. */
+
+typedef int (WINAPI *PFN_GDI_TEXTCOLOR)(HDC, DWORD);   /* SetTextColor(COLORREF) */
+typedef int (WINAPI *PFN_GDI_BKCOLOR)(HDC, DWORD);     /* SetBkColor(COLORREF) */
+typedef int (WINAPI *PFN_GDI_BKMODE)(HDC, int);        /* SetBkMode */
+static PFN_GDI_TEXTCOLOR s_gdi_settext = NULL;
+static PFN_GDI_BKCOLOR   s_gdi_setbk   = NULL;
+static PFN_GDI_BKMODE    s_gdi_bkmode  = NULL;
+static HWND s_gdi_hwnd = NULL;    /* cached after the first successful scan */
+static HWND s_gdi_best_hwnd;      /* per-scan best (EnumWindows accumulator) */
+static long s_gdi_best_area;
+
+static BOOL CALLBACK ui_gdi_find_hwnd(HWND top, LPARAM l) {
+    (void)l;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(top, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    if (!IsWindowVisible(top) || IsIconic(top)) return TRUE;
+    RECT rc;
+    if (!GetWindowRect(top, &rc)) return TRUE;
+    long area = (long)(rc.right - rc.left) * (long)(rc.bottom - rc.top);
+    if (s_gdi_best_hwnd == NULL || area > s_gdi_best_area) {
+        s_gdi_best_hwnd = top;
+        s_gdi_best_area = area;
+    }
+    return TRUE;
+}
+
+int ui_gdi_fallback_draw(void) {
+    if (overlay_disabled_reason()[0] == '\0') return 0;   /* ARMED -> draw nothing */
+    if (s_gdi_hwnd == NULL) {
+        s_gdi_best_hwnd = NULL;
+        s_gdi_best_area = 0;
+        if (!EnumWindows(ui_gdi_find_hwnd, 0)) return 0;
+        s_gdi_hwnd = s_gdi_best_hwnd;
+        if (s_gdi_hwnd == NULL) return 0;   /* no visible window -> safe no-op */
+    }
+    HDC dc = GetDC(s_gdi_hwnd);
+    if (dc == NULL) return 0;
+    RECT rc;
+    GetClientRect(s_gdi_hwnd, &rc);
+    rc.left = 8;
+    rc.top = 8;
+    if (s_gdi_settext == NULL) {
+        HMODULE g = LoadLibraryA("gdi32.dll");
+        if (g != NULL) {
+            s_gdi_settext = (PFN_GDI_TEXTCOLOR)(DWORD_PTR)GetProcAddress(g, "SetTextColor");
+            s_gdi_setbk   = (PFN_GDI_BKCOLOR)(DWORD_PTR)GetProcAddress(g, "SetBkColor");
+            s_gdi_bkmode  = (PFN_GDI_BKMODE)(DWORD_PTR)GetProcAddress(g, "SetBkMode");
+        }
+    }
+    if (s_gdi_bkmode != NULL)  s_gdi_bkmode(dc, OPAQUE);
+    if (s_gdi_setbk != NULL)   s_gdi_setbk(dc, 0x000000u);        /* black background */
+    if (s_gdi_settext != NULL) s_gdi_settext(dc, 0x002828E0u);    /* RGB(0xE0,0x28,0x28) */
+    static char s_gdi_msg[160];
+    _snprintf(s_gdi_msg, sizeof(s_gdi_msg), "Resource Rate Mod: disabled (%s)",
+              overlay_disabled_reason());
+    DrawTextA(dc, s_gdi_msg, -1, &rc, DT_LEFT | DT_TOP | DT_NOCLIP | DT_SINGLELINE);
+    ReleaseDC(s_gdi_hwnd, dc);
+    return 1;
 }

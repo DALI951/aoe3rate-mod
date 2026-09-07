@@ -485,6 +485,54 @@ static void test_nullsafe_actual(void) {
     printf("PASS: rate_for returns 0.0f when g_res NULL (main menu)\n");
 }
 
+/* ==== ROUND 10 (P0): ARMED/DISABLED status + GDI visible fallback ==== */
+static void test_overlay_status_p0(void) {
+    /* pure helper: version-first precedence, then d3dx9 loadability */
+    if (strstr(overlay_state_reason(0, 1, 0), "ver:") == NULL)
+        { printf("FAIL: overlay_state_reason(0,1,0) must contain \"ver:\"\n"); failures++; }
+    else printf("PASS: state_reason(0,1,0) -> ver: reason (version precedence)\n");
+    if (strstr(overlay_state_reason(1, 0, 0), "d3dx9_25.dll") == NULL)
+        { printf("FAIL: overlay_state_reason(1,0,0) must mention d3dx9_25.dll\n"); failures++; }
+    else printf("PASS: state_reason(1,0,0) -> d3dx9_25.dll not loadable\n");
+    if (overlay_state_reason(1, 1, 0)[0] != '\0')
+        { printf("FAIL: overlay_state_reason(1,1,0) must be empty (armed)\n"); failures++; }
+    else printf("PASS: state_reason(1,1,0) -> empty (overlay ARMED)\n");
+    if (overlay_state_reason(1, 1, 1)[0] != '\0')
+        { printf("FAIL: overlay_state_reason(1,1,1) must be empty (ini is a suffix, not a disable)\n"); failures++; }
+    else printf("PASS: state_reason(1,1,1) -> empty (ini-missing never disables)\n");
+
+    /* no-window safety: scan finds no visible same-process window -> 0, no crash */
+    g_version_ok = 0;            /* force DISABLED so the gate lets the scan run */
+    g_version_reason[0] = '\0';
+    if (ui_gdi_fallback_draw() != 0)
+        { printf("FAIL: no matching HWND must return 0\n"); failures++; }
+    else printf("PASS: GDI fallback with no window -> 0 (safe no-op)\n");
+
+    /* hidden-window smoke: a real visible top-level window is found and drawn */
+    HWND h = CreateWindowA("STATIC", "rrmod-p0", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                           0, 0, 200, 100, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    if (h == NULL) { printf("FAIL: CreateWindowA failed\n"); failures++; return; }
+    ShowWindow(h, SW_SHOW);
+    UpdateWindow(h);
+    if (ui_gdi_fallback_draw() != 1)
+        { printf("FAIL: disabled + visible window must draw (return 1)\n"); failures++; }
+    else printf("PASS: GDI fallback draws on the visible window (return 1)\n");
+    DestroyWindow(h);
+    if (ui_gdi_fallback_draw() != 0)
+        { printf("FAIL: destroyed window must return 0\n"); failures++; }
+    else printf("PASS: destroyed window -> 0 (stale HWND safe)\n");
+
+    /* armed -> the gate short-circuits before any GDI work */
+    ui_test_set_ready(1);
+    g_version_ok = 1;
+    g_version_reason[0] = '\0';
+    if (ui_gdi_fallback_draw() != 0)
+        { printf("FAIL: ARMED (version ok + ui ready) must draw nothing\n"); failures++; }
+    else printf("PASS: ARMED -> ui_gdi_fallback_draw() returns 0 (no stray GDI line)\n");
+    ui_test_set_ready(0);
+    g_version_ok = 0;            /* leave the harness globals as found */
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -509,6 +557,8 @@ int main(void) {
     if (g_res != NULL || g_inc != NULL) { printf("FAIL: unmapped -> non-NULL\n"); failures++; }
     observer_sample();
     printf("PASS: unmapped page guard -> NULLs, observer no-op (no crash)\n");
+
+    test_overlay_status_p0();
 
     printf(failures ? "D3D9-ACTUAL FAILURES: %d\n" : "ALL D3D9 ACTUAL CHECKS PASSED\n",
            failures);

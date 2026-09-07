@@ -213,6 +213,7 @@ void settings_load(void) {
     }
     FILE *f = fopen(g_ini_path, "rb");
     if (f == NULL) {
+        g_ini_missing = 1;   /* R10: surfaced in the ARMED status line suffix */
         profile_path_find();
         profile_apply();
         return;

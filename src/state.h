@@ -70,6 +70,8 @@ extern void   *g_fault_dev;   /* device being called when a FAULT fires */
 extern void  **g_fault_vt;    /* that device's vtable pointer */
 extern int     g_fault_slot;  /* device vtable slot index being called */
 extern int     g_ovl_first_done;   /* first successful overlay draw marker */
+extern int     g_ini_missing;      /* R10: ResourceRateMod.ini fopen failed (status line suffix) */
+#define OVL_HEARTBEAT_FRAMES 600   /* R10: one heartbeat line per 600 completed draws (~10s) */
 
 /* ---- logger ---- */
 void dlog(const char *fmt, ...);
@@ -173,6 +175,8 @@ extern int g_panel_visible;
 extern int  g_version_ok;
 extern char g_version_reason[128];
 void version_gate_check(void);
+const char *overlay_disabled_reason(void);   /* R10: current disable reason, "" when armed */
+void overlay_status_log(void);               /* R10: one ARMED/DISABLED line per DLL load */
 
 void settings_init(void);
 void settings_load(void);
@@ -189,5 +193,10 @@ void ui_draw(void);
 void ui_on_reset(void *dev);
 void ui_toggle_panel(void);
 void ui_check_hotkey(void);
+int  ui_ready(void);                            /* R10: d3dx9_25.dll loaded accessor */
+int  ui_gdi_fallback_draw(void);                /* R10: red GDI line when overlay disabled */
+#ifdef SWARM_TEST
+void ui_test_set_ready(int v);                  /* R10 harness seam: force g_ui_ready */
+#endif
 
 #endif /* STATE_H */

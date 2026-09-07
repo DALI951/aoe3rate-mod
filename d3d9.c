@@ -66,6 +66,7 @@ void  *g_font_dev = NULL;       /* R16 B1: device the ID3DXFont is bound to */
 /* settings state */
 ModSettings g_settings;
 int g_panel_visible = 1;
+int g_ini_missing = 0;   /* R10: ResourceRateMod.ini fopen failed (status-line suffix) */
 
 /* version gate state */
 int  g_version_ok = 0;
@@ -292,6 +293,12 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
         : (int)0x8876086c;
     set_step("present-after");
     InterlockedExchange(&g_in_present, 0);
+    /* ROUND 10: GDI visible fallback — OUTSIDE the tripwire set/clear interval,
+     * after the Enabled=0 zero-touch branch, and only draws when the overlay is
+     * DISABLED (version gate failed or d3dx9_25.dll unloadable). No device
+     * state touched, no breadcrumb, no per-frame log: the red line IS the
+     * visibility. */
+    ui_gdi_fallback_draw();
     return hr;
 }
 
@@ -417,6 +424,45 @@ void version_gate_check(void) {
 
     lstrcpyA(g_version_reason, "ok");
     g_version_ok = 1;
+}
+
+/* ========================= ROUND 10: ARMED/DISABLED status =========================
+ * P0 of the spec-gap closure: make "overlay is not running" IMPOSSIBLE to miss.
+ * The last two live logs prove the draw path COMPLETES (version=OK -> UI ready ->
+ * patched=yes -> chain n=3 [human-p1] -> font created -> `ovl first draw ok`,
+ * zero FAULT). What a log cannot prove: pixels on screen, nonzero data, and
+ * post-first-frame stability. This block adds (1) a once-per-load ARMED/DISABLED
+ * status line, (2) the GDI visible fallback (ui.c, red top-left line when the
+ * overlay is DISABLED), (3) a heartbeat every 600 draws in ui_draw().
+ *
+ * overlay_state_reason is the PURE decision helper (harness-testable):
+ *   !version_ok      -> "ver:<g_version_reason>"   (precedence: version first)
+ *   !ui_ready        -> "d3dx9_25.dll not loadable"
+ *   otherwise        -> "" (ARMED)
+ * g_ini_missing is NEVER a disable — it only adds the "(ini missing: using
+ * defaults)" suffix to the ARMED line (defaults-and-continue behavior unchanged). */
+static const char *overlay_state_reason(int version_ok, int ui_ready, int ini_missing) {
+    (void)ini_missing;
+    static char s_buf[160];
+    if (!version_ok) {
+        _snprintf(s_buf, sizeof(s_buf), "ver:%s", g_version_reason);
+        return s_buf;
+    }
+    if (!ui_ready) return "d3dx9_25.dll not loadable";
+    return "";
+}
+
+const char *overlay_disabled_reason(void) {
+    return overlay_state_reason(g_version_ok != 0, ui_ready() != 0, g_ini_missing != 0);
+}
+
+void overlay_status_log(void) {
+    const char *r = overlay_state_reason(g_version_ok != 0, ui_ready() != 0, g_ini_missing != 0);
+    if (r[0] == '\0') {
+        dlog("OVERLAY ARMED%s", g_ini_missing ? " (ini missing: using defaults)" : "");
+    } else {
+        dlog("OVERLAY DISABLED: %s", r);
+    }
 }
 
 /* ========================= IDirect3D9 COM ========================= */
@@ -565,6 +611,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         }
 
         ui_init();
+        overlay_status_log();   /* R10: once per DLL load: ARMED / ARMED(note) / DISABLED:.. */
         set_step("dllmain-done");
     }
     return TRUE;
