@@ -156,6 +156,8 @@ int format_export_line(unsigned long t_ms, float food, float wood, float coin,
                        float export, char *buf, size_t len);
 int export_start(void);
 void export_shutdown(void);
+/* R23: thread-side resolver — fresh chain walk, no shared globals */
+int resolve_export_player(DWORD base, int limit, DWORD *out_res, int *out_idx);
 
 /* ---- settings state ---- */
 typedef struct {

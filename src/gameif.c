@@ -471,6 +471,81 @@ void observer_sample(void) {
     }
 }
 
+/* ---- R23: thread-side resource resolver (NO observer dependency) ----
+ * The export thread MUST NOT depend on the globals the observer resolved at
+ * match start (g_res/g_inc/g_ctx). Those are only refreshed from the present
+ * hook, which is DEAD in-match, so they hold a stale/one-shot/reallocated
+ * pointer whose decrypt reads come back 0 forever. This resolver re-walks
+ * the full verified chain FRESH on every call (game=*(base+RVA_GAME_PTR),
+ * ctx=*(game+OFF_GAME_CTX), n=*(ctx+OFF_CTX_PLAYERCNT), arr=*(ctx+
+ * OFF_CTX_PLAYERS)) and never writes any shared global. Guarded like
+ * locate_resources_impl (safe_r32 chain, NULL-safe throughout).
+ *
+ * Player pick for MP+SP: iterate i in 0..n-1, take p=*(arr+i*4),
+ * r=*(p+OFF_PLAYER_RES), ic=*(p+OFF_PLAYER_INCOME), skip any 0; total =
+ * decrypt_slot_at(r,2)+decrypt_slot_at(r,1)+decrypt_slot_at(r,0)+
+ * decrypt_slot_at(r,7) (decrypt_slot_at itself unchanged); pick the
+ * candidate with the LARGEST total (> previous best). The candidate list
+ * (every (i,total)) and n are exposed through g_export_cands/g_export_n so
+ * the caller can log once on change. Returns 1 + *out_res/*out_idx on a sane
+ * pick, 0 (no write) when no candidate is usable (all zero/garbage). */
+typedef struct {
+    int   idx;
+    float total;
+} ExportCand;
+#define EXPORT_MAX_CANDS 32
+static ExportCand g_export_cands[EXPORT_MAX_CANDS];
+static int        g_export_ncand = 0;   /* candidates filled this call */
+static int        g_export_n = 0;       /* player count seen this call */
+
+int resolve_export_player(DWORD base, int limit, DWORD *out_res, int *out_idx) {
+    g_export_ncand = 0;
+    g_export_n = 0;
+    if (out_res) *out_res = 0;
+    if (out_idx) *out_idx = -1;
+    if (base == 0) return 0;
+
+    DWORD game = safe_r32(base + RVA_GAME_PTR);
+    if (game == 0) return 0;
+    DWORD ctx = safe_r32(game + OFF_GAME_CTX);
+    if (ctx == 0) return 0;
+
+    int n = (int)safe_r32(ctx + OFF_CTX_PLAYERCNT);
+    g_export_n = n;
+    if (n <= 0) return 0;
+    if (limit > 0 && n > limit) n = limit;
+
+    DWORD arr = safe_r32(ctx + OFF_CTX_PLAYERS);
+    if (arr == 0) return 0;
+
+    int   pick_i = -1;
+    DWORD pick_r = 0;
+    float best = -1.0f;
+    for (int i = 0; i < n; i++) {
+        DWORD p = safe_r32(arr + (DWORD)i * 4);
+        if (p == 0) continue;
+        DWORD r = safe_r32(p + OFF_PLAYER_RES);
+        DWORD ic = safe_r32(p + OFF_PLAYER_INCOME);
+        if (r == 0 || ic == 0) continue;
+        float total = decrypt_slot_at(r, 2) + decrypt_slot_at(r, 1) +
+                      decrypt_slot_at(r, 0) + decrypt_slot_at(r, 7);
+        if (g_export_ncand < EXPORT_MAX_CANDS) {
+            g_export_cands[g_export_ncand].idx = i;
+            g_export_cands[g_export_ncand].total = total;
+            g_export_ncand++;
+        }
+        if (total > best) {
+            best = total;
+            pick_i = i;
+            pick_r = r;
+        }
+    }
+    if (pick_i < 0 || pick_r == 0) return 0;
+    if (out_res) *out_res = pick_r;
+    if (out_idx) *out_idx = pick_i;
+    return 1;
+}
+
 /* ---- R21: export thread ----
  * Background thread that tails the verified resource chain and writes the
  * live exported values to rates.log (R21: the DLL's own pipe, read by
@@ -482,6 +557,9 @@ void observer_sample(void) {
  * [Debug] Enabled=0 (export mode). Shutdown via s_export_running=0 from
  * DLL_PROCESS_DETACH + WaitForSingleObject. d3d9mod.log stays the DEBUG
  * diagnostics log (Debug=1 only) — the export pipe is now rates.log. */
+static int s_exp_last_idx = -1;   /* R23: previous pick index for one-shot diag */
+static int s_exp_last_n   = -1;   /* R23: previous player count for one-shot diag */
+
 static DWORD WINAPI export_thread(LPVOID param) {
     (void)param;
     char logpath[MAX_PATH];
@@ -500,13 +578,37 @@ static DWORD WINAPI export_thread(LPVOID param) {
     while (s_export_running) {
         Sleep(500);
         unsigned long t = (unsigned long)clock_now();
-        void *base = g_base;
-        void *res  = g_res;
-        if (base == NULL || res == NULL) continue;
-        float food   = decrypt_slot_at((DWORD)(DWORD_PTR)res, 2);
-        float wood   = decrypt_slot_at((DWORD)(DWORD_PTR)res, 1);
-        float coin   = decrypt_slot_at((DWORD)(DWORD_PTR)res, 0);
-        float export = decrypt_slot_at((DWORD)(DWORD_PTR)res, 7);
+        /* R23: resolve the player FRESH each iteration — never trust the
+         * observer-resolved g_res (stale in-match, zeros forever). */
+        DWORD base = g_base ? (DWORD)(DWORD_PTR)g_base : 0;
+        DWORD res = 0;
+        int   idx = -1;
+        if (base == 0) continue;
+        if (!resolve_export_player(base, EXPORT_MAX_CANDS, &res, &idx))
+            continue;   /* no sane player -> no zero line */
+        if (res == 0) continue;
+
+        /* R23 who-is-who diagnostic: ONE line ONLY when the pick (index or
+         * player count) changes — rare, tells us which index Dali IS. */
+        if (idx != s_exp_last_idx || g_export_n != s_exp_last_n) {
+            char dbg[256];
+            int ln = _snprintf(dbg, sizeof(dbg), "R23 pick: n=%d idx=%d cand=[",
+                               g_export_n, idx);
+            for (int k = 0; k < g_export_ncand && ln > 0 && ln < (int)sizeof(dbg); k++)
+                ln += _snprintf(dbg + ln, sizeof(dbg) - ln, "%s%d:%.0f",
+                                k ? " " : "", g_export_cands[k].idx,
+                                g_export_cands[k].total);
+            if (ln > 0 && ln < (int)sizeof(dbg))
+                ln += _snprintf(dbg + ln, sizeof(dbg) - ln, "]");
+            dlog("%s", dbg);
+            s_exp_last_idx = idx;
+            s_exp_last_n = g_export_n;
+        }
+
+        float food   = decrypt_slot_at(res, 2);
+        float wood   = decrypt_slot_at(res, 1);
+        float coin   = decrypt_slot_at(res, 0);
+        float export = decrypt_slot_at(res, 7);
         char buf[64];
         int n = format_export_line(t, food, wood, coin, export, buf, sizeof(buf));
         if (n <= 0) continue;

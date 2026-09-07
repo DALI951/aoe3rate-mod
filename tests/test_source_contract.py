@@ -839,13 +839,29 @@ check("(unsigned long)clock_now()" in code,
       "R20/21: export thread t comes from the verified clock_now() ms source")
 check("format_export_line(t, food, wood, coin, export" in code,
       "R20/21: export thread formats via format_export_line with all five fields")
-check("decrypt_slot_at((DWORD)(DWORD_PTR)res, 2)" in code
-      and "decrypt_slot_at((DWORD)(DWORD_PTR)res, 1)" in code
-      and "decrypt_slot_at((DWORD)(DWORD_PTR)res, 0)" in code
-      and "float export = decrypt_slot_at((DWORD)(DWORD_PTR)res, 7);" in code,
-      "R20/21: export decrypts slots food=2, wood=1, coin=0, export=7 via the VERIFIED chain")
-check("if (base == NULL || res == NULL) continue;" in code,
-      "R20/21: export skips writes while g_base/g_res are NULL")
+check("decrypt_slot_at(res, 2)" in code
+      and "decrypt_slot_at(res, 1)" in code
+      and "decrypt_slot_at(res, 0)" in code
+      and "decrypt_slot_at(res, 7)" in code,
+      "R23: export decrypts slots food=2, wood=1, coin=0, export=7 from resolve result (DWORD res)")
+check("resolve_export_player" in code,
+      "R23: resolve_export_player called per-iteration by the export thread")
+check("EXPORT_MAX_CANDS" in code and "g_export_cands" in code and "g_export_ncand" in code,
+      "R23: EXPORT_MAX_CANDS / g_export_cands / g_export_ncand statics present")
+check("g_export_n" in code and "g_export_ncand" in code,
+      "R23: g_export_n and g_export_ncand exposed for caller diagnostics")
+check("s_exp_last_idx" in code and "s_exp_last_n" in code,
+      "R23: s_exp_last_idx / s_exp_last_n diagnostic tracking statics present")
+check('"R23 pick: n=%d idx=%d cand=["' in code,
+      "R23: who-is-who diagnostic format string present in export thread")
+check(code.count('"R23 pick: n=%d idx=%d cand=["') == 1,
+      "R23: who-is-who diagnostic fires EXACTLY once (when pick changes)")
+check('int resolve_export_player(DWORD base, int limit, DWORD *out_res, int *out_idx)' in code,
+      "R23: resolve_export_player with correct signature (int *out_idx for -1) defined")
+check("safe_r32" in code and "RVA_GAME_PTR" in code and "OFF_GAME_CTX" in code,
+      "R23: resolver walks game->ctx chain via safe_r32 (NULL-safe guarded)")
+check("s_exp_last_idx = idx;" in code and "s_exp_last_n = g_export_n;" in code,
+      "R23: one-shot diagnostic updates s_exp_last_idx and s_exp_last_n after logging")
 check("fopen(logpath, \"w\")" in code, "R20/21: export truncates the log at thread start")
 check("fopen(logpath, \"a\")" in code and "fwrite(buf" in code
       and "fflush(f)" in code and "fclose(f)" in code,
