@@ -612,14 +612,29 @@ for _sl, _nm in ((2, "Food"), (1, "Wood"), (0, "Coin"), (7, "Export")):
           f"rate_get_ema({_sl})" in code,
           f"R12: row {_sl} ({_nm}) names-off->NULL via format_rate_line+rate_get_ema")
 
-# 4) P0 one-shot render diagnostic (debug-gated, after the first-draw marker).
+# R13: the one-shot render diagnostic is UNCONDITIONAL (primary invisibility
+# diagnostic — one line per load even on DebugEnabled=0 deployments), so the
+# marker..diag region must no longer reference the debug flag at all.
 i_fd = src.find('"ovl first draw ok frame=%d"')
 i_diag = src.find('ovl diag rt=%p rect=%ld,%ld:%ldx%ld alpha=0x%lX', i_fd)
-check(i_fd != -1 and i_diag != -1, "R11: ovl diag line present after the first-draw marker")
-check(i_fd != -1 and i_diag != -1 and src.find("g_settings.debug_enabled", i_fd) < i_diag,
-      "R11: g_settings.debug_enabled gates the diagnostic (marker < gate < diag)")
-check("!g_ovl_first_done && g_settings.debug_enabled" in code,
-      "R11: diagnostic guard literal (flag set AFTER the diag block)")
+check(i_fd != -1 and i_diag != -1, "R13: ovl diag line present after the first-draw marker")
+check(i_fd != -1 and i_diag != -1 and "debug_enabled" not in src[i_fd:i_diag],
+      "R13: ovl diag is NOT debug-gated (marker..diag region free of the gate)")
+check("!g_ovl_first_done && g_settings.debug_enabled" not in code,
+      "R13: old debug-gated diag guard literal removed")
+
+# R13: silent-stop detectors — one draw-path abort logger (4 named stages,
+# fires once at 60 consecutive aborts) and one reentrant-present logger, both
+# non-debug-gated; both counters reset on a completed/normal frame.
+check(code.count('ovl stop: %u consecutive frame aborts at stage=') == 1,
+      "R13: draw-path stop detector message exactly once")
+for stage in ("grt-missing", "grt-fail", "surface-bad", "guard-fail"):
+    check(code.count('ovl_abort_stop("%s")' % stage) == 1,
+          "R13: abort stage %s wired exactly once" % stage)
+check(code.count("ovl stop: reentrant-present for %u consecutive frames") == 1,
+      "R13: reentrant-present stop detector exactly once")
+check("s_ovl_abort_n = 0;" in code and "s_re_present_n = 0;" in code,
+      "R13: both stop detectors reset on a completed/normal frame")
 
 # ================= R14: modular layout =================
 

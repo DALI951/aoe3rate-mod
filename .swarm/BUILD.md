@@ -1,3 +1,83 @@
+# BUILD — ROUND 13 (2026-09-07) — DIAGNOSIS-DRIVEN HARDENING (silent-stop detector + unconditional diag)
+
+## ROUND SUMMARY
+No crash this round (game NOT launched). Two fresh live runs (log bodies IDENTICAL) showed
+`OVERLAY ARMED` -> `UI: font created` -> `ovl first draw ok frame=440`/`342`, then ABSOLUTE
+SILENCE for 60s — the 600-frame heartbeat (src/ui.c:697-702, NOT debug-gated) logged ZERO times.
+This round: (1) byte-verify the deployed DLL, (2) un-gate the render diag, (3) add a permanent
+silent-stop detector so a dead overlay is never ambiguous again, (4) refresh the stale game-dir INI.
+
+## FINDING #1 — deployed DLL is CURRENT, NOT stale (bytes)
+- `Get-FileHash` on all three copies BEFORE any rebuild: game dir == repo == tests ==
+  `1cf285b6a730a0e531be8bb1ab36db7bbca64ec6e10b5d77815911ef2e38cbeb` (the exact R12 hash),
+  149,815 B, same mtime — **the deployed game-dir DLL IS the R12 build and DOES contain the R10
+  heartbeat**. A stale deployment CANNOT explain the silence. => The missing heartbeat is REAL:
+  the draw path dies quietly after the first successful draw, i.e. one of the four EARLY RETURNS at
+  src/ui.c:609/611/613/622 (grt==NULL / grt-fail / cvt==NULL / VirtualQuery guard) fires every
+  later frame. Those paths were silent and pre-state-change, which is exactly why they never
+  showed up — now they cannot hide.
+
+## CHANGE LIST
+- **src/ui.c — `ovl diag` un-gated (render-invisibility diagnostic).** The one-shot
+  `dlog("ovl diag rt=%p rect=%ld,%ld:%ldx%ld alpha=0x%lX", ...)` now fires on the FIRST draw
+  UNCONDITIONALLY — one line per process load, even on a shipped `[Debug] Enabled=0` run — because
+  it is the PRIMARY render-invisibility diagnostic. Content identical to R11 P0 (rt + exact panel
+  rect/alpha used the same frame). `g_ovl_first_done` semantics kept (flag set AFTER the block);
+  comment updated to state it is unconditional-by-design. No state.h change needed (no macro/flag
+  involved — `g_ovl_first_done` already an extern).
+- **src/ui.c — silent-stop detector (draw path).** New `ovl_abort_stop(stage)`: counts CONSECUTIVE
+  frames aborting at the four early returns — stage `grt-missing` (grt==NULL), `grt-fail`
+  (GetRenderTarget hr!=0 or cur==NULL), `surface-bad` (surface vtable NULL), `guard-fail`
+  (VirtualQuery MEM_COMMIT/NOACCESS/GUARD check). At exactly 60 consecutive aborts it logs ONCE
+  (not per frame, NOT debug-gated): `ovl stop: %u consecutive frame aborts at stage=<stage> - overlay
+  draw halted`. Counter resets on any completed draw (the `s_ovl_draws++` heartbeat bump). The abort
+  sites already ran BEFORE any state was changed, so logging is trivially safe.
+- **d3d9.c — silent-stop detector (reentrant present).** Counts CONSECUTIVE frames where the
+  present_hook re-entrancy branch fires (nested Present while the tripwire was set); at 60 logs once:
+  `ovl stop: reentrant-present for %u consecutive frames`. Reset on any normal present. Distinguishes
+  "hook called but overlay skipped every frame" from "ui_draw early-returns". Kept brace-flat inside
+  the reentrant branch (single-statement if) so the R9 B7 pin "no early return between tripwire-set
+  and clear while holding the token" still passes.
+- **Game-dir INI REFRESH.** Old `ResourceRateMod.ini` was the 26-line pre-R11 version (missing the 9
+  R11 keys + `[Debug] Enabled=0` which also hides RES + diag). Backed up to
+  `ResourceRateMod.ini.bak` (366 B, 26 lines) in the game dir; new file is the COMPLETE 35-line
+  config from the repo example with `[Debug] Enabled=1` (all 9 keys: DecimalPlaces, ShowPlusSign,
+  ShowResourceNames, ShowZeroRates, ShowFood/Wood/Coin/Export, PositionMode). Repo-side
+  `ResourceRateMod.ini.example` already had every key — unchanged. No key invented beyond settings.c.
+- **tests/test_source_contract.py** — R11 gate pins FLIPPED to R13: the marker..diag region must NOT
+  contain `debug_enabled`; the old `!g_ovl_first_done && g_settings.debug_enabled` guard literal must
+  be GONE. New pins (not over-tightened): draw-path stop message exactly once; each stage name wired
+  exactly once; reentrant-present message exactly once; both counters reset on a completed/normal
+  frame. All other pins (incl. B7) untouched.
+
+## LIVE-TEST EXPECTATIONS (Dali's next run, this build)
+The game-dir INI now has `[Debug] Enabled=1`, so the next run MUST show, on TOP of the previous
+body: uninterrupted periodic `ovl heartbeat n=600 frame=.. res=.. food=.. wood=.. coin=.. export=..`
+lines every ~10s (the R16 check), `RES` sampling lines per SETTLEMENT (when debug on), and the
+philosophy of the log reading:
+- heartbeat lines every ~10s  => draw path completes continuously  (panel may still be invisible
+  for geometry reasons -> next-step is render-geometry math).
+- `ovl stop: .. aborts at stage=grt-missing|grt-fail|surface-bad|guard-fail` => draw path dying
+  every frame -> next-step is RT-surface handling.
+- `ovl stop: reentrant-present for 60` => hook called but overlay skipped -> next-step is tripwire
+  lifetime.
+- still NO heartbeat AND NO ovl stop => even the abort path never runs -> next-step is
+  present_hook not being called at all (device/vtable).
+
+## BUILD / HARNESSES (this round)
+- Build rc=0, zero warnings (-Wall -Wextra), VERIFY PASS (i386 PE32, imports KERNEL32/USER32/msvcrt
+  only, 11 exports via d3d9.def — unchanged set).
+- d3d9.dll = **150,394 B**, SHA256 `e04cc7c4341c4ac68f31154c1f5001c880f7dc120f1cb768ae1bea89bd8b4249`,
+  deployed byte-identical to repo root + game dir + tests\d3d9.dll (all 3 SHA256 equal); old
+  d3d9mod.log deleted. (First e04cc7c4 build, then a pure-brace reformat rebuilt to the SAME hash —
+  confirmed code-equivalent.)
+- Harnesses (rebuilt from tests\ with i686-w64-mingw32-gcc 16.2.0, then run): test_rate_engine.exe
+  FAILURES 0 · test_d3d9_actual.exe ALL D3D9 ACTUAL CHECKS PASSED · test_pe_structure.py
+  FAILURES 0 · test_source_contract.py SOURCE-CONTRACT: PASS (R13 pins + all R11/R12 pins green).
+- One harness iteration caught: R13's nested-if inside the reentrant branch broke the R9 B7 pin's
+  flat-brace scan -> reverted to a single-statement if (identical code, identical hash).
+
+---
 # BUILD — ROUND 12 (2026-09-07) — TESTER-FINDING CLOSURES (names-off real fix + tightened harnesses)
 
 ## ROUND SUMMARY

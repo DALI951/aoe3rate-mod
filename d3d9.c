@@ -102,6 +102,7 @@ typedef int  (STDMETHODCALLTYPE *DEV_RESET)(void *, const void *);
 static PRESENT_FN s_orig_present = NULL;
 static DEV_RESET s_orig_reset   = NULL;
 static volatile LONG g_in_present = 0;   /* R16 B7: re-entrancy tripwire */
+static unsigned int s_re_present_n = 0;  /* R13: consecutive reentrant-present frames (stop detector) */
 
 /* (patch_device_present forward-declared above) */
 
@@ -286,9 +287,20 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
      * the overlay body again. Skip straight to the real Present. */
     if (InterlockedCompareExchange(&g_in_present, 1, 0) != 0) {
         set_step("present-reentrant");
+        /* R13: reentrant-present stop detector — counts CONSECUTIVE frames
+         * where the tripwire was ALREADY set (a nested Present on this thread).
+         * Logs once at 60 so "hook called but overlay skipped every frame" is
+         * distinguishable from a ui_draw early-return (which logs its own
+         * ovl stop with a stage). The counter resets on the first normal
+         * (non-reentrant) present below. */
+        s_re_present_n++;
+        if (s_re_present_n == 60)
+            dlog("ovl stop: reentrant-present for %u consecutive frames",
+                 s_re_present_n);
         PRESENT_FN re = s_orig_present;
         return (re != NULL) ? re(self, a, b, hwnd, dirty) : (int)0x8876086c;
     }
+    s_re_present_n = 0;   /* R13: a normal present resets the reentrant counter */
 
     set_step("locate");
     locate_resources();

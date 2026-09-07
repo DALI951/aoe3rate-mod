@@ -93,6 +93,7 @@ static int     g_ui_ready = 0;
 static int     g_font_guard_warned = 0;
 static int     s_font_fail_n = 0;   /* consecutive font-create fails (R16 B4) */
 static DWORD   s_ovl_draws = 0;     /* R10: completed overlay draws (600-frame heartbeat) */
+static unsigned int s_ovl_abort_n = 0;  /* R13: consecutive frame aborts at the 4 draw-path early returns */
 static unsigned short g_key_prev[17];  /* 6 plain toggles + indices 6/7 (F9/scratch) + 9 Alt toggles (R11) */
 
 static void set_trace(void *dev, void **vt, int slot, const char *step);
@@ -560,6 +561,20 @@ static void set_trace(void *dev, void **vt, int slot, const char *step) {
     set_step(step);
 }
 
+/* R13: silent-stop detector — counts CONSECUTIVE frames that die at the four
+ * draw-path early returns (grt-missing / grt-fail / surface-bad / guard-fail).
+ * After 60 consecutive aborts (~1s at 60fps) it logs ONCE per burst (not per
+ * frame, NOT debug-gated), so a dead overlay can never again look like a stale
+ * deployment or plain silence. The counter resets on the first draw that
+ * completes (reaches the heartbeat bump below). */
+static void ovl_abort_stop(const char *stage) {
+    s_ovl_abort_n++;
+    if (s_ovl_abort_n == 60) {
+        dlog("ovl stop: %u consecutive frame aborts at stage=%s - overlay draw halted",
+             s_ovl_abort_n, stage);
+    }
+}
+
 void ui_draw(void) {
     set_step("ovl-start");
     if (!g_settings.enabled) return;
@@ -606,11 +621,11 @@ void ui_draw(void) {
      * -> skip the whole frame. */
     void *cur = NULL;
     VF_GETRT grt = (VF_GETRT)vt[D9_GETRENDERTARGET];
-    if (grt == NULL) return;
+    if (grt == NULL) { ovl_abort_stop("grt-missing"); return; }
     set_trace(dev, vt, D9_GETRENDERTARGET, "ovl-grt");
-    if (grt(dev, 0, &cur) != 0 || cur == NULL) return;
+    if (grt(dev, 0, &cur) != 0 || cur == NULL) { ovl_abort_stop("grt-fail"); return; }
     void **cvt = *(void ***)cur;
-    if (cvt == NULL) return;
+    if (cvt == NULL) { ovl_abort_stop("surface-bad"); return; }
     VF_HR crel = (VF_HR)cvt[2];                    /* IDirect3DSurface9::Release (slot 2) */
     {
         MEMORY_BASIC_INFORMATION mbi;
@@ -619,6 +634,7 @@ void ui_draw(void) {
             (mbi.Protect & PAGE_NOACCESS) ||
             (mbi.Protect & PAGE_GUARD)) {
             if (crel != NULL) crel(cur);
+            ovl_abort_stop("guard-fail");
             return;
         }
     }
@@ -674,26 +690,28 @@ void ui_draw(void) {
     if (crel != NULL) crel(cur);   /* release our GetRenderTarget reference */
     if (!g_ovl_first_done) {
         dlog("ovl first draw ok frame=%d", g_frames_since_reset);
-        /* R11 P0: ONE-SHOT render diagnostic (debug-gated, so a shipped
-         * DebugEnabled=0 run logs nothing extra). The nested
-         * "!g_ovl_first_done" is still true here — the flag is set AFTER this
-         * block. Logs the CURRENT render target (the released pointer value
-         * only, never dereferenced) plus the exact panel rect/alpha that
-         * ui_draw_panel used this same frame. */
-        if (!g_ovl_first_done && g_settings.debug_enabled) {
-            int dpx, dpy, dpw, dph;
-            ui_panel_geometry(&dpx, &dpy, &dpw, &dph);
-            DWORD dal = (DWORD)((g_settings.opacity * 255.0f) + 0.5f);
-            if (dal > 255) dal = 255;
-            dlog("ovl diag rt=%p rect=%ld,%ld:%ldx%ld alpha=0x%lX",
-                 cur, (long)dpx, (long)dpy, (long)dpw, (long)dph,
-                 (unsigned long)dal);
-        }
+        /* R13: the render diagnostic is UNCONDITIONAL by design — exactly one
+         * line per process load, even on a shipped DebugEnabled=0 run, because
+         * it is the PRIMARY render-invisibility diagnostic: a missing line on
+         * an otherwise-working load means the deployed DLL is stale or the
+         * draw path died before the first successful draw. Content identical
+         * to R11 P0: the CURRENT render target (released pointer value only,
+         * never dereferenced) plus the exact panel rect/alpha that
+         * ui_draw_panel used this same frame. g_ovl_first_done semantics kept:
+         * the flag is set AFTER this block. */
+        int dpx, dpy, dpw, dph;
+        ui_panel_geometry(&dpx, &dpy, &dpw, &dph);
+        DWORD dal = (DWORD)((g_settings.opacity * 255.0f) + 0.5f);
+        if (dal > 255) dal = 255;
+        dlog("ovl diag rt=%p rect=%ld,%ld:%ldx%ld alpha=0x%lX",
+             cur, (long)dpx, (long)dpy, (long)dpw, (long)dph,
+             (unsigned long)dal);
         g_ovl_first_done = 1;
     }
     /* ROUND 10 heartbeat: every 600 completed draws (~10s at 60fps) prove the
      * draw path is STILL completing long after first-frame — not debug-gated
      * (max ~6 lines/min), value/res reads reuse what ui_draw already has. */
+    s_ovl_abort_n = 0;   /* R13: any completed draw resets the stop detector */
     s_ovl_draws++;
     if ((s_ovl_draws % OVL_HEARTBEAT_FRAMES) == 0) {
         dlog("ovl heartbeat n=%u frame=%d res=%p food=%0.0f wood=%0.0f coin=%0.0f export=%0.0f",
