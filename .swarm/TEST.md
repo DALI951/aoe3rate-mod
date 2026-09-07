@@ -151,6 +151,13 @@ canonical DXSDK d3d9.h (order: GetSwapChain, GetNumberOfSwapChains, Reset,
 
 ---
 
+## R24 (commit 5e1a276 + 500558a)
+
+Tester verdict: TESTS PASS — 7 harnesses, 0 failures across ~600 checks.
+New runtime harness tests/test_r24_selection.c (19 CHECKs, commit 500558a): exercises the REAL resolver via SWARM_TEST include of src/d3d9.c — stable-lock, spend-signature switch, no-candidate skip. Fails on R23 behavior (6+ checks). Runner: build\build.bat then i686-w64-mingw32-gcc on each test*.c, python tests\*.py.
+
+---
+
 # TEST.md — ROUND 5 — authoritative active-player rework (chain `idx = *(game+0x14c)` + probe-lite fallback)
 
 Date: 2026-09-05. Tester re-verification of the round-5 rework described in `.swarm/BUILD.md`

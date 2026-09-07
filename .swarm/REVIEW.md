@@ -217,3 +217,6 @@ cryptographic math + the guard behavior only, never the live data path.
    47-51). Doc-only.
 5. `test_nullsafe_o1.exe` (mod root) — stale SEH-era binary, fails its own
    case 3, exit 1. Recommend deletion.
+
+## R24
+VERDICT: APPROVE. Pick rules match plan exactly (lock → sp_locked → first → skip); spend-switch requires drop>=15% AND >=40 with >=2 occurrences, cannot fire at match-start tiny totals; rates.log format byte-identical to Dali's spec; diag change-gated. Findings: (1) test tautological CHECK at test_r24_selection.c:174, (2) weak post-switch CHECK index assertion line ~259, (3) rnd rounding for negative floats gameif.c:398-404 minor, (4) spend-switch only records last qualifying other (gameif.c:616) fragile if n>3, (5) MEDIUM: LAN-client join locks onto host idx1 until spend-switch; consider INI PlayerIdx override later.
