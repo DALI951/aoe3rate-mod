@@ -1,3 +1,52 @@
+# BUILD — ROUND 20 (2026-09-07) — EXPORT LINE → `t=ms` + EXPORT FIELD (4 resources)
+
+## ROUND SUMMARY
+R20 re-formats the recurring export line to the exact
+`t=%lu,food=%d,wood=%d,coin=%d,export=%d` contract: `t` is the **verified realtime
+millisecond clock** (`tracker.c clock_now()`: QPC → ms, `GetTickCount` fallback — NOT the
+per-Present `s_tick` frame counter), and the 4th resource **export (slot 7)** is added via the
+same verified `decrypt_slot_at` chain. Widget shows Food/Wood/Coin/Export + a small dimmed
+`t=` indicator. Imports stay {KERNEL32,USER32,msvcrt}, still 11 exports, all 6 harnesses green.
+**NOT deployed to the game folder** — Dali verifies on his machine first.
+
+## HOW TO USE (unchanged)
+Default `[Debug] Enabled=0` → the log carries ONLY the recurring export lines:
+`pythonw.exe tools\rates_widget.py` (drag = move, right-click = close). `[Debug] Enabled=1` →
+full diagnostics, export suppressed.
+
+## IMPLEMENTATION
+- `src/gameif.c` `format_export_line` signature is now
+  `int format_export_line(unsigned long t_ms, float food, float wood, float coin, float export, char *buf, size_t len)`
+  → exact `"t=%lu,food=%d,wood=%d,coin=%d,export=%d"`, values `(int)(x+0.5f)`,
+  clamped + forced NUL, 0 on NULL/0-size. Declared in `src/state.h`.
+- `export_thread`: `Sleep(500)` → `t = (unsigned long)clock_now()` (QPC→ms verified),
+  skip while `g_base`/`g_res` NULL, decrypt slots **food=2, wood=1, coin=0, export=7**,
+  truncate-once (`"w"`) then append+`fflush` (`"a"`).
+- Launch/shutdown unchanged: lazy on first `Direct3DCreate9`, Debug=0 only; `DLL_PROCESS_DETACH` →
+  `export_shutdown()`.
+- `tools/rates_widget.py`: PATTERN `t=(\d+),food=(\d+),wood=(\d+),coin=(\d+),export=(\d+)` →
+  `(t,food,wood,coin,export)`; new EXPORT row (`#a5e8a0`); small dimmed `t=` footer
+  (`#556677`); frameless/topmost/drag/200ms poll all kept.
+
+## HARNESS (ALL 6 GREEN)
+- `tests/test_export.exe` — **FAILURES: 0** — exact `t=%lu,...` string incl. Dali's 3 sample lines
+  (`t=182340,food=100,wood=0,coin=0,export=0`, `182840/120`, `183340/120`), `(int)(x+0.5f)`
+  rounding incl. export, big-`t` 0xFFFFFFFF wrap, no-space check, NULL/0-size/tiny-buffer.
+- `tests/test_widget_parse.py` — **WIDGET-PARSE: PASS** — 5-tuple parse, Dali's 3 lines, missing-
+  field/malformed/R19-legacy → None, module PATTERN pinned.
+- `tests/test_source_contract.py` — **SOURCE-CONTRACT: PASS** — R19 pins updated to R20: new 5-arg
+  signature (def + state.h decl), `t=%lu` format literal, `(unsigned long)clock_now()` in thread,
+  slot-7 decrypt, widget PATTERN string, unchanged diet/gating/order pins.
+- `tests/test_rate_engine.exe` — **FAILURES: 0** · `tests/test_d3d9_actual.exe` — **ALL D3D9 ACTUAL
+  CHECKS PASSED** · `tests/test_pe_structure.py` — **FAILURES: 0** (imports subset verified).
+
+## BUILD
+rc=0, zero warnings. **d3d9.dll = 155,825 B**, SHA256:
+`9b99c2a307a5729b6774909ae8c7cff00a3685e1878341d432c7ff4784b2c170`
+(see `d3d9.sha256`).
+
+---
+
 # BUILD — ROUND 19-PIVOT (2026-09-07) — FILE-EXPORT PIVOT: live values → d3d9mod.log + always-on-top Python widget
 
 ## ROUND SUMMARY

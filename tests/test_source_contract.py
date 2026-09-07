@@ -66,6 +66,8 @@ def load_sources():
 src = load_sources()
 code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
 code = re.sub(r"//[^\r\n]*", "", code)
+with open(os.path.join(ROOT, "tools", "rates_widget.py"), "r", encoding="utf-8") as fw:
+    widget_code = fw.read()
 
 
 def code_contains(sym):
@@ -626,9 +628,10 @@ for _sl, _nm in ((2, "Food"), (1, "Wood"), (0, "Coin"), (7, "Export")):
           f"rate_get_ema({_sl})" in code,
           f"R12: row {_sl} ({_nm}) names-off->NULL via format_rate_line+rate_get_ema")
 
-# R19: the one-shot render diagnostic is now DEBUG-GATED (the pivot makes the
-# default Debug=0 log export-only, containing ONLY `food:X ,wood:X ,coin:X`
-# lines). The R13 "unconditional diag" design is retired by the pivot.
+# R19/R20: the one-shot render diagnostic is now DEBUG-GATED (the pivot makes
+# the default Debug=0 log export-only, containing ONLY the recurring
+# `t=%lu,food=%d,wood=%d,coin=%d,export=%d` export lines). The R13
+# "unconditional diag" design is retired by the pivot.
 i_fd = src.find('"ovl first draw ok frame=%d"')
 i_diag = src.find('ovl diag rt=%p rect=%ld,%ld:%ldx%ld alpha=0x%lX', i_fd)
 check(i_fd != -1 and i_diag != -1, "R13/R19: ovl diag line still present after the first-draw marker")
@@ -806,89 +809,99 @@ check('dlog("swapchain-impl: sw=%p patched=%d"' in code
       and 'dlog("swapchain-impl: n/a hr=0x%08X"' in code,
       "R17: swapchain-impl line (patched / n/a) logged once per device")
 
-# ================= ROUND 19: FILE EXPORT PIVOT (live values -> d3d9mod.log + widget) =================
-# Dali pivoted away from the in-game D3D overlay: the DLL now exports the live
-# decrypted stock as recurring `food:%d ,wood:%d ,coin:%d` lines to d3d9mod.log,
-# and a Python Tkinter widget (tools/rates_widget.py) tails them in an
-# always-on-top window. House rules: reuses ONLY the verified chain + decrypt,
-# no new imports (CreateThread via KERNEL32), additive, Debug=0 => export-only.
-export_format = "food:%d ,wood:%d ,coin:%d"
-check("int format_export_line(float food, float wood, float coin, char *buf, size_t len)" in code,
-      "R19: format_export_line DEFINED with the exact signature")
-check("int format_export_line(float food, float wood, float coin, char *buf, size_t len);" in stateh,
-      "R19: format_export_line DECLARED in state.h")
+# ================= ROUND 20: t=ms + EXPORT FIELD (live values -> d3d9mod.log + widget) =================
+# R20 moves the export line to the exact format
+# `t=%lu,food=%d,wood=%d,coin=%d,export=%d` — t is the VERIFIED realtime
+# millisecond clock (tracker.c clock_now(): QPC->ms, GetTickCount fallback),
+# NOT the s_tick present-frame counter. Export field = slot 7 decrypted via
+# the VERIFIED chain, same as the RES line. House rules: reuses ONLY the
+# verified chain + decrypt, no new imports, additive, Debug=0 => export-only.
+export_format = "t=%lu,food=%d,wood=%d,coin=%d,export=%d"
+check("int format_export_line(unsigned long t_ms, float food, float wood, float coin," in code
+      and "float export, char *buf, size_t len)" in code,
+      "R20: format_export_line DEFINED with the exact signature")
+check("int format_export_line(unsigned long t_ms, float food, float wood, float coin," in stateh
+      and "float export, char *buf, size_t len);" in stateh,
+      "R20: format_export_line DECLARED in state.h")
 check(export_format in code,
-      "R19: exact export format `food:%d ,wood:%d ,coin:%d` present")
+      "R20: exact export format `t=%lu,food=%d,wood=%d,coin=%d,export=%d` present")
 check("(int)(food + 0.5f)" in code and "(int)(wood + 0.5f)" in code
-      and "(int)(coin + 0.5f)" in code,
-      "R19: values rounded via (int)(x+0.5f)")
+      and "(int)(coin + 0.5f)" in code and "(int)(export + 0.5f)" in code,
+      "R20: values rounded via (int)(x+0.5f) incl. export")
 check("static DWORD WINAPI export_thread(LPVOID param)" in code,
-      "R19: export_thread defined (background thread)")
+      "R20: export_thread defined (background thread)")
 check("CreateThread(NULL, 0, export_thread, NULL, 0, NULL)" in code,
-      "R19: export thread created via kernel32 CreateThread")
-check("d3d9mod.log" in code, "R19: export writes to d3d9mod.log")
-check("Sleep(500)" in code, "R19: export thread samples every 500ms")
-check("format_export_line(food, wood, coin" in code,
-      "R19: export thread formats via format_export_line")
+      "R20: export thread created via kernel32 CreateThread")
+check("d3d9mod.log" in code, "R20: export writes to d3d9mod.log")
+check("Sleep(500)" in code, "R20: export thread samples every 500ms")
+check("(unsigned long)clock_now()" in code,
+      "R20: export thread t comes from the verified clock_now() ms source")
+check("format_export_line(t, food, wood, coin, export" in code,
+      "R20: export thread formats via format_export_line with all five fields")
 check("decrypt_slot_at((DWORD)(DWORD_PTR)res, 2)" in code
       and "decrypt_slot_at((DWORD)(DWORD_PTR)res, 1)" in code
-      and "decrypt_slot_at((DWORD)(DWORD_PTR)res, 0)" in code,
-      "R19: export decrypts slots food=2, wood=1, coin=0 via the VERIFIED chain")
+      and "decrypt_slot_at((DWORD)(DWORD_PTR)res, 0)" in code
+      and "float export = decrypt_slot_at((DWORD)(DWORD_PTR)res, 7);" in code,
+      "R20: export decrypts slots food=2, wood=1, coin=0, export=7 via the VERIFIED chain")
 check("if (base == NULL || res == NULL) continue;" in code,
-      "R19: export skips writes while g_base/g_res are NULL")
-check("fopen(logpath, \"w\")" in code, "R19: export truncates the log at thread start")
+      "R20: export skips writes while g_base/g_res are NULL")
+check("fopen(logpath, \"w\")" in code, "R20: export truncates the log at thread start")
 check("fopen(logpath, \"a\")" in code and "fwrite(buf" in code
       and "fflush(f)" in code and "fclose(f)" in code,
-      "R19: export appends + flush per write (contention-safe on Windows)")
+      "R20: export appends + flush per write (contention-safe on Windows)")
 
 # launch gating: only on first Direct3DCreate9 (NOT DllMain), only if Debug=0
 check("int export_start(void)" in code and "void export_shutdown(void)" in code,
-      "R19: export_start/export_shutdown defined")
+      "R20: export_start/export_shutdown defined")
 check("if (!g_settings.debug_enabled) export_start();" in code,
-      "R19: export thread launched ONLY when debug_enabled==0 (export mode)")
+      "R20: export thread launched ONLY when debug_enabled==0 (export mode)")
 i_d9 = code.find("dlog(\"Create9 v=%u -> wrapped=%p\"")
 i_start = code.find("if (!g_settings.debug_enabled) export_start();")
 check(i_d9 != -1 and i_start != -1 and i_d9 < i_start,
-      "R19: export_start called AFTER the Create9 wrapped log (lazy, not DllMain)")
+      "R20: export_start called AFTER the Create9 wrapped log (lazy, not DllMain)")
 check("s_export_running" in code and "s_export_thread" in code,
-      "R19: s_export_running/s_export_thread file-scope statics present")
+      "R20: s_export_running/s_export_thread file-scope statics present")
 i_shutdown = code.find("export_shutdown();")
 i_detach = code.find("DLL_PROCESS_DETACH")
 check(i_shutdown != -1 and i_detach != -1 and i_detach < i_shutdown,
-      "R19: export_shutdown called in the DLL_PROCESS_DETACH branch")
-check("s_export_running = 0;" in code, "R19: shutdown sets s_export_running=0")
+      "R20: export_shutdown called in the DLL_PROCESS_DETACH branch")
+check("s_export_running = 0;" in code, "R20: shutdown sets s_export_running=0")
 check("WaitForSingleObject(h, 200)" in code and "CloseHandle(h)" in code,
-      "R19: shutdown drains the thread (200ms) then closes the handle")
+      "R20: shutdown drains the thread (200ms) then closes the handle")
 check("if (g_settings.debug_enabled) return 0;" in code and
       "s_export_running = 1;" in code and
       code.find("if (g_settings.debug_enabled) return 0;") < code.find("s_export_running = 1;"),
-      "R19: export_start refuses to run when debug_enabled==1 (early return before starting)")
+      "R20: export_start refuses to run when debug_enabled==1 (early return before starting)")
 
 # logging diet — a small unconditional set vs the debug-gated bulk
 check(code.count('dlog("ovl stop: %u consecutive frame aborts at stage=') == 1,
-      "R19: ovl stop (draw-path abort) remains UNCONDITIONAL exactly once")
+      "R20: ovl stop (draw-path abort) remains UNCONDITIONAL exactly once")
 check(code.count("ovl stop: reentrant-present for %u consecutive frames") == 1,
-      "R19: reentrant ovl stop remains (unconditional) exactly once")
+      "R20: reentrant ovl stop remains (unconditional) exactly once")
 check('dlog("R14 DLL loaded base=%p real=%p version=%s reason=%s"' in code,
-      "R19: DLL-loaded line remains UNCONDITIONAL (kept)")
+      "R20: DLL-loaded line remains UNCONDITIONAL (kept)")
 
 # present-path tracer now debug-gated (default log = export-only)
 i_tp = code.find("static void tracer_tick(void)")
 i_td = code.find('dlog("present-path dev=%u sw=%u scene=%u frames=%u"', i_tp)
 check(i_tp != -1 and i_td != -1 and "g_settings.debug_enabled" in code[i_tp:i_td],
-      "R19: present-path tracer dlog sits behind the debug_enabled gate")
+      "R20: present-path tracer dlog sits behind the debug_enabled gate")
 # ovl heartbeat debug-gated (default log is export-only in Debug=0)
 i_hb2 = code.find("ovl heartbeat n=%u frame=%d")
 i_hbg = code.rfind("g_settings.debug_enabled", 0, i_hb2)
 check(i_hb2 != -1 and i_hbg != -1 and i_hbg < i_hb2,
-      "R19: ovl heartbeat sits behind the debug_enabled gate")
+      "R20: ovl heartbeat sits behind the debug_enabled gate")
 # exactly two `dlog("ovl stop:` sites (the two unconditional ones)
 ovl_stop_sites = [m.start() for m in re.finditer(r'dlog\("ovl stop:', code)]
 check(len(ovl_stop_sites) == 2,
-      "R19: exactly 2 `dlog(\"ovl stop:` sites remain (draw abort + reentrant)")
+      "R20: exactly 2 `dlog(\"ovl stop:` sites remain (draw abort + reentrant)")
 # DLL_PROCESS_DETACH sets s_export_running=0 (via export_shutdown)
 check("s_export_running = 0;" in code and "DLL_PROCESS_DETACH" in code,
-      "R19: DLL_PROCESS_DETACH path sets s_export_running=0 (shutdown)")
+      "R20: DLL_PROCESS_DETACH path sets s_export_running=0 (shutdown)")
+
+# R20 widget contract: exact t=... comma format (the tail display depends on it)
+check("t=(\\d+),food=(\\d+),wood=(\\d+),coin=(\\d+),export=(\\d+)" in widget_code,
+      "R20: widget PATTERN matches `t=...,food=...,wood=...,coin=...,export=...`")
 
 print("SOURCE-CONTRACT:", "PASS" if failures == 0 else f"{failures} FAILURES")
 sys.exit(0 if failures == 0 else 1)

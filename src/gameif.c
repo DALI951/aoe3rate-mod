@@ -388,15 +388,20 @@ static int rnd_i(float x) {
     return (x >= 0.0f) ? (int)(x + 0.5f) : (int)(x - 0.5f);
 }
 
-/* ---- R19: export line formatter ----
- * Writes the exact format "food:%d ,wood:%d ,coin:%d" to buf.
- * Values rounded with (int)(x+0.5f). Returns chars written,
- * 0 on NULL/0-size. Never writes past len. */
-int format_export_line(float food, float wood, float coin, char *buf, size_t len) {
+/* ---- R20 export line formatter ----
+ * Writes the exact recurring format
+ *   "t=%lu,food=%d,wood=%d,coin=%d,export=%d"
+ * t_ms is the verified realtime millisecond clock (clock_now(): QPC->ms,
+ * GetTickCount fallback); values rounded with (int)(x+0.5f). Returns chars
+ * written, 0 on NULL/0-size. Never writes past len. */
+int format_export_line(unsigned long t_ms, float food, float wood, float coin,
+                       float export, char *buf, size_t len) {
     if (buf == NULL || len == 0) return 0;
     buf[0] = '\0';
-    int n = _snprintf(buf, len, "food:%d ,wood:%d ,coin:%d",
-                      (int)(food + 0.5f), (int)(wood + 0.5f), (int)(coin + 0.5f));
+    int n = _snprintf(buf, len, "t=%lu,food=%d,wood=%d,coin=%d,export=%d",
+                      t_ms,
+                      (int)(food + 0.5f), (int)(wood + 0.5f),
+                      (int)(coin + 0.5f), (int)(export + 0.5f));
     if (n < 0 || (size_t)n >= len) {
         buf[len - 1] = '\0';
         if (n < 0) n = 0;
@@ -466,10 +471,12 @@ void observer_sample(void) {
     }
 }
 
-/* ---- R19: export thread ----
+/* ---- R20: export thread ----
  * Background thread that tails the verified resource chain and writes the
  * live exported values to d3d9mod.log in the exact recurring format
- * `food:X ,wood:X ,coin:X` (one line ~every 500ms). Launched lazily from the
+ * `t=%lu,food=%d,wood=%d,coin=%d,export=%d` (one line ~every 500ms).
+ * t comes from clock_now() — the verified realtime QPC->ms clock (GetTickCount
+ * fallback) already used across the rate engine. Launched lazily from the
  * FIRST Direct3DCreate9 call (never DllMain — avoids loader lock), only when
  * [Debug] Enabled=0 (export mode). Shutdown via s_export_running=0 from
  * DLL_PROCESS_DETACH + WaitForSingleObject. */
@@ -490,14 +497,16 @@ static DWORD WINAPI export_thread(LPVOID param) {
 
     while (s_export_running) {
         Sleep(500);
+        unsigned long t = (unsigned long)clock_now();
         void *base = g_base;
         void *res  = g_res;
         if (base == NULL || res == NULL) continue;
-        float food = decrypt_slot_at((DWORD)(DWORD_PTR)res, 2);
-        float wood = decrypt_slot_at((DWORD)(DWORD_PTR)res, 1);
-        float coin = decrypt_slot_at((DWORD)(DWORD_PTR)res, 0);
+        float food   = decrypt_slot_at((DWORD)(DWORD_PTR)res, 2);
+        float wood   = decrypt_slot_at((DWORD)(DWORD_PTR)res, 1);
+        float coin   = decrypt_slot_at((DWORD)(DWORD_PTR)res, 0);
+        float export = decrypt_slot_at((DWORD)(DWORD_PTR)res, 7);
         char buf[64];
-        int n = format_export_line(food, wood, coin, buf, sizeof(buf));
+        int n = format_export_line(t, food, wood, coin, export, buf, sizeof(buf));
         if (n <= 0) continue;
         FILE *f = fopen(logpath, "a");
         if (f == NULL) continue;

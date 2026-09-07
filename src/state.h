@@ -151,8 +151,9 @@ float rate_get_raw(int slot);
 float rate_display(int slot);
 const char *rate_unit_label(void);
 
-/* ---- R19: export line formatter ---- */
-int format_export_line(float food, float wood, float coin, char *buf, size_t len);
+/* ---- R20 export line formatter ---- */
+int format_export_line(unsigned long t_ms, float food, float wood, float coin,
+                       float export, char *buf, size_t len);
 int export_start(void);
 void export_shutdown(void);
 

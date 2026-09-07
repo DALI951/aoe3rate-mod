@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_widget_parse.py — R19 widget parse-line tests (PASS/FAIL + exit code).
+"""test_widget_parse.py — R20 widget parse-line tests (PASS/FAIL + exit code).
 
 Calls tools\\rates_widget.py parse_line / PATTERN against the sample export
 line plus malformed cases, so the tail-display contract is pinned.
@@ -25,53 +25,49 @@ def check(cond, msg):
         failures += 1
 
 
-SAMPLE = "food:120 ,wood:340 ,coin:500"
+SAMPLE = "t=182340,food=100,wood=0,coin=0,export=0"
 
 # normal sample
 r = rates_widget.parse_line(SAMPLE)
-check(r == (120, 340, 500), f"parse_line(sample) == (120,340,500), got {r}")
+check(r == (182340, 100, 0, 0, 0), f"parse_line(sample) == (182340,100,0,0,0), got {r}")
 
-# whitespace-flexible variants (existing regex has \s* before comma; the DLL
-# never emits a leading space before a value, only before the comma)
-for variant in [
-    "food:1,wood:2,coin:3",
-    "food:1 ,wood:2 ,coin:3",
-    "food:10 ,  wood:20, coin:30",
+# Dali's exact three example lines from the R20 spec
+for line, expect in [
+    ("t=182340,food=100,wood=0,coin=0,export=0", (182340, 100, 0, 0, 0)),
+    ("t=182840,food=120,wood=0,coin=0,export=0", (182840, 120, 0, 0, 0)),
+    ("t=183340,food=120,wood=0,coin=0,export=0", (183340, 120, 0, 0, 0)),
 ]:
-    r = rates_widget.parse_line(variant)
-    check(r is not None, f"whitespace variant parses: {variant!r}")
+    r = rates_widget.parse_line(line)
+    check(r == expect, f"Dali sample {line!r} -> {expect}, got {r}")
 
-# leading space before a VALUE is NOT part of the DLL format -> None (kept)
-check(rates_widget.parse_line("food: 10 ,wood:2 ,coin:3") is None,
-      "leading space before a value -> None (never emitted by the DLL)")
+# all five fields filled
+r = rates_widget.parse_line("t=5000,food=1024,wood=777,coin=65,export=33")
+check(r == (5000, 1024, 777, 65, 33), f"all five fields: got {r}")
 
 # embedded in a longer line (tail may carry other text)
-r = rates_widget.parse_line("junk food:7 ,wood:8 ,coin:9 tail")
-check(r == (7, 8, 9), f"embedded in extra text: got {r}")
+r = rates_widget.parse_line("junk t=7,food=8,wood=9,coin=10,export=11 tail")
+check(r == (7, 8, 9, 10, 11), f"embedded in extra text: got {r}")
 
 # malformed / absent
 check(rates_widget.parse_line("") is None, "empty line -> None")
 check(rates_widget.parse_line("hello") is None, "non-export line -> None")
-check(rates_widget.parse_line("food:abc ,wood:2 ,coin:3") is None,
+check(rates_widget.parse_line("t=abc,food=2,wood=3,coin=4,export=5") is None,
+      "non-integer t -> None")
+check(rates_widget.parse_line("t=1,food=abc,wood=3,coin=4,export=5") is None,
       "non-integer food -> None")
 check(rates_widget.parse_line("RES t=1 food=0 wood=0 coin=0") is None,
-      "old RES format (no export separators) -> None")
+      "old RES format (no comma separators) -> None")
+check(rates_widget.parse_line("food:100 ,wood:0 ,coin:0") is None,
+      "R19 format (no t prefix) -> None")
 check(rates_widget.parse_line(None) is None, "None -> None")
 
 # missing fields
-check(rates_widget.parse_line("food:1 ,wood:2") is None,
-      "missing coin -> None")
+check(rates_widget.parse_line("t=1,food=2,wood=3,coin=4") is None,
+      "missing export -> None")
 
 # regex module-level PATTERN exists and matches the sample
 check(rates_widget.PATTERN is not None and rates_widget.PATTERN.search(SAMPLE),
       "module-level PATTERN matches the sample line")
-
-# float-locale note: a localised comma-decimal ("food:1,5") cannot be a valid
-# export line — \d+ matches integer tokens only, so the line fails to parse
-# (the comma is not followed by wood:). This is the documented locale-safe
-# behaviour: the DLL exports INTEGERS, so no locale decimal comma can appear.
-check(rates_widget.parse_line("food:1,5 ,wood:2 ,coin:3") is None,
-      "comma-decimal 1,5 -> None (integers only, locale-safe)")
 
 print("WIDGET-PARSE:", "PASS" if failures == 0 else f"{failures} FAILURES")
 sys.exit(0 if failures == 0 else 1)
