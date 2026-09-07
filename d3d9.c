@@ -66,6 +66,9 @@ void  *g_font_dev = NULL;       /* R16 B1: device the ID3DXFont is bound to */
 /* settings state */
 ModSettings g_settings;
 int g_panel_visible = 1;
+int g_match_active = 0;   /* R15: set when a match has started (gameif.c), cleared
+                             when the chain breaks — suppresses the values/res gate
+                             bursts that are legal during menus (ui.c ovl_abort_stop) */
 int g_ini_missing = 0;   /* R10: ResourceRateMod.ini fopen failed (status-line suffix) */
 DWORD g_bb_w = 0;        /* R11: latest BackBufferWidth from D3DPRESENT_PARAMETERS */
 DWORD g_bb_h = 0;        /* R11: latest BackBufferHeight (TopRight panel anchor) */
@@ -101,14 +104,47 @@ typedef int  (STDMETHODCALLTYPE *DEV_RESET)(void *, const void *);
  * tracks the patched vtable so a post-Reset vtable swap still gets re-asserted. */
 static PRESENT_FN s_orig_present = NULL;
 static DEV_RESET s_orig_reset   = NULL;
-static volatile LONG g_in_present = 0;   /* R16 B7: re-entrancy tripwire */
+static volatile LONG g_in_present = 0;   /* R16 B7: re-entrancy tripwire (shared by both Present kinds) */
 static unsigned int s_re_present_n = 0;  /* R13: consecutive reentrant-present frames (stop detector) */
+
+/* ========================= ROUND 15: swap-chain Present hook =========================
+ * Root cause (8-min live log, R14 build): the game renders the MATCH through
+ * IDirect3DSwapChain9::Present while our hook sat on IDirect3DDevice9::Present
+ * (slot 17), which only the menu/loading uses. Zero RES t=2+, zero heartbeats,
+ * zero gate/RT/pre-RT `ovl stop` AND a visibly-running game all point to the
+ * device-hook body never being called in-match.
+ *
+ * Slot truth (verified from the REAL mingw-w64 d3d9.h of this toolchain, NOT
+ * from memory):
+ *   - IDirect3DDevice9 (lines 1773-1781): 13 CreateAdditionalSwapChain,
+ *     14 GetSwapChain, 15 GetNumberOfSwapChains, 16 Reset, 17 Present,
+ *     18 GetBackBuffer  -> GetSwapChain = 14 (matches the mandate's check).
+ *   - IDirect3DSwapChain9 (lines 307-323): 0 QueryInterface, 1 AddRef,
+ *     2 Release, 3 Present(const RECT*, const RECT*, HWND, const RGNDATA*,
+ *     DWORD flags)  <- NOTE the trailing DWORD flags Device::Present lacks,
+ *     4 GetFrontBufferData, 5 GetBackBuffer, 6 GetRasterStatus, 7 GetDisplayMode,
+ *     8 GetDevice, 9 GetPresentParameters  -> swapchain Present = 3.
+ */
+#define D9_GETSWAPCHAIN 14
+#define D9_SW_PRESENT    3        /* SwapChain::Present carries `DWORD flags` (5 args + this) */
+
+typedef int  (STDMETHODCALLTYPE *DEV_GETSC)(void *self, UINT i, void **pp);
+typedef int  (STDMETHODCALLTYPE *SW_PRESENT_FN)(void *sw, const RECT *a,
+        const RECT *b, HWND hwnd, const void *dirty, DWORD flags);
+static DEV_GETSC s_orig_get_swapchain = NULL;  /* device slot 14, saved ONCE (R6 semantics) */
+static SW_PRESENT_FN s_orig_sw_present = NULL; /* swapchain slot 3, saved ONCE */
+static void *g_sw = NULL;                      /* last captured swapchain (re-patch + diagnostics) */
+static int g_ovl_last_draw_frame = -1;         /* R15: frame marker for the same-frame double-call guard */
 
 /* (patch_device_present forward-declared above) */
 
 static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp);
 static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT *b,
         HWND hwnd, const void *dirty);
+static int STDMETHODCALLTYPE sw_present_hook(void *sw, const RECT *a, const RECT *b,
+        HWND hwnd, const void *dirty, DWORD flags);
+static int STDMETHODCALLTYPE w_get_swapchain(void *self, UINT i, void **pp);
+static void patch_swapchain(void *sw);
 
 static int  STDMETHODCALLTYPE w_query_interface(void *self, const void *iid, void **p);
 static unsigned long STDMETHODCALLTYPE w_add_ref(void *self);
@@ -245,60 +281,53 @@ static D3D9W *wrap_d3d9(void *real) {
 
 /* ========================= device hook ========================= */
 
-static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
-    g_device = self;
-    g_frames_since_reset = 0;
-    if (pp != NULL) {   /* R11: refresh the backbuffer dims after a Reset */
-        g_bb_w = ((const DWORD *)pp)[0];
-        g_bb_h = ((const DWORD *)pp)[1];
-    }
-    set_step("reset-hook");
-    g_fault_dev = self;
-    g_fault_vt  = (self != NULL) ? *(void ***)self : NULL;
-    g_fault_slot = 16;
-    ui_on_reset(self);   /* logs "reset dev=%p -> font invalidated" */
-    int hr = (s_orig_reset != NULL) ? s_orig_reset(self, pp) : (int)0x8876086c;
-    patch_device_present(self);   /* re-assert slots 16/17 on the ACTUAL device */
-    /* NO font creation here (round-7 fix): the device is still in NOTRESET
-     * limbo during Reset — D3DXCreateFontA here FAILS or returns a broken
-     * object (live fault: eip=000000D8 at ovl-panel = call through a dangling
-     * font). The font is re-created LAZILY on the next present frame, only
-     * after TestCooperativeLevel returns OK (device truly up). */
-    set_step("reset-done");
-    return hr;
-}
-
-static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT *b,
-        HWND hwnd, const void *dirty) {
+/* R15: OVERLAY BODY SHARED BY BOTH present entry points:
+ * IDirect3DDevice9::Present (slot 17 — menu/loading) and
+ * IDirect3DSwapChain9::Present (slot 3 — the in-match fullscreen render TAD
+ * actually presents its frames through). One code path, identical semantics:
+ * enabled-check (zero-touch forward when disabled), same-frame double-call
+ * guard, the shared re-entrancy tripwire (B7), fault filter re-arm, chain walk,
+ * observer, hotkeys, profile poll, ui_draw (gates + RT + panel + heartbeat),
+ * then the caller's original Present. `is_sw` marks the entry kind: a device
+ * present's `self` IS the device (becomes g_device); a swapchain present's
+ * self is the swapchain, so g_device stays whatever device the last present
+ * path set (set at CreateDevice/Reset/device-present). Returns 1 when the
+ * overlay body ran; callers forward to their own original Present either way. */
+static int overlay_present_common(void *self, int is_sw) {
     if (!g_settings.enabled) {
         /* ZERO-TOUCH path ([General] Enabled=0): no chain walk, no observer,
-         * no breadcrumbs, no font/RT calls — just forward the Present. This is
-         * the A/B control that splits "hook vs overlay" as the crash culprit. */
-        PRESENT_FN fl = s_orig_present;
-        return (fl != NULL) ? fl(self, a, b, hwnd, dirty) : (int)0x8876086c;
+         * no breadcrumbs, no font/RT calls — the caller just forwards its
+         * original Present. A/B control that splits "hook vs overlay". */
+        return 0;
     }
-    g_device = self;
-    if (g_frames_since_reset < 0x7FFFFFFF) g_frames_since_reset++;
+    if (!is_sw) g_device = self;
     ensure_fault_filter();   /* the game may have replaced our unhandled filter */
 
-    /* R16 B7: single-frame re-entrancy tripwire. If anything below (chain walk,
-     * observer, hotkey, overlay draw, profile poll) triggers a NESTED Present
-     * on this thread — e.g. a log-flush or d3dx9 device help — we must not run
-     * the overlay body again. Skip straight to the real Present. */
+    /* R15 double-call guard: the game may call Device::Present AND
+     * SwapChain::Present for the SAME frame (non-nested). The marker holds the
+     * frame count at which ui_draw last ran; a second entry within the SAME
+     * frame still matches (the counter only advances AFTER the draw, below), so
+     * it forwards to its original WITHOUT running the overlay body again. Normal
+     * consecutive single-call frames never collide. */
+    if (g_ovl_last_draw_frame == g_frames_since_reset) return 0;
+
+    /* R16 B7: single-frame re-entrancy tripwire — ONE shared token across both
+     * present kinds. If anything below (chain walk, observer, hotkey, overlay
+     * draw, profile poll) triggers a NESTED Present of either kind on this
+     * thread, the overlay body is not run again — skip straight to the caller's
+     * original. */
     if (InterlockedCompareExchange(&g_in_present, 1, 0) != 0) {
         set_step("present-reentrant");
         /* R13: reentrant-present stop detector — counts CONSECUTIVE frames
          * where the tripwire was ALREADY set (a nested Present on this thread).
          * Logs once at 60 so "hook called but overlay skipped every frame" is
-         * distinguishable from a ui_draw early-return (which logs its own
-         * ovl stop with a stage). The counter resets on the first normal
-         * (non-reentrant) present below. */
+         * distinguishable from a ui_draw early-return. Resets on the first
+         * normal (non-reentrant) present below. */
         s_re_present_n++;
         if (s_re_present_n == 60)
             dlog("ovl stop: reentrant-present for %u consecutive frames",
                  s_re_present_n);
-        PRESENT_FN re = s_orig_present;
-        return (re != NULL) ? re(self, a, b, hwnd, dirty) : (int)0x8876086c;
+        return 0;
     }
     s_re_present_n = 0;   /* R13: a normal present resets the reentrant counter */
 
@@ -317,11 +346,13 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
     set_step("draw-overlay");
     ui_draw();
 
+    /* R15: draw completed on THIS frame number (double-call guard marker, and
+     * the frame counter advances once per completed overlay body so the guard
+     * comparison above is stable within a frame). */
+    g_ovl_last_draw_frame = g_frames_since_reset;
+    if (g_frames_since_reset < 0x7FFFFFFF) g_frames_since_reset++;
+
     set_step("present-before");
-    int hr = (s_orig_present != NULL)
-        ? s_orig_present(self, a, b, hwnd, dirty)
-        : (int)0x8876086c;
-    set_step("present-after");
     InterlockedExchange(&g_in_present, 0);
     /* ROUND 10: GDI visible fallback — OUTSIDE the tripwire set/clear interval,
      * after the Enabled=0 zero-touch branch, and only draws when the overlay is
@@ -329,12 +360,91 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
      * state touched, no breadcrumb, no per-frame log: the red line IS the
      * visibility. */
     ui_gdi_fallback_draw();
+    return 1;
+}
+
+/* R15: swapchain Present hook (slot 3). Signature MUST carry the trailing
+ * `DWORD flags` of IDirect3DSwapChain9::Present (unlike Device::Present) —
+ * dropping it would corrupt the stdcall frame. */
+static int STDMETHODCALLTYPE sw_present_hook(void *sw, const RECT *a, const RECT *b,
+        HWND hwnd, const void *dirty, DWORD flags) {
+    overlay_present_common(sw, 1);
+    SW_PRESENT_FN fl = s_orig_sw_present;
+    return (fl != NULL) ? fl(sw, a, b, hwnd, dirty, flags) : (int)0x8876086c;
+}
+
+/* R15: capture one swapchain object: its vtable slot 3 (Present) is patched to
+ * our hook; the ORIGINAL is saved once (first swapchain, R6 single-original
+ * semantics — in practice all swapchains of a device share one vtable, so one
+ * save covers them). Logs ONE line per installed vtable:
+ * `patch_swapchain: sw=%p vt=%p present=%p`. */
+static void patch_swapchain(void *sw) {
+    if (sw == NULL) return;
+    void **vt = *(void ***)sw;
+    if (vt == NULL) return;
+    if (vt[D9_SW_PRESENT] == (void *)sw_present_hook) { g_sw = sw; return; }
+    SW_PRESENT_FN o = (SW_PRESENT_FN)vt[D9_SW_PRESENT];
+    if (o == NULL) return;
+    if (s_orig_sw_present == NULL) s_orig_sw_present = o;   /* save ONCE */
+    DWORD old = 0;
+    DWORD slot = (DWORD)(DWORD_PTR)&vt[D9_SW_PRESENT];
+    VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
+    vt[D9_SW_PRESENT] = (void *)sw_present_hook;
+    VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
+    g_sw = sw;
+    dlog("patch_swapchain: sw=%p vt=%p present=%p",
+         sw, (void *)vt, (void *)sw_present_hook);
+}
+
+/* R15: device GetSwapChain wrapper (slot 14) — every swapchain the game
+ * obtains is captured and patched. Forward only; the body does no device-side
+ * work of its own. */
+static int STDMETHODCALLTYPE w_get_swapchain(void *self, UINT i, void **pp) {
+    DEV_GETSC o = s_orig_get_swapchain;   /* saved once by patch_device_present */
+    if (o == NULL) return (int)0x8876086c;
+    int hr = o(self, i, pp);
+    if (hr >= 0 && pp != NULL && *pp != NULL) patch_swapchain(*pp);
     return hr;
 }
 
-/* Re-assert our Present/Reset hooks on THE ACTUAL device (never a stale stored
- * pointer). Originals are saved ONCE from the first patched vtable (R6/R13
- * semantics — the shape proven live on TAD's single device object). */
+static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
+    g_device = self;
+    g_frames_since_reset = 0;
+    if (pp != NULL) {   /* R11: refresh the backbuffer dims after a Reset */
+        g_bb_w = ((const DWORD *)pp)[0];
+        g_bb_h = ((const DWORD *)pp)[1];
+    }
+    set_step("reset-hook");
+    g_fault_dev = self;
+    g_fault_vt  = (self != NULL) ? *(void ***)self : NULL;
+    g_fault_slot = 16;
+    ui_on_reset(self);   /* logs "reset dev=%p -> font invalidated" */
+    int hr = (s_orig_reset != NULL) ? s_orig_reset(self, pp) : (int)0x8876086c;
+    patch_device_present(self);   /* re-assert slots 14/16/17 on the ACTUAL device after Reset */
+    /* NO font creation here (round-7 fix): the device is still in NOTRESET
+     * limbo during Reset — D3DXCreateFontA here FAILS or returns a broken
+     * object (live fault: eip=000000D8 at ovl-panel = call through a dangling
+     * font). The font is re-created LAZILY on the next present frame, only
+     * after TestCooperativeLevel returns OK (device truly up). */
+    set_step("reset-done");
+    return hr;
+}
+
+static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT *b,
+        HWND hwnd, const void *dirty) {
+    /* R15: the ONCE-PER-FRAME overlay body now lives in
+     * overlay_present_common() (shared with the swapchain hook — one code
+     * path, no duplication). This hook keeps the MENU path intact: run the
+     * shared body, then always forward to the device's real Present. The
+     * Enabled=0 zero-touch forward is the common body's first branch. */
+    overlay_present_common(self, 0);
+    PRESENT_FN fl = s_orig_present;
+    return (fl != NULL) ? fl(self, a, b, hwnd, dirty) : (int)0x8876086c;
+}
+
+/* Re-assert our Present/Reset/GetSwapChain hooks on THE ACTUAL device (never a
+ * stale stored pointer). Originals are saved ONCE from the first patched vtable
+ * (R6/R13 semantics — the shape proven live on TAD's single device object). */
 static int s_second_vt_logged = 0;   /* R16 A5: log the second vtable once */
 
 static int patch_device_present(void *dev) {
@@ -369,6 +479,16 @@ static int patch_device_present(void *dev) {
             VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
             s_orig_reset = (DEV_RESET)vt[16];
             vt[16] = (void *)reset_hook;
+            VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
+        }
+        if (s_orig_get_swapchain == NULL) {
+            /* R15: wrap GetSwapChain (slot 14) so every swapchain object the
+             * game obtains is captured and its Present (slot 3) is patched too.
+             * Same once-only save + same VirtualProtect pattern as 16/17. */
+            DWORD slot = (DWORD)(DWORD_PTR)&vt[14];
+            VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
+            s_orig_get_swapchain = (DEV_GETSC)vt[14];
+            vt[14] = (void *)w_get_swapchain;
             VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
         }
         g_devvt = vt;
@@ -637,6 +757,10 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         DisableThreadLibraryCalls(hInst);
         s_orig_present = NULL;
         s_orig_reset = NULL;
+        s_orig_get_swapchain = NULL;
+        s_orig_sw_present = NULL;
+        g_sw = NULL;
+        g_ovl_last_draw_frame = -1;
         g_devvt = NULL;
         g_base = (void *)GetModuleHandleA("age3y.exe");
 

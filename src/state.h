@@ -183,6 +183,7 @@ typedef struct {
 } ModSettings;
 extern ModSettings g_settings;
 extern int g_panel_visible;
+extern int g_match_active;   /* R15: match-started latch (gameif.c sets it on match_start; ui.c uses it to suppress pre-match values/res gate bursts) */
 
 /* version gate */
 extern int  g_version_ok;

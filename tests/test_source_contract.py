@@ -85,19 +85,22 @@ check("rnd_i(v[2]), rnd_i(v[1]), rnd_i(v[0]), rnd_i(v[7])" in src,
 check("decrypt_slot_at(rr, s)" in src,
       "observer reads the 8 slots via decrypt_slot_at (real decrypt)")
 
-# present_hook must run observer -> hotkey -> overlay -> original Present
+# present_hook must run the SHARED overlay body (observer -> hotkey -> overlay)
+# then forward to the original device Present (R15: the body lives in the
+# common overlay_present_common, so the hook is a thin forward — one code path
+# for both Device::Present and SwapChain::Present).
 i_obs = src.find("observer_sample();")
 i_ui = src.find("ui_draw();")
-i_orig = src.find("s_orig_present(self, a, b, hwnd, dirty)")
-check(i_obs != -1, "present_hook calls observer_sample()")
-check(i_ui != -1, "present_hook calls ui_draw()")
+i_orig = src.find("fl(self, a, b, hwnd, dirty)")
+check(i_obs != -1, "present_hook path calls observer_sample()")
+check(i_ui != -1, "present_hook path calls ui_draw()")
 check(i_orig != -1, "present_hook still forwards the original Present")
 check(i_obs != -1 and i_ui != -1 and i_orig != -1 and
       i_obs < i_ui < i_orig,
       "present_hook order: observer -> hotkey -> overlay -> original Present")
 check(src.find("set_step(\"observer-sample\")") < src.find("set_step(\"draw-overlay\")") < i_orig,
       "observer (read) runs strictly before the overlay flip")
-check("ui_check_hotkey()" in src, "present_hook checks the F9/settings hotkeys")
+check("ui_check_hotkey()" in src, "present_hook path checks the F9/settings hotkeys")
 
 check("g_player_idx = 1;" in src, "primary path: g_player_idx = 1 (human-p1)")
 check("g_player_idx = pick_i;" in src, "fallback path: g_player_idx = pick_i")
@@ -216,7 +219,7 @@ check("fault_filter" in src and "ExitProcess" in src,
 
 check("RESET_COOLDOWN_FRAMES" in src, "RESET_COOLDOWN_FRAMES defined (state.h)")
 check("g_frames_since_reset" in src and "g_frames_since_reset++" in src,
-      "present_hook increments g_frames_since_reset every frame")
+      "present path increments g_frames_since_reset every frame (common body ends)")
 check("g_frames_since_reset = 0;" in src and src.count("g_frames_since_reset = 0;") >= 3,
       "counter zeroed on CreateDevice / CreateDeviceEx / Reset")
 check("g_font == NULL) return;" in src, "ui_draw guards font-first before RT work")
@@ -301,12 +304,14 @@ check("ovl-begin" in src and "ovl-end" in src and "ovl-restore" in src,
       "draw breadcrumbs chain kept (begin/end/restore; no srt)")
 check("ovl-tcl" in src and "ovl-grt" in src,
       "TCL + GetRenderTarget breadcrumbs retained")
-# zero-touch Enabled path: present_hook forwards before ANY other work
-i_p = code.find("int STDMETHODCALLTYPE present_hook")
-i_e = code.find("!g_settings.enabled", i_p)
-i_l = code.find("locate_resources()", i_p)
-check(i_p != -1 and i_e != -1 and i_l != -1 and i_e < i_l,
-      "Enabled=0 zero-touch: present_hook forwards before observer/overlay work")
+# zero-touch Enabled path: the SHARED overlay body (R15) forwards before work
+# (both present_hook and sw_present_hook defer to overlay_present_common, whose
+# FIRST branch is the Enabled=0 zero-touch forward, before observer/overlay)
+i_oc = code.find("static int overlay_present_common(void *self, int is_sw)")
+i_e = code.find("!g_settings.enabled", i_oc)
+i_l = code.find("locate_resources()", i_e)
+check(i_oc != -1 and i_e != -1 and i_l != -1 and i_e < i_l,
+      "Enabled=0 zero-touch: common overlay body forwards before observer/overlay work")
 check("ContextRecord->Eip" in src and "ContextRecord->Esp" in src and "ContextRecord->Ebp" in src,
       "fault dump reads eip/esp/ebp from the exception CONTEXT")
 check('"ovl first draw ok frame=%d"' in src, "first-draw marker logged once")
@@ -466,12 +471,17 @@ check('"d3dx9_25.dll not loadable"' in src,
       "R10: d3dx9-disable reason string present")
 
 # 3) GDI fallback: defined in ui.c, dependency-free (dynamic gdi32), drawn AFTER
-#    the tripwire clear, body contains NO vtable-slot dispatch.
+#    the tripwire clear, body contains NO vtable-slot dispatch. The tripwire +
+#    fallback live in the SHARED overlay body (overlay_present_common, R15) —
+#    one code path for both Device::Present and SwapChain::Present.
 check("int ui_gdi_fallback_draw(void)" in code, "R10: ui_gdi_fallback_draw defined in ui.c")
-i_gdi_call = pbody.find("ui_gdi_fallback_draw();")
-i_clrp = pbody.find("InterlockedExchange(&g_in_present, 0)")
+i_oc = code.find("static int overlay_present_common(void *self, int is_sw)")
+i_oc_end = code.find("static int STDMETHODCALLTYPE sw_present_hook", i_oc)
+pcbody = code[i_oc:i_oc_end] if (i_oc != -1 and i_oc_end != -1 and i_oc < i_oc_end) else ""
+i_gdi_call = pcbody.find("ui_gdi_fallback_draw();")
+i_clrp = pcbody.find("InterlockedExchange(&g_in_present, 0)")
 check(i_gdi_call != -1 and i_clrp != -1 and i_clrp < i_gdi_call,
-      "R10: ui_gdi_fallback_draw() called AFTER the tripwire clear in present_hook")
+      "R10: ui_gdi_fallback_draw() called AFTER the tripwire clear in the common body")
 i_gd = code.find("int ui_gdi_fallback_draw(void)")
 gbody = code[i_gd:] if i_gd != -1 else ""
 check('LoadLibraryA("gdi32.dll")' in src and "GetProcAddress(" in gbody,
@@ -480,11 +490,14 @@ with open(os.path.join(ROOT, "build", "build.bat"), "r", encoding="utf-8", error
     bb = bat.read()
 check("-lgdi32" not in bb, "R10: build.bat does NOT link gdi32 statically (import table stays clean)")
 
-# 4) no NEW vtable-slot constants: device D9_* and font FONT_* pinned EXACTLY.
+# 4) vtable-slot constants: device D9_* and font FONT_* pinned EXACTLY (R15:
+# NEW canonical slots — 14 GetSwapChain + 3 SwapChain::Present — are the
+# round-15 mandate: without them in-match presents can never be hooked, since
+# the game renders through the swapchain, not the device).
 d9mac = set(int(v) for v in re.findall(r"#define D9_\w+\s+(\d+)", src))
 ftmac = set(int(v) for v in re.findall(r"#define FONT_\w+\s+(\d+)", src))
-check(d9mac == {3, 16, 38, 41, 42, 57, 58, 83, 89, 90},
-      "R10: device vtable slots pinned EXACTLY {3,16,38,41,42,57,58,83,89,90} (no additions)")
+check(d9mac == {3, 14, 16, 38, 41, 42, 57, 58, 83, 89, 90},
+      "R15: slot constants pinned EXACTLY {3(SW Present),14(GetSwapChain),16,38,41,42,57,58,83,89,90}")
 check(ftmac == {14, 16, 17},
       "R10: font vtable slots pinned EXACTLY {14,16,17} (no additions)")
 check("vt[" not in gbody, "R10: GDI fallback body contains NO device-vtable dispatch (vt[)")
@@ -660,6 +673,49 @@ check(_t_i != -1 and _t_store > _t_i and "s_last_time = now" not in src[_t_i:_t_
 for mod in ("logger.c", "tracker.c", "rate.c", "gameif.c", "settings.c", "ui.c"):
     inc = f'#include "src/{mod}"'
     check(inc in src, f"d3d9.c includes src/{mod} (monolithic build entry)")
+
+# ================= ROUND 15: swap-chain Present root-cause =================
+# Slot truth (verified from the REAL mingw-w64 d3d9.h of this build toolchain):
+#   IDirect3DDevice9 (header lines 1773-1781): 13 CreateAdditionalSwapChain,
+#   14 GetSwapChain, 15 GetNumberOfSwapChains, 16 Reset, 17 Present,
+#   18 GetBackBuffer.
+#   IDirect3DSwapChain9 (header lines 307-323): 0 QueryInterface, 1 AddRef,
+#   2 Release, 3 Present(const RECT*, const RECT*, HWND, const RGNDATA*,
+#   DWORD flags) — NOTE the trailing DWORD flags Device::Present does not have,
+#   4 GetFrontBufferData, 5 GetBackBuffer, 6 GetRasterStatus, 7 GetDisplayMode,
+#   8 GetDevice, 9 GetPresentParameters.
+check("D9_GETSWAPCHAIN 14" in src, "R15: GetSwapChain device slot 14 constant")
+check("D9_SW_PRESENT    3" in src or "D9_SW_PRESENT 3" in src,
+      "R15: SwapChain::Present slot 3 constant")
+check("static int STDMETHODCALLTYPE w_get_swapchain" in code,
+      "R15: device GetSwapChain wrapped (captures every swapchain)")
+check('dlog("patch_swapchain: sw=%p vt=%p present=%p"' in src,
+      "R15: one install log per swapchain (patch_swapchain: sw=.. vt=.. present=..)")
+check(code.count('dlog("patch_swapchain: sw=%p vt=%p present=%p"') == 1,
+      "R15: patch_swapchain install log defined exactly once")
+check("vt[D9_SW_PRESENT] = (void *)sw_present_hook;" in code,
+      "R15: swapchain vtable slot 3 patched to sw_present_hook")
+check("if (s_orig_sw_present == NULL) s_orig_sw_present = o;" in code,
+      "R15: original swapchain Present saved ONCE (R6 single-original semantics)")
+check("s_orig_sw_present != NULL" in code or "s_orig_sw_present" in code,
+      "R15: fallback forward uses the saved original swapchain Present")
+check(code.count("overlay_present_common(") >= 2,
+      "R15: BOTH present hooks call the SHARED common body (no code duplication)")
+check("g_ovl_last_draw_frame" in code,
+      "R15: same-frame double-call marker present (draw once per frame even when both Present kinds run)")
+check("DWORD flags" in code and "fl(sw, a, b, hwnd, dirty, flags)" in code,
+      "R15: swapchain hook forwards the trailing DWORD flags (stdcall frame intact)")
+
+# R15 FINDING-analog: menu false-alarm suppression — values/res gate bursts are
+# legal pre-match and must not trip the stop detector until a match started.
+check("g_match_active" in code, "R15: g_match_active exists (match latch)")
+check("g_match_active = 1;" in code and "g_match_active = 0;" in code,
+      "R15: latch set on match_start, cleared when the chain breaks")
+check('!strcmp(stage, "values")' in code and '!strcmp(stage, "res")' in code,
+      "R15: values/res stages suppressed pre-match in ovl_abort_stop")
+i_mg = src.find("g_match_active")
+check(i_mg != -1 and src.find("match start n=%d", i_mg) != -1,
+      "R15: match-start separator (where the latch is set) present")
 
 print("SOURCE-CONTRACT:", "PASS" if failures == 0 else f"{failures} FAILURES")
 sys.exit(0 if failures == 0 else 1)

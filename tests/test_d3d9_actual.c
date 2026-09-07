@@ -486,6 +486,115 @@ static void test_nullsafe_actual(void) {
 }
 
 /* ==== ROUND 10 (P0): ARMED/DISABLED status + GDI visible fallback ==== */
+/* R15 SWAPCHAIN block: a REAL device through the production wrapper —
+ * GetSwapChain (device slot 14) must resolve to OUR w_get_swapchain, and the
+ * returned swapchain's Present (slot 3) must be patched to OUR sw_present_hook
+ * with the original saved once and the install line logged. Runs against the
+ * real system d3d9.dll (loaded for g_real) so the vtable layout is real. */
+static void test_swapchain_hook(void) {
+    if (g_real == NULL) {
+        char sys[MAX_PATH];
+        if (!GetSystemDirectoryA(sys, MAX_PATH)) return;
+        lstrcatA(sys, "\\d3d9.dll");
+        g_real = LoadLibraryA(sys);
+    }
+    if (g_real == NULL) { printf("FAIL: real d3d9.dll not loadable (sw)\n"); failures++; return; }
+    logger_init();
+    delete_chain_log();
+
+    HWND h = CreateWindowA("STATIC", "rrmod-sw", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                           0, 0, 320, 240, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    if (h == NULL) { printf("FAIL: CreateWindowA (sw)\n"); failures++; return; }
+
+    void *d3d = Direct3DCreate9(32);
+    if (d3d == NULL) { printf("FAIL: Direct3DCreate9 (sw)\n"); DestroyWindow(h); failures++; return; }
+
+    /* D3DPRESENT_PARAMETERS (windowed): zeroed 64 bytes; poke the real offsets
+     * (i386 COM struct, d3d9types.h): [3]=BackBufferCount, [6]=SwapEffect
+     * (DISCARD), [7]=hDeviceWindow, [8]=Windowed. */
+    DWORD pp[16];
+    memset(pp, 0, sizeof(pp));
+    pp[3] = 1;
+    pp[6] = 1;
+    pp[7] = (DWORD)(DWORD_PTR)h;
+    pp[8] = 1;
+
+    void *dev = NULL;
+    int hr = w_create_device(d3d, 0, 1 /*D3DDEVTYPE_HAL*/, h,
+                             0x20 /*D3DCREATE_SOFTWARE_VERTEXPROCESSING*/, pp, &dev);
+    if (hr < 0 || dev == NULL)
+        hr = w_create_device(d3d, 0, 2 /*D3DDEVTYPE_REF*/, h,
+                             0x20 /*D3DCREATE_SOFTWARE_VERTEXPROCESSING*/, pp, &dev);
+    if (hr < 0 || dev == NULL) {
+        printf("FAIL: CreateDevice (sw) hr=%#010x\n", (unsigned)hr);
+        DestroyWindow(h);
+        failures++;
+        return;
+    }
+
+    void **vt = *(void ***)dev;
+    if (vt == NULL || vt[14] != (void *)w_get_swapchain) {
+        printf("FAIL: device GetSwapChain (slot 14) is not our wrapper\n");
+        failures++;
+    } else {
+        printf("PASS: device slot 14 -> w_get_swapchain (capture in place)\n");
+    }
+
+    void *sw = NULL;
+    int h2 = ((DEV_GETSC)vt[14])(dev, 0, &sw);
+    if (h2 < 0 || sw == NULL) {
+        printf("FAIL: GetSwapChain(0) returned nothing (hr=%#010x)\n", (unsigned)h2);
+        failures++;
+    } else {
+        void **svt = *(void ***)sw;
+        int ok = (svt != NULL) && (svt[3] == (void *)sw_present_hook);
+        if (!ok) {
+            printf("FAIL: swapchain Present (slot 3) not patched to sw_present_hook\n");
+            failures++;
+        } else {
+            printf("PASS: swapchain slot 3 -> sw_present_hook (in-match Present hooked)\n");
+        }
+        if (s_orig_sw_present == NULL) {
+            printf("FAIL: original swapchain Present not saved\n");
+            failures++;
+        } else {
+            printf("PASS: original swapchain Present saved (s_orig_sw_present)\n");
+        }
+        if (g_sw != sw) {
+            printf("FAIL: g_sw not the captured swapchain\n");
+            failures++;
+        } else {
+            printf("PASS: g_sw == captured swapchain\n");
+        }
+        if (!log_contains("patch_swapchain: sw=")) {
+            printf("FAIL: patch_swapchain install line not logged\n");
+            failures++;
+        } else {
+            printf("PASS: `patch_swapchain: sw=.. vt=.. present=..` logged on install\n");
+        }
+        /* second GetSwapChain: same vtable already patched; orig unchanged */
+        void *sw2 = NULL;
+        ((DEV_GETSC)vt[14])(dev, 0, &sw2);
+        if (*(void ***)dev == NULL) { /* never */ }
+        if (sw2 == NULL) {
+            printf("FAIL: second GetSwapChain(0) returned nothing\n");
+            failures++;
+        } else {
+            if ((*(void ***)sw2)[3] != (void *)sw_present_hook) {
+                printf("FAIL: re-patched swapchain lost our hook\n");
+                failures++;
+            } else {
+                printf("PASS: repeated GetSwapChain stays patched (idempotent)\n");
+            }
+        }
+    }
+
+    /* release the created objects via the vtable (COM) */
+    void **vd = *(void ***)dev;
+    if (vd != NULL && vd[2] != NULL) ((void (STDMETHODCALLTYPE *)(void *))vd[2])(dev);
+    DestroyWindow(h);
+}
+
 static void test_overlay_status_p0(void) {
     /* pure helper: version-first precedence, then d3dx9 loadability */
     if (strstr(overlay_state_reason(0, 1, 0), "ver:") == NULL)
@@ -550,6 +659,7 @@ int main(void) {
 
     test_nullsafe_actual();
     test_observer_log();
+    test_swapchain_hook();
 
     /* unmapped-page guard */
     g_res = g_inc = (void*)0xDEADBEEF;

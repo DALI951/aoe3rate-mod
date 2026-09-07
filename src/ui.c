@@ -573,6 +573,14 @@ static void set_trace(void *dev, void **vt, int slot, const char *step) {
  * exact stage, so the killer gate/stage is never ambiguous again. The counter
  * resets on the first draw that completes (reaches the heartbeat bump below). */
 static void ovl_abort_stop(const char *stage) {
+    /* R15: menu false-alarm suppression — BEFORE a match starts there is no
+     * chain, so g_values_valid==0 and g_res==NULL are BY DESIGN and their
+     * per-frame bursts only spam `ovl stop` on menus. Until g_match_active
+     * (set by gameif.c on `--- match start ---`, cleared on chain-break) the
+     * values/res stages do NOT count; the other six gates
+     * (enabled/version/panel/device/ui_ready/cooldown) always do. */
+    if (!g_match_active && (!strcmp(stage, "values") || !strcmp(stage, "res")))
+        return;
     s_ovl_abort_n++;
     if (s_ovl_abort_n == 60) {
         dlog("ovl stop: %u consecutive frame aborts at stage=%s - overlay draw halted",

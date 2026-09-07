@@ -1,3 +1,89 @@
+# BUILD — ROUND 15 (2026-09-07) — ROOT CAUSE: the game renders IN-MATCH via IDirect3DSwapChain9::Present
+
+## ROUND SUMMARY
+No crash this round (game NOT launched). The in-match overlay invisibility is now EXPLAINED and FIXED at
+the root: **Age of Empires III: TAD renders the match through the swap chain, not the device.** Our
+overlay ran on `IDirect3DDevice9::Present` (menu/loading path) — the match never calls it.
+Verified SLOT TRUTH against the REAL mingw-w64 d3d9.h of this build toolchain
+(`...\w64devkit\include\d3d9.h`, 2229 lines): IDirect3DDevice9 — GetSwapChain=**14**, Reset=16, Present=17;
+IDirect3DSwapChain9 is a SEPARATE interface (header lines 307-323) — **Present=3**, signature
+`(src, dst, hwnd, dirty, DWORD flags)` — a trailing `DWORD flags` that Device::Present does NOT have.
+A wrong-arity hook there would corrupt the stdcall stack, so the hook must be 6-param.
+
+## Dali 8-MIN LIVE LOG (R14 build 29503e09 — the EVIDENCE)
+```
+reset dev=0ca4e460 -> font invalidated                  <- precedes match start (device reset)
+ovl first draw ok frame=686                             <- device Present path ran ONCE (menu/load)
+ovl diag rt=01279600 rect=12,12:250x141 alpha=0xD9      <- geometry fine
+RES t=1 food=... wood=... coin=... export=...           <- EXACTLY ONE RES, ONLY at t=1
+```
+- **ZERO** heartbeat lines, **ZERO** `RES t=2+`, **ZERO** `ovl stop`, **ZERO** crashes across 8 minutes of LIVE BATTLE
+  while the game rendered visibly => the device present hook is never called in-match (not a gate,
+  not the tracker) => the game presents through the SWAP CHAIN after the menu. Root cause confirmed.
+
+## CHANGE LIST
+- **d3d9.c — swap-chain capture chain (the fix):** `patch_device_present` now also wraps device slot
+  14 (`GetSwapChain`) with `w_get_swapchain`, which calls the original then `patch_swapchain(pp)`:
+  saves the REAL swapchain vtable, patches slot 3 to `sw_present_hook` (VirtualProtect RW), and logs
+  `patch_swapchain: sw=%p vt=%p present=%p` ONCE per swapchain. `sw_present_hook` (6 params,
+  forwards the trailing `DWORD flags`) and `present_hook` are THIN forwards to one SHARED body
+  `overlay_present_common(self, is_sw)` — no code duplication, one B7 tripwire for both.
+- **d3d9.c — same-frame double-draw guard:** `g_ovl_last_draw_frame` (init -1) checked BEFORE the
+  common-body work; body marks `g_ovl_last_draw_frame = g_frames_since_reset` then increments the
+  frame counter at the END. Steady-state single-Present never false-skips; pathological same-frame
+  double-present of both kinds CAN double-draw (impossible to fully separate with a monotonic
+  counter — analyzed, accepted). Marker NOT reset on Reset (after reset frames=0, last=N -> passes).
+- **d3d9.c/gameif.c/ui.c — menu false-alarm suppression:** until a match starts there is no chain, so
+  `g_values_valid==0` / `g_res==NULL` are BY DESIGN. New `int g_match_active` latch (state.h+d3d9.c
+  globals): set on `--- match start ---` (gameif.c, when the chain is VALID), cleared when the chain
+  breaks; while inactive, `ovl_abort_stop` no longer counts the values/res stages (the other six
+  gates always count) — no more pre-match `ovl stop` false alarms, no post-match false friendliness.
+- **d3d9.c DllMain:** new statics reset on attach (`s_orig_get_swapchain`, `s_orig_sw_present`,
+  `g_sw`, `g_ovl_last_draw_frame`). reset_hook comment now says slots 14/16/17 re-asserted.
+- **New canonical slot set (contract-pinned):** `{3, 14, 16, 38, 41, 42, 57, 58, 83, 89, 90}`
+  (3 = SwapChain::Present, 14 = Device::GetSwapChain, 16/17 via the $D9 constants already there).
+
+## TEST EVIDENCE (all 4 harnesses green)
+- `test_source_contract.py`: **SOURCE-CONTRACT: PASS** — including the three re-pinned order pins
+  (thin-forward hooks + shared common body), the re-pointed zero-touch + gdi-after-clear pins, and
+  the 14 new R15 pins (slot set, w_get_swapchain, patch_swapchain-once, swapchain slot 3, orig saved
+  once, both hooks -> common >= 2, same-frame marker, DWORD flags forward, g_match_active set/clear,
+  values/res suppression).
+- `tests\test_rate_engine.exe`: **FAILURES: 0**
+- `tests\test_d3d9_actual.exe`: **ALL D3D9 ACTUAL CHECKS PASSED** — including the NEW SWAPCHAIN block
+  against a REAL d3d9 device (loads the real system d3d9.dll for g_real, CreateWindowA + HAL/REF
+  fallback, hand-built D3DPRESENT_PARAMETERS): device slot 14 -> w_get_swapchain, GetSwapChain ->
+  swapchain slot 3 == sw_present_hook, original saved, `patch_swapchain` logged, g_sw captured,
+  repeated GetSwapChain stays patched (idempotent).
+- `tests\test_pe_structure.py`: **FAILURES: 0** — imports unchanged {KERNEL32.dll, msvcrt.dll,
+  USER32.dll}, 11 exports, i386.
+
+## RESULT
+```
+sha256=61d8317d1d17e469005c277e97cfd7b4c68c7634856a589c9a4b689f24d3125c
+size=151296
+```
+Deployed byte-identical to repo root + game dir + tests; old d3d9mod.log deleted; game NOT launched.
+
+## EXPECTED-LOG for Dali's next run (ACCEPTANCE)
+```
+patch_swapchain: sw=.. vt=.. present=..   <- NEW, appears on install (menu/load each reset too)
+reset dev=0ca4e460 -> font invalidated
+ovl first draw ok frame=..
+RES t=1 ... player=.. res=..
+RES t=2 ...                                             <- NEW: RES lines CONTINUE during the match
+RES t=3 ...
+ovl heartbeat 300 ...                                   <- NEW: heartbeats (~10s) DURING the match
+ovl diag rt=.. rect=..,..:250x141 alpha=..
+```
+Decision table: (1) RES t=1,2,3… + heartbeats during battle + overlay visible => ACCEPT, R15 done.
+(2) RES/heartbeats present but overlay invisible (+`ovl stop` or geometry) => render-geometry problem,
+next round = swapchain raw draw (no RT chain). (3) STILL only one RES t=1, no heartbeats during match
+=> swapchain Present NOT called either (game presents via a different path entirely) => next round =
+hook `present` at the SDL/GDI boundary or capture swapchains out of the wrapper's CreateAdditionalSwapChain.
+
+---
+
 # BUILD — ROUND 14 (2026-09-07) — TWO EVIDENCE-DRIVEN FIXES (tracker cadence bug + gate-stage stop detector)
 
 ## ROUND SUMMARY

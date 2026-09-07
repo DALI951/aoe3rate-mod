@@ -401,6 +401,8 @@ void observer_sample(void) {
                           (g_obs_player != 0 && g_obs_player != s_last_player) ||
                           (n != s_last_n);
         if (match_start) {
+            g_match_active = 1;   /* R15: from the first valid frame on, values/res
+                                     gate failures are REAL (menu suppression lifts) */
             dlog("--- match start n=%d player=%08X res=%08X ---",
                  n,
                  (unsigned)g_obs_player,
@@ -412,6 +414,9 @@ void observer_sample(void) {
         s_last_ctx = ctx;
         s_last_player = g_obs_player;
         s_last_n = n;
+    } else {
+        g_match_active = 0;   /* R15: chain gone (menu/loading) -> values/res gate
+                                 bursts are legal again and stop being counted */
     }
 
     s_tick++;
