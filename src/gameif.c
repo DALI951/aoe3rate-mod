@@ -471,57 +471,83 @@ void observer_sample(void) {
     }
 }
 
-/* ---- R23: thread-side resource resolver (NO observer dependency) ----
+/* ---- R24: thread-side resource resolver + STABLE human lock (NO observer dep) ----
  * The export thread MUST NOT depend on the globals the observer resolved at
  * match start (g_res/g_inc/g_ctx). Those are only refreshed from the present
  * hook, which is DEAD in-match, so they hold a stale/one-shot/reallocated
- * pointer whose decrypt reads come back 0 forever. This resolver re-walks
- * the full verified chain FRESH on every call (game=*(base+RVA_GAME_PTR),
+ * pointer whose decrypt reads come back 0 forever. We re-walk the full
+ * verified chain FRESH every sample (game=*(base+RVA_GAME_PTR),
  * ctx=*(game+OFF_GAME_CTX), n=*(ctx+OFF_CTX_PLAYERCNT), arr=*(ctx+
- * OFF_CTX_PLAYERS)) and never writes any shared global. Guarded like
+ * OFF_CTX_PLAYERS)) and never write any shared global. Guarded like
  * locate_resources_impl (safe_r32 chain, NULL-safe throughout).
  *
- * Player pick for MP+SP: iterate i in 0..n-1, take p=*(arr+i*4),
- * r=*(p+OFF_PLAYER_RES), ic=*(p+OFF_PLAYER_INCOME), skip any 0; total =
- * decrypt_slot_at(r,2)+decrypt_slot_at(r,1)+decrypt_slot_at(r,0)+
- * decrypt_slot_at(r,7) (decrypt_slot_at itself unchanged); pick the
- * candidate with the LARGEST total (> previous best). The candidate list
- * (every (i,total)) and n are exposed through g_export_cands/g_export_n so
- * the caller can log once on change. Returns 1 + *out_res/*out_idx on a sane
- * pick, 0 (no write) when no candidate is usable (all zero/garbage). */
+ * R24: stable "human" selection. R23 picked the LARGEST total each sample,
+ * which flipped between the real players every few seconds as the leader
+ * changed (user saw the opponent's numbers half the time; his spends looked
+ * invisible because the tracker jumped to the other player). We now keep
+ * PERSISTENT per-session selection state (file-scope statics) and lock in a
+ * single index. Selection, first match wins:
+ *   1) a locked index from a previous sample -> use it
+ *   2) else idx1 total nonzero -> provisional idx1 (SP + LAN-host verified)
+ *   3) else first nonzero-total candidate
+ *   4) else NO candidate -> write nothing this sample (fixes load-blip zeros)
+ * A spend-signature detector runs regardless of the lock: per candidate we
+ * track the previous total; a "big drop" = drop >= 15% of prev AND >= 40
+ * resources in one sample. If the currently tracked player has 0 big drops
+ * while some OTHER candidate has >= 2 -> switch the lock to that candidate
+ * (the human spends in batches; an AI climbs smoothly).
+ *
+ * Candidate/total table shared with the thread's diagnostic via the g_export_*
+ * statics below. resolve_export_player returns the SELECTED index/res. */
 typedef struct {
     int   idx;
     float total;
+    float prev;       /* R24: previous sample total per candidate */
+    int   big_drops;  /* R24: count of >=15% & >=40 spend-drops per candidate */
 } ExportCand;
 #define EXPORT_MAX_CANDS 32
 static ExportCand g_export_cands[EXPORT_MAX_CANDS];
 static int        g_export_ncand = 0;   /* candidates filled this call */
 static int        g_export_n = 0;       /* player count seen this call */
 
+/* R24: persistent per-session selection state (thread file-scope) */
+static int   s_lock_idx       = -1;    /* locked player index, -1 = none */
+static int   s_lock_rule_init = 0;     /* rule string set for current lock */
+static char  s_lock_rule[24];          /* rule used to acquire the lock */
+static int   s_last_diag_idx  = -1;    /* last diag'd selected index */
+static int   s_last_diag_n    = -1;    /* last diag'd player count */
+static int   s_last_diag_lock = -1;    /* last diag'd lock state */
+
 int resolve_export_player(DWORD base, int limit, DWORD *out_res, int *out_idx) {
     g_export_ncand = 0;
     g_export_n = 0;
     if (out_res) *out_res = 0;
     if (out_idx) *out_idx = -1;
-    if (base == 0) return 0;
 
-    DWORD game = safe_r32(base + RVA_GAME_PTR);
-    if (game == 0) return 0;
-    DWORD ctx = safe_r32(game + OFF_GAME_CTX);
-    if (ctx == 0) return 0;
+    /* gather fresh candidates (chain walk) */
+    DWORD arr = 0;
+    int   n = 0;
+    if (base != 0) {
+        DWORD game = safe_r32(base + RVA_GAME_PTR);
+        if (game != 0) {
+            DWORD ctx = safe_r32(game + OFF_GAME_CTX);
+            if (ctx != 0) {
+                n = (int)safe_r32(ctx + OFF_CTX_PLAYERCNT);
+                g_export_n = n;
+                if (n > 0) {
+                    if (limit > 0 && n > limit) n = limit;
+                    arr = safe_r32(ctx + OFF_CTX_PLAYERS);
+                }
+            }
+        }
+    }
+    if (n <= 0 || arr == 0) return 0;
 
-    int n = (int)safe_r32(ctx + OFF_CTX_PLAYERCNT);
-    g_export_n = n;
-    if (n <= 0) return 0;
-    if (limit > 0 && n > limit) n = limit;
-
-    DWORD arr = safe_r32(ctx + OFF_CTX_PLAYERS);
-    if (arr == 0) return 0;
-
-    int   pick_i = -1;
-    DWORD pick_r = 0;
-    float best = -1.0f;
-    for (int i = 0; i < n; i++) {
+    /* per-candidate totals + prev-tracking + big-drop count.
+     * The static g_export_cands[] array persists across calls; candidate slots
+     * map stably to player indices during a match (idx0 empty, idx1/idx2 real...
+     * stable nonzero set), so prev + big_drops naturally carry between samples. */
+    for (int i = 0; i < n && g_export_ncand < EXPORT_MAX_CANDS; i++) {
         DWORD p = safe_r32(arr + (DWORD)i * 4);
         if (p == 0) continue;
         DWORD r = safe_r32(p + OFF_PLAYER_RES);
@@ -529,24 +555,101 @@ int resolve_export_player(DWORD base, int limit, DWORD *out_res, int *out_idx) {
         if (r == 0 || ic == 0) continue;
         float total = decrypt_slot_at(r, 2) + decrypt_slot_at(r, 1) +
                       decrypt_slot_at(r, 0) + decrypt_slot_at(r, 7);
-        if (g_export_ncand < EXPORT_MAX_CANDS) {
-            g_export_cands[g_export_ncand].idx = i;
-            g_export_cands[g_export_ncand].total = total;
-            g_export_ncand++;
+        int c = g_export_ncand;
+        int first_time = (g_export_cands[c].idx != i);   /* slot reused for different player -> reset */
+        g_export_cands[c].idx = i;
+        if (first_time) g_export_cands[c].big_drops = 0;
+        /* big-drop detector: drop >= 15% of prev AND >= 40 resources */
+        if (!first_time && g_export_cands[c].prev > 0.0f &&
+            g_export_cands[c].prev - total >= 40.0f &&
+            (g_export_cands[c].prev - total) >= 0.15f * g_export_cands[c].prev) {
+            g_export_cands[c].big_drops++;
         }
-        if (total > best) {
-            best = total;
-            pick_i = i;
-            pick_r = r;
+        g_export_cands[c].prev = total;
+        g_export_cands[c].total = total;
+        g_export_ncand++;
+    }
+    if (g_export_ncand == 0) return 0;
+
+    /* --- selection rules (first match wins) --- */
+    int sel_idx = -1;
+    const char *rule = "first";
+    DWORD sel_res = 0;
+
+    /* rule 1: locked index still present this sample */
+    if (s_lock_idx >= 0) {
+        for (int k = 0; k < g_export_ncand; k++) {
+            if (g_export_cands[k].idx == s_lock_idx) {
+                sel_idx = s_lock_idx;
+                rule = "lock";
+                break;
+            }
         }
     }
-    if (pick_i < 0 || pick_r == 0) return 0;
-    if (out_res) *out_res = pick_r;
-    if (out_idx) *out_idx = pick_i;
+
+    if (sel_idx < 0) {
+        /* rule 2: idx1 nonzero total -> provisional (SP + LAN-host verified) */
+        for (int k = 0; k < g_export_ncand; k++)
+            if (g_export_cands[k].idx == 1 && g_export_cands[k].total != 0.0f) {
+                sel_idx = 1; rule = "sp_locked"; break;
+            }
+        /* rule 3: else first nonzero-total candidate */
+        if (sel_idx < 0) {
+            for (int k = 0; k < g_export_ncand; k++)
+                if (g_export_cands[k].total != 0.0f) {
+                    sel_idx = g_export_cands[k].idx; rule = "sp"; break;
+                }
+        }
+        /* rule 4: no candidate -> write nothing (return 0) */
+        if (sel_idx < 0) return 0;
+    }
+
+    /* spend-signature switch: run regardless of lock. If the currently tracked
+     * player has 0 big drops while some OTHER candidate has >= 2, switch the
+     * lock to that candidate. Only when we have a valid tracked player. */
+    if (sel_idx >= 0) {
+        int track_drops = 0, other_drops = 0, other_idx = -1;
+        for (int k = 0; k < g_export_ncand; k++) {
+            if (g_export_cands[k].idx == sel_idx)
+                track_drops = g_export_cands[k].big_drops;
+            else if (g_export_cands[k].big_drops >= 2) {
+                other_drops = g_export_cands[k].big_drops;
+                other_idx = g_export_cands[k].idx;
+            }
+        }
+        if (track_drops == 0 && other_drops >= 2 && other_idx >= 0) {
+            sel_idx = other_idx;
+            rule = "spend_switch";
+        }
+    }
+
+    /* set/refresh the lock + rule */
+    if (s_lock_idx != sel_idx) {
+        s_lock_idx = sel_idx;
+        s_lock_rule_init = 1;
+        _snprintf(s_lock_rule, sizeof(s_lock_rule), "%s", rule);
+    } else if (!s_lock_rule_init) {
+        s_lock_rule_init = 1;
+        _snprintf(s_lock_rule, sizeof(s_lock_rule), "%s", rule);
+    }
+
+    /* resolve the resource pointer for the selected index */
+    sel_res = 0;
+    for (int i = 0; i < n; i++) {
+        DWORD p = safe_r32(arr + (DWORD)i * 4);
+        if (p == 0) continue;
+        DWORD r = safe_r32(p + OFF_PLAYER_RES);
+        DWORD ic = safe_r32(p + OFF_PLAYER_INCOME);
+        if (r == 0 || ic == 0) continue;
+        if (i == sel_idx) { sel_res = r; break; }
+    }
+    if (sel_res == 0) return 0;
+    if (out_res) *out_res = sel_res;
+    if (out_idx) *out_idx = sel_idx;
     return 1;
 }
 
-/* ---- R21: export thread ----
+/* ---- R23/R21: export thread ----
  * Background thread that tails the verified resource chain and writes the
  * live exported values to rates.log (R21: the DLL's own pipe, read by
  * Dali's config/log_tailer/parser pipeline) in the exact recurring format
@@ -557,9 +660,6 @@ int resolve_export_player(DWORD base, int limit, DWORD *out_res, int *out_idx) {
  * [Debug] Enabled=0 (export mode). Shutdown via s_export_running=0 from
  * DLL_PROCESS_DETACH + WaitForSingleObject. d3d9mod.log stays the DEBUG
  * diagnostics log (Debug=1 only) — the export pipe is now rates.log. */
-static int s_exp_last_idx = -1;   /* R23: previous pick index for one-shot diag */
-static int s_exp_last_n   = -1;   /* R23: previous player count for one-shot diag */
-
 static DWORD WINAPI export_thread(LPVOID param) {
     (void)param;
     char logpath[MAX_PATH];
@@ -578,8 +678,7 @@ static DWORD WINAPI export_thread(LPVOID param) {
     while (s_export_running) {
         Sleep(500);
         unsigned long t = (unsigned long)clock_now();
-        /* R23: resolve the player FRESH each iteration — never trust the
-         * observer-resolved g_res (stale in-match, zeros forever). */
+        /* R24: resolve + select the human FRESH each sample with stable lock */
         DWORD base = g_base ? (DWORD)(DWORD_PTR)g_base : 0;
         DWORD res = 0;
         int   idx = -1;
@@ -588,12 +687,13 @@ static DWORD WINAPI export_thread(LPVOID param) {
             continue;   /* no sane player -> no zero line */
         if (res == 0) continue;
 
-        /* R23 who-is-who diagnostic: ONE line ONLY when the pick (index or
-         * player count) changes — rare, tells us which index Dali IS. */
-        if (idx != s_exp_last_idx || g_export_n != s_exp_last_n) {
+        /* R24 diagnostic: ONE line ONLY on selection/lock CHANGE — never
+         * spams identical lines. Rules: lock|sp_locked|sp|first|spend_switch. */
+        if (idx != s_last_diag_idx || g_export_n != s_last_diag_n ||
+            s_lock_idx != s_last_diag_lock) {
             char dbg[256];
-            int ln = _snprintf(dbg, sizeof(dbg), "R23 pick: n=%d idx=%d cand=[",
-                               g_export_n, idx);
+            int ln = _snprintf(dbg, sizeof(dbg), "R24 human: idx=%d rule=%s cand=[",
+                               idx, s_lock_rule);
             for (int k = 0; k < g_export_ncand && ln > 0 && ln < (int)sizeof(dbg); k++)
                 ln += _snprintf(dbg + ln, sizeof(dbg) - ln, "%s%d:%.0f",
                                 k ? " " : "", g_export_cands[k].idx,
@@ -601,8 +701,9 @@ static DWORD WINAPI export_thread(LPVOID param) {
             if (ln > 0 && ln < (int)sizeof(dbg))
                 ln += _snprintf(dbg + ln, sizeof(dbg) - ln, "]");
             dlog("%s", dbg);
-            s_exp_last_idx = idx;
-            s_exp_last_n = g_export_n;
+            s_last_diag_idx = idx;
+            s_last_diag_n = g_export_n;
+            s_last_diag_lock = s_lock_idx;
         }
 
         float food   = decrypt_slot_at(res, 2);

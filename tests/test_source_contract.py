@@ -850,18 +850,24 @@ check("EXPORT_MAX_CANDS" in code and "g_export_cands" in code and "g_export_ncan
       "R23: EXPORT_MAX_CANDS / g_export_cands / g_export_ncand statics present")
 check("g_export_n" in code and "g_export_ncand" in code,
       "R23: g_export_n and g_export_ncand exposed for caller diagnostics")
-check("s_exp_last_idx" in code and "s_exp_last_n" in code,
-      "R23: s_exp_last_idx / s_exp_last_n diagnostic tracking statics present")
-check('"R23 pick: n=%d idx=%d cand=["' in code,
-      "R23: who-is-who diagnostic format string present in export thread")
-check(code.count('"R23 pick: n=%d idx=%d cand=["') == 1,
-      "R23: who-is-who diagnostic fires EXACTLY once (when pick changes)")
+check("s_lock_idx" in code and "s_lock_rule" in code,
+      "R24: s_lock_idx / s_lock_rule persistent selection state present")
 check('int resolve_export_player(DWORD base, int limit, DWORD *out_res, int *out_idx)' in code,
-      "R23: resolve_export_player with correct signature (int *out_idx for -1) defined")
+      "R24: resolve_export_player with correct signature (int *out_idx for -1) defined")
 check("safe_r32" in code and "RVA_GAME_PTR" in code and "OFF_GAME_CTX" in code,
-      "R23: resolver walks game->ctx chain via safe_r32 (NULL-safe guarded)")
-check("s_exp_last_idx = idx;" in code and "s_exp_last_n = g_export_n;" in code,
-      "R23: one-shot diagnostic updates s_exp_last_idx and s_exp_last_n after logging")
+      "R24: resolver walks game->ctx chain via safe_r32 (NULL-safe guarded)")
+check("big_drops" in code and "prev" in code and "sel_idx" in code,
+      "R24: big_drops / prev per-candidate state + sel_idx present")
+check("rule = \"lock\"" in code and "rule = \"sp_locked\"" in code
+      and "rule = \"sp\"" in code and "rule = \"first\"" in code
+      and "rule = \"spend_switch\"" in code,
+      "R24: selection rules lock/sp_locked/sp/first/spend_switch all present")
+check('"R24 human: idx=%d rule=%s cand=["' in code,
+      "R24: who-is-who diagnostic format string present in export thread")
+check(code.count('"R24 human: idx=%d rule=%s cand=["') == 1,
+      "R24: who-is-who diagnostic fires EXACTLY once (when pick changes)")
+check("s_last_diag_idx" in code and "s_last_diag_n" in code and "s_last_diag_lock" in code,
+      "R24: s_last_diag_* one-shot-change tracking statics present")
 check("fopen(logpath, \"w\")" in code, "R20/21: export truncates the log at thread start")
 check("fopen(logpath, \"a\")" in code and "fwrite(buf" in code
       and "fflush(f)" in code and "fclose(f)" in code,
