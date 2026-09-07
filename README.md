@@ -4,8 +4,10 @@ In-game resource-rate overlay for **Age of Empires III: The Asian Dynasties** (`
 
 Drops in as `d3d9.dll` next to the game executable. Reads the human player's **decrypted stock**
 (food / wood / coin / export — the verified memory chain), computes **real-time gather/spend rates**
-from per-slot ring sampling with EMA smoothing, and draws a small native-looking panel in-game.
-Settings live in `ResourceRateMod.ini` next to the DLL; F9 toggles the panel, and the overlay's
+from per-slot ring sampling with EMA smoothing, and shows them two ways: a small native-looking
+in-game panel (D3DX9 overlay) and/or — the **recommended R19 surface** — by exporting the live values
+to `d3d9mod.log` for the always-on-top **`rates_widget.py`** viewer (see below). Settings live in
+`ResourceRateMod.ini` next to the DLL; F9 toggles the panel, and the overlay's
 two settings-hint lines let you flip toggles live (written back to the INI immediately).
 
 ## Definitive Edition is NOT supported
@@ -20,6 +22,25 @@ refused by the version gate and left completely untouched.
    `d3dx9_25.dll` must be present there (DX9 redist; the proxy loads it at runtime).
 2. Launch **`age3y.exe`** and play. F9 toggles the panel, F9+Alt flips format/visibility toggles.
 3. Do **NOT** launch `age3.exe` / `age3x.exe` — the proxy targets `age3y.exe` only (see below).
+
+## Live Resource Viewer (external widget — R19 pivot)
+
+The in-game overlay's in-match draw path is unreliable on the legacy engine, so the **recommended
+surface is now the external viewer**: the DLL exports your **live decrypted stock** as recurring
+`food:X ,wood:X ,coin:X` lines to `d3d9mod.log` (every ~500 ms) and a small always-on-top window shows
+them while you play.
+
+```bat
+pythonw.exe tools\rates_widget.py
+```
+
+- The widget is **stdlib-only** (Tkinter), frameless, always-on-top, draggable (left-drag), closes on
+  right-click. Optional: `--log <path>` and `--fps`.
+- Default log path = `C:\Users\dali\Documents\Age of Empires III - Complete Collection\d3d9mod.log`.
+- In the shipped default (`[Debug] Enabled=0`) `d3d9mod.log` contains **only** the recurring export
+  lines — clean and tiny. With `[Debug] Enabled=1` the full diagnostics return and export lines are
+  suppressed.
+- `.swarm/BUILD.md` ROUND 19-PIVOT has the full implementation + harness detail.
 
 ## Supported Versions
 
@@ -90,7 +111,7 @@ rewritten atomically (temp + replace) and the active `Users\DefaultProfile*.xml`
 | | `UseGameTime` | 1 | **remnant switch** — both modes wall-clock QPC (see Known Limitations) |
 | | `DiscontinuityRatio` | 3.0 | spend-spike skip threshold |
 | | `ShowGains` | 1 | count positive jumps |
-| `[Debug]` | `Enabled` | 0 | extended diagnostics into `d3d9mod.log` (incl. the one-shot `ovl diag` line) |
+| `[Debug]` | `Enabled` | 0 | **0 = export mode** (log = only the `food:X ,wood:X ,coin:X` lines, read by `rates_widget.py`); **1 = full diagnostics** (`ovl diag`, chain, heartbeats; export lines suppressed) |
 
 ### Hotkeys
 
@@ -233,6 +254,7 @@ d3d9.def               exported-symbol list
 build/build.bat        build + verify + deploy
 build/verify_pe.py     PE checks (machine, imports, exports, SHA256)
 tools/extract_bar.py   ESPN-v2 .bar list/extract (RE / experimental XML path)
+tools/rates_widget.py  always-on-top Tkinter live-resource viewer (tails d3d9mod.log export lines)
 config/schema.md       INI schema doc
 ResourceRateMod.ini.example
 tests/                 harness sources (SWARM_TEST builds use d3d9.dll)
@@ -242,7 +264,8 @@ VERIFIED_ADDRESSES.md  address notes
 
 | Tag | State | Artifact |
 |-----|-------|----------|
-| R11 (this round) | **Current — settings gap (decimal/plus/visibility/position) + two-line hints + version table + P0 `ovl diag`** | `d3d9.dll` (see `.swarm/BUILD.md` for size + SHA256) |
+| R19-PIVOT | **Current — live file-export + external widget (155,259 B, `65d8e880…`) + logging diet** | `d3d9.dll` + `tools/rates_widget.py` (see `.swarm/BUILD.md`) |
+| R11 (this round) | **Settings gap (decimal/plus/visibility/position) + two-line hints + version table + P0 `ovl diag`** | `d3d9.dll` (see `.swarm/BUILD.md` for size + SHA256) |
 | R14 | Overlay + rate engine + observer (previous) | `d3d9.dll` |
 | R13 | Observer-only proxy — verified vs HUD 2026-09-06 | 83,272 B `E6F79C46EF26FD430D3366B06418752B5E3E59870116295DF3BF75DA5D7DF6D0` |
 

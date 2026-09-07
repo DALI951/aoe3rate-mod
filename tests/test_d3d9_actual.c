@@ -499,6 +499,7 @@ static void test_swapchain_hook(void) {
         g_real = LoadLibraryA(sys);
     }
     if (g_real == NULL) { printf("FAIL: real d3d9.dll not loadable (sw)\n"); failures++; return; }
+    g_settings.debug_enabled = 1;   /* R19: install/tracer breadcrumbs are DebugEnabled-gated */
     logger_init();
     delete_chain_log();
 
@@ -739,6 +740,9 @@ static void test_overlay_status_p0(void) {
 
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    g_settings.debug_enabled = 1;   /* R19: every breadcrumb in this dev harness
+                                       needs the DebugEnabled=1 log stream (in
+                                       production ships Debug=0 => export-only) */
 
     test_primary_p1();
     test_fallback_p1_broken();

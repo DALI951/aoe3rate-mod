@@ -233,7 +233,8 @@ void settings_poll_profile(void) {
 void settings_load(void) {
     if (!s_clock_noted) {
         s_clock_noted = 1;
-        dlog("clock: using realtime QPC (s_tick is a frame counter, not game time)");
+        if (g_settings.debug_enabled)
+            dlog("clock: using realtime QPC (s_tick is a frame counter, not game time)");
     }
     FILE *f = fopen(g_ini_path, "rb");
     if (f == NULL) {

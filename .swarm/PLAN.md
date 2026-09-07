@@ -6,6 +6,14 @@ Upgrade the R13 observer-only proxy (`d3d9.dll`) into the full resource-rate mod
 
 **Deliveries:** `d3d9.dll` (single artifact) + `ResourceRateMod.ini` (+ optional experimental loose `data\ui\options.xml`). Two-file delivery stays intact.
 
+**ROUND 19-PIVOT (2026-09-07):** primary surface changed from the in-game panel to an **external
+always-on-top viewer** — the DLL exports live decrypted stock as `food:X ,wood:X ,coin:X` to
+`d3d9mod.log` every ~500ms, read by `tools/rates_widget.py` (stdlib Tkinter). The overlay path stays
+intact/zero-touch but is no longer relied upon for in-match visibility. House rules held: reuse ONLY
+the verified chain + decrypt, NO new imports (CreateThread via KERNEL32; imports
+{KERNEL32,USER32,msvcrt}, 11 exports), additive, all harnesses green. Full detail: `.swarm/BUILD.md`
+ROUND 19-PIVOT. Delivery = `d3d9.dll` + `ResourceRateMod.ini` + `tools/rates_widget.py`.
+
 ## 2. CURRENT-STATE AUDIT (verified this session)
 
 **Repo** `C:\Users\dali\aoe3rate-mod` @ `07f5b4f` R13, clean. `d3d9.c` = 616 lines, observer-only, logs `RES t=... food/wood/coin/export player= res=`. Exports 11, imports KERNEL32/msvcrt only, 83,272 B, SHA256 `E6F79C46...DF6D0`.

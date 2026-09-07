@@ -233,10 +233,11 @@ void dlog_chain(DWORD game, DWORD ctx, int n,
     memcpy(g_last_c, cur, sizeof(cur));
     g_last_tag[0] = '\0';
     if (tag != NULL) strncpy(g_last_tag, tag, sizeof(g_last_tag) - 1);
-    dlog("chain game=%08X ctx=%08X n=%d player=%08X res=%08X inc=%08X%s%s",
-         (unsigned)game, (unsigned)ctx, n,
-         (unsigned)player, (unsigned)res, (unsigned)inc,
-         tag ? " " : "", tag ? tag : "");
+    if (g_settings.debug_enabled)
+        dlog("chain game=%08X ctx=%08X n=%d player=%08X res=%08X inc=%08X%s%s",
+             (unsigned)game, (unsigned)ctx, n,
+             (unsigned)player, (unsigned)res, (unsigned)inc,
+             tag ? " " : "", tag ? tag : "");
 }
 
 /* ---- resource location ---- */
@@ -387,6 +388,23 @@ static int rnd_i(float x) {
     return (x >= 0.0f) ? (int)(x + 0.5f) : (int)(x - 0.5f);
 }
 
+/* ---- R19: export line formatter ----
+ * Writes the exact format "food:%d ,wood:%d ,coin:%d" to buf.
+ * Values rounded with (int)(x+0.5f). Returns chars written,
+ * 0 on NULL/0-size. Never writes past len. */
+int format_export_line(float food, float wood, float coin, char *buf, size_t len) {
+    if (buf == NULL || len == 0) return 0;
+    buf[0] = '\0';
+    int n = _snprintf(buf, len, "food:%d ,wood:%d ,coin:%d",
+                      (int)(food + 0.5f), (int)(wood + 0.5f), (int)(coin + 0.5f));
+    if (n < 0 || (size_t)n >= len) {
+        buf[len - 1] = '\0';
+        if (n < 0) n = 0;
+        else if ((size_t)n >= len) n = (int)(len - 1);
+    }
+    return n;
+}
+
 /* ---- observer ---- */
 void observer_sample(void) {
     DWORD ctx   = g_ctx ? (DWORD)(DWORD_PTR)g_ctx : 0;
@@ -403,10 +421,11 @@ void observer_sample(void) {
         if (match_start) {
             g_match_active = 1;   /* R15: from the first valid frame on, values/res
                                      gate failures are REAL (menu suppression lifts) */
-            dlog("--- match start n=%d player=%08X res=%08X ---",
-                 n,
-                 (unsigned)g_obs_player,
-                 (unsigned)(DWORD_PTR)g_res);
+            if (g_settings.debug_enabled)
+                dlog("--- match start n=%d player=%08X res=%08X ---",
+                     n,
+                     (unsigned)g_obs_player,
+                     (unsigned)(DWORD_PTR)g_res);
             s_snap_have = 0;
             s_tick = 0;
             tracker_reset();
@@ -444,5 +463,70 @@ void observer_sample(void) {
              rnd_i(v[2]), rnd_i(v[1]), rnd_i(v[0]), rnd_i(v[7]),
              g_obs_player ? (unsigned)g_obs_player : 0u,
              (unsigned)rr);
+    }
+}
+
+/* ---- R19: export thread ----
+ * Background thread that tails the verified resource chain and writes the
+ * live exported values to d3d9mod.log in the exact recurring format
+ * `food:X ,wood:X ,coin:X` (one line ~every 500ms). Launched lazily from the
+ * FIRST Direct3DCreate9 call (never DllMain — avoids loader lock), only when
+ * [Debug] Enabled=0 (export mode). Shutdown via s_export_running=0 from
+ * DLL_PROCESS_DETACH + WaitForSingleObject. */
+static DWORD WINAPI export_thread(LPVOID param) {
+    (void)param;
+    char logpath[MAX_PATH];
+    if (GetModuleFileNameA(NULL, logpath, MAX_PATH) == 0)
+        return 0;
+    char *slash = strrchr(logpath, '\\');
+    if (slash != NULL) { slash[1] = '\0'; lstrcatA(logpath, "d3d9mod.log"); }
+    else lstrcpyA(logpath, "d3d9mod.log");
+
+    /* truncate once at thread start (fresh session) */
+    {
+        FILE *f = fopen(logpath, "w");
+        if (f != NULL) fclose(f);
+    }
+
+    while (s_export_running) {
+        Sleep(500);
+        void *base = g_base;
+        void *res  = g_res;
+        if (base == NULL || res == NULL) continue;
+        float food = decrypt_slot_at((DWORD)(DWORD_PTR)res, 2);
+        float wood = decrypt_slot_at((DWORD)(DWORD_PTR)res, 1);
+        float coin = decrypt_slot_at((DWORD)(DWORD_PTR)res, 0);
+        char buf[64];
+        int n = format_export_line(food, wood, coin, buf, sizeof(buf));
+        if (n <= 0) continue;
+        FILE *f = fopen(logpath, "a");
+        if (f == NULL) continue;
+        fwrite(buf, 1, (size_t)n, f);
+        fputc('\n', f);
+        fflush(f);
+        fclose(f);
+    }
+    return 0;
+}
+
+int export_start(void) {
+    if (s_export_running) return 0;   /* already running (once-only) */
+    if (g_settings.debug_enabled) return 0;   /* export mode ONLY when debug off */
+    s_export_running = 1;
+    s_export_thread = CreateThread(NULL, 0, export_thread, NULL, 0, NULL);
+    if (s_export_thread == NULL) {
+        s_export_running = 0;
+        return 0;
+    }
+    return 1;
+}
+
+void export_shutdown(void) {
+    s_export_running = 0;
+    if (s_export_thread != NULL) {
+        HANDLE h = s_export_thread;
+        s_export_thread = NULL;
+        WaitForSingleObject(h, 200);
+        CloseHandle(h);
     }
 }

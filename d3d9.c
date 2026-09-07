@@ -77,6 +77,10 @@ DWORD g_bb_h = 0;        /* R11: latest BackBufferHeight (TopRight panel anchor)
 int  g_version_ok = 0;
 char g_version_reason[128] = "";
 
+/* R19: export thread state */
+static volatile int s_export_running = 0;
+static HANDLE s_export_thread = NULL;
+
 /* ---- include modules ---- */
 #include "src/logger.c"
 #include "src/tracker.c"
@@ -191,9 +195,10 @@ static unsigned int s_n_dev_seen   = 0;   /* distinct device vtables seen throug
  * swapchain acquisition; R17 then proves two live questions in one run). */
 static void tracer_tick(void) {
     if (((s_dev_presents + s_sw_presents + s_scene_ends) % 300) == 0)
-        dlog("present-path dev=%u sw=%u scene=%u frames=%u",
-             s_dev_presents, s_sw_presents, s_scene_ends,
-             (unsigned)g_frames_since_reset);
+        if (g_settings.debug_enabled)
+            dlog("present-path dev=%u sw=%u scene=%u frames=%u",
+                 s_dev_presents, s_sw_presents, s_scene_ends,
+                 (unsigned)g_frames_since_reset);
 }
 
 /* (patch_device_present forward-declared above) */
@@ -276,8 +281,9 @@ static int STDMETHODCALLTYPE w_create_device(void *self, UINT adapter, UINT type
         }
         if (ppdev != NULL && *ppdev != NULL) {
         int patched = patch_device_present(*ppdev);
-        dlog("CreateDevice hr=%#010x dev=%p patched=%s",
-             (unsigned)hr, *ppdev, patched ? "yes" : "no");
+        if (g_settings.debug_enabled)
+            dlog("CreateDevice hr=%#010x dev=%p patched=%s",
+                 (unsigned)hr, *ppdev, patched ? "yes" : "no");
         g_frames_since_reset = 0;
         if (patched) eager_implicit_swapchain(*ppdev);  /* R17: capture+patch the IMPLICIT swapchain (the runtime makes one at creation) */
         if (patched) ui_create_font(*ppdev);   /* R9: only bind a font to a device
@@ -298,8 +304,9 @@ static int STDMETHODCALLTYPE w_create_device_ex(void *self, UINT adapter, UINT t
         }
         if (ppdev != NULL && *ppdev != NULL) {
         int patched = patch_device_present(*ppdev);
-        dlog("CreateDeviceEx hr=%#010x dev=%p patched=%s",
-             (unsigned)hr, *ppdev, patched ? "yes" : "no");
+        if (g_settings.debug_enabled)
+            dlog("CreateDeviceEx hr=%#010x dev=%p patched=%s",
+                 (unsigned)hr, *ppdev, patched ? "yes" : "no");
         g_frames_since_reset = 0;
         if (patched) eager_implicit_swapchain(*ppdev);  /* R17: capture+patch the IMPLICIT swapchain (the runtime makes one at creation) */
         if (patched) ui_create_font(*ppdev);   /* R9: only bind a font to a device
@@ -462,8 +469,9 @@ static void patch_swapchain(void *sw) {
     vt[D9_SW_PRESENT] = (void *)sw_present_hook;
     VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
     g_sw = sw;
-    dlog("patch_swapchain: sw=%p vt=%p present=%p",
-         sw, (void *)vt, (void *)sw_present_hook);
+    if (g_settings.debug_enabled)
+        dlog("patch_swapchain: sw=%p vt=%p present=%p",
+             sw, (void *)vt, (void *)sw_present_hook);
 }
 
 /* R15: device GetSwapChain wrapper (slot 14) — every swapchain the game
@@ -535,12 +543,14 @@ static void eager_implicit_swapchain(void *dev) {
     if (dev == NULL) return;
     void *sw = NULL;
     int shr = w_get_swapchain(dev, 0, &sw);
-    if (shr >= 0 && sw != NULL) {
-        void **vts = *(void ***)sw;
-        int pt = (vts != NULL && vts[D9_SW_PRESENT] == (void *)sw_present_hook) ? 1 : 0;
-        dlog("swapchain-impl: sw=%p patched=%d", sw, pt);
-    } else {
-        dlog("swapchain-impl: n/a hr=0x%08X", (unsigned)shr);
+    if (g_settings.debug_enabled) {
+        if (shr >= 0 && sw != NULL) {
+            void **vts = *(void ***)sw;
+            int pt = (vts != NULL && vts[D9_SW_PRESENT] == (void *)sw_present_hook) ? 1 : 0;
+            dlog("swapchain-impl: sw=%p patched=%d", sw, pt);
+        } else {
+            dlog("swapchain-impl: n/a hr=0x%08X", (unsigned)shr);
+        }
     }
 }
 
@@ -604,10 +614,12 @@ static int patch_device_present(void *dev) {
             s_n_dev_seen++;   /* R16: distinct device vtable seen (second) */
             if (!s_second_vt_logged) {
                 s_second_vt_logged = 1;
-                dlog("device-count: n_devices=%u", s_n_dev_seen);
-                dlog("patch_device_present: second vtable %p seen (had %p) - "
-                     "not re-patched, overlay inactive on this device",
-                     vt, g_devvt);
+                if (g_settings.debug_enabled) {
+                    dlog("device-count: n_devices=%u", s_n_dev_seen);
+                    dlog("patch_device_present: second vtable %p seen (had %p) - "
+                         "not re-patched, overlay inactive on this device",
+                         vt, g_devvt);
+                }
             }
             return 0;
         }
@@ -805,6 +817,7 @@ const char *overlay_disabled_reason(void) {
 
 void overlay_status_log(void) {
     const char *r = overlay_state_reason(g_version_ok != 0, ui_ready() != 0, g_ini_missing != 0);
+    if (!g_settings.debug_enabled) return;   /* R19: status line debug-gated */
     if (r[0] == '\0') {
         dlog("OVERLAY ARMED%s", g_ini_missing ? " (ini missing: using defaults)" : "");
     } else {
@@ -821,6 +834,10 @@ void *WINAPI Direct3DCreate9(UINT SDKVersion) {
     if (f == NULL) return NULL;
     void *wrapped = (void *)wrap_d3d9(f(SDKVersion));
     dlog("Create9 v=%u -> wrapped=%p", (unsigned)SDKVersion, wrapped);
+    /* R19: launch the file-export thread lazily on the FIRST Direct3DCreate9
+     * call (NOT DllMain — avoids loader lock). Only in export mode
+     * (Debug=0). Once-only via s_export_running. */
+    if (!g_settings.debug_enabled) export_start();
     return wrapped;
 }
 
@@ -971,6 +988,10 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         ui_init();
         overlay_status_log();   /* R10: once per DLL load: ARMED / ARMED(note) / DISABLED:.. */
         set_step("dllmain-done");
+    }
+    else if (reason == DLL_PROCESS_DETACH) {
+        /* R19: stop the file-export thread (if running) and drain it briefly. */
+        export_shutdown();
     }
     return TRUE;
 }

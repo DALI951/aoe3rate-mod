@@ -17,6 +17,10 @@ build_log.txt
 build_test.txt
 tests/build_actual.txt
 
+# python bytecode
+__pycache__/
+*.pyc
+
 # generated files — never commit
 ResourceRateMod.ini
 d3d9.sha256

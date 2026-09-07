@@ -146,10 +146,10 @@ void ui_init(void) {
     g_d3dx = LoadLibraryA("d3dx9_25.dll");
     g_ui_ready = (g_d3dx != NULL);
     if (!g_ui_ready) {
-        dlog("UI disabled: d3dx9_25.dll not loadable");
+        if (g_settings.debug_enabled) dlog("UI disabled: d3dx9_25.dll not loadable");
         return;
     }
-    dlog("UI ready: d3dx9_25.dll loaded");
+    if (g_settings.debug_enabled) dlog("UI ready: d3dx9_25.dll loaded");
 }
 
 /* R10: d3dx9_25.dll-loadability accessor for the ARMED/DISABLED status line and
@@ -169,7 +169,7 @@ void ui_test_set_ready(int v) {
 
 void ui_on_reset(void *dev) {
     font_destroy();
-    dlog("reset dev=%p -> font invalidated", dev);
+    if (g_settings.debug_enabled) dlog("reset dev=%p -> font invalidated", dev);
 }
 
 static int ui_key_edge(int vk, int idx) {
@@ -182,7 +182,7 @@ static int ui_key_edge(int vk, int idx) {
 
 void ui_toggle_panel(void) {
     g_panel_visible = !g_panel_visible;
-    dlog("panel %s", g_panel_visible ? "shown" : "hidden");
+    if (g_settings.debug_enabled) dlog("panel %s", g_panel_visible ? "shown" : "hidden");
 }
 
 /* R16 B2: the 1-6 settings toggles only respond while the game window is the
@@ -264,7 +264,7 @@ void ui_check_hotkey(void) {
     }
     if (changed) {
         settings_save();
-        dlog("settings updated via hotkeys (saved)");
+        if (g_settings.debug_enabled) dlog("settings updated via hotkeys (saved)");
     }
 }
 
@@ -523,7 +523,7 @@ void ui_create_font(void *dev) {
     PFN_CREATEFONT cf = (PFN_CREATEFONT)(DWORD_PTR)
         GetProcAddress(g_d3dx, "D3DXCreateFontA");
     if (cf == NULL) {
-        dlog("UI: D3DXCreateFontA missing");
+        if (g_settings.debug_enabled) dlog("UI: D3DXCreateFontA missing");
         return;
     }
     const char *face = (g_settings.font_name[0] != '\0')
@@ -536,7 +536,7 @@ void ui_create_font(void *dev) {
         g_font = font;
         g_font_dev = dev;
         s_font_fail_n = 0;
-        dlog("UI: font created size=%d face=%s font=%p", size, face, font);
+        if (g_settings.debug_enabled) dlog("UI: font created size=%d face=%s font=%p", size, face, font);
     } else {
         /* never leave a dangling/non-NULL font on failure; log at most once,
          * then a heartbeat every 300 failures (R16 B4) so a persistent
@@ -545,10 +545,12 @@ void ui_create_font(void *dev) {
         g_font_dev = NULL;
         s_font_fail_n++;
         unsigned int h = (unsigned)hr;
-        if (s_font_fail_n == 1)
-            dlog("UI: font create FAILED hr=0x%08X", h);
-        else if ((s_font_fail_n % 300) == 0)
-            dlog("UI: font create still failing (%d)", s_font_fail_n);
+        if (g_settings.debug_enabled) {
+            if (s_font_fail_n == 1)
+                dlog("UI: font create FAILED hr=0x%08X", h);
+            else if ((s_font_fail_n % 300) == 0)
+                dlog("UI: font create still failing (%d)", s_font_fail_n);
+        }
     }
 }
 
@@ -701,31 +703,24 @@ void ui_draw(void) {
     }
     if (crel != NULL) crel(cur);   /* release our GetRenderTarget reference */
     if (!g_ovl_first_done) {
-        dlog("ovl first draw ok frame=%d", g_frames_since_reset);
-        /* R13: the render diagnostic is UNCONDITIONAL by design — exactly one
-         * line per process load, even on a shipped DebugEnabled=0 run, because
-         * it is the PRIMARY render-invisibility diagnostic: a missing line on
-         * an otherwise-working load means the deployed DLL is stale or the
-         * draw path died before the first successful draw. Content identical
-         * to R11 P0: the CURRENT render target (released pointer value only,
-         * never dereferenced) plus the exact panel rect/alpha that
-         * ui_draw_panel used this same frame. g_ovl_first_done semantics kept:
-         * the flag is set AFTER this block. */
-        int dpx, dpy, dpw, dph;
-        ui_panel_geometry(&dpx, &dpy, &dpw, &dph);
-        DWORD dal = (DWORD)((g_settings.opacity * 255.0f) + 0.5f);
-        if (dal > 255) dal = 255;
-        dlog("ovl diag rt=%p rect=%ld,%ld:%ldx%ld alpha=0x%lX",
-             cur, (long)dpx, (long)dpy, (long)dpw, (long)dph,
-             (unsigned long)dal);
+        /* R19: the first-draw marker + render diag are now debug-gated so the
+         * default (Debug=0) log carries ONLY the export lines. */
+        if (g_settings.debug_enabled) {
+            dlog("ovl first draw ok frame=%d", g_frames_since_reset);
+            int dpx, dpy, dpw, dph;
+            ui_panel_geometry(&dpx, &dpy, &dpw, &dph);
+            DWORD dal = (DWORD)((g_settings.opacity * 255.0f) + 0.5f);
+            if (dal > 255) dal = 255;
+            dlog("ovl diag rt=%p rect=%ld,%ld:%ldx%ld alpha=0x%lX",
+                 cur, (long)dpx, (long)dpy, (long)dpw, (long)dph,
+                 (unsigned long)dal);
+        }
         g_ovl_first_done = 1;
     }
-    /* ROUND 10 heartbeat: every 600 completed draws (~10s at 60fps) prove the
-     * draw path is STILL completing long after first-frame — not debug-gated
-     * (max ~6 lines/min), value/res reads reuse what ui_draw already has. */
+    /* R19: the heartbeat is debug-gated (the default log is export-only). */
     s_ovl_abort_n = 0;   /* R13: any completed draw resets the stop detector */
     s_ovl_draws++;
-    if ((s_ovl_draws % OVL_HEARTBEAT_FRAMES) == 0) {
+    if (g_settings.debug_enabled && (s_ovl_draws % OVL_HEARTBEAT_FRAMES) == 0) {
         dlog("ovl heartbeat n=%u frame=%d res=%p food=%0.0f wood=%0.0f coin=%0.0f export=%0.0f",
              s_ovl_draws, g_frames_since_reset, g_res,
              g_last_values[2], g_last_values[1], g_last_values[0], g_last_values[7]);

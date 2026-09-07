@@ -1,3 +1,76 @@
+# BUILD — ROUND 19-PIVOT (2026-09-07) — FILE-EXPORT PIVOT: live values → d3d9mod.log + always-on-top Python widget
+
+## ROUND SUMMARY
+Dali pivoted **away from the flaky in-match D3D overlay** (R15-17 traced the in-match Present to the
+runtime's implicit swapchain but the draw path never proved reliable). The DLL now exports the LIVE
+decrypted resources as recurring `food:%d ,wood:%d ,coin:%d` lines to
+`C:\Users\dali\Documents\Age of Empires III - Complete Collection\d3d9mod.log` every ~500ms, and a new
+stdlib Tkinter widget reads them in an always-on-top frameless window. Reuses ONLY the verified chain +
+decrypt; **NO new imports** (thread via KERNEL32 `CreateThread`); imports stay
+{KERNEL32,USER32,msvcrt}, still 11 exports. All existing harnesses stay green.
+
+## HOW TO USE (default = export mode)
+1. Launch the game (server/deploy already copied the DLL + ini). In default `[Debug] Enabled=0` the log
+   carries ONLY the recurring export lines.
+2. Show the live numbers:
+   ```
+   pythonw.exe tools\rates_widget.py
+   ```
+   (default log = the game dir `d3d9mod.log`; optional `--log PATH` and `--fps`). Drag with the left
+   button, close with right-click.
+3. Diagnostics: set `[Debug] Enabled=1` in `ResourceRateMod.ini` → the full verbose log (chain / device /
+   draw / heartbeat) returns and export lines are suppressed.
+
+## IMPLEMENTATION
+- `src/gameif.c`: `format_export_line(float,float,float,char*,size_t)` — exact `food:%d ,wood:%d ,coin:%d`,
+  values rounded `(int)(x+0.5f)`, returns 0 on NULL/0-size, never writes past len (clamped + forced NUL).
+- `export_thread(LPVOID)` — `Sleep(500)` then read `g_base`/`g_res`; skip while either NULL; decrypt
+  `decrypt_slot_at` slots **food=2, wood=1, coin=0** (the verified map); truncate the log ONCE on thread
+  start (`"w"`), then append + `fflush` per write (`"a"`).
+- `export_start()` / `export_shutdown()` (d3d9.c file-scope statics `s_export_running` / `s_export_thread`):
+  thread launched **lazily on the first `Direct3DCreate9` call ONLY when `debug_enabled==0`** (never from
+  DllMain — avoids the loader lock); `DLL_PROCESS_DETACH` → `export_shutdown()` sets `s_export_running=0`
+  and drains with `WaitForSingleObject(h,200)` + `CloseHandle`.
+
+## LOGGING DIET
+3 sites stay UNCONDITIONAL (the shipped Debug=0 log's only non-export content):
+- `DLL loaded base=%p real=%p version=%s reason=%s` (R14)
+- `ovl stop: %u consecutive frame aborts at stage=..` (R13 draw-path abort)
+- `ovl stop: reentrant-present for %u consecutive frames` (R13)
+
+Everything else (~24 sites across `d3d9.c`/`src/gameif.c`/`src/ui.c`/`src/settings.c`) is now gated behind
+`g_settings.debug_enabled`, including: CreateDevice(Ex) hr, patch_swapchain, swapchain-impl,
+device-count, the merged present-path tracer, the OVERLAY ARMED/DISABLED status, the chain line, the
+match-start separator, the R13 unconditional `ovl diag` (its pin was FLIPPED to gated), the ovl
+heartbeat, ui.c font/panel/hotkey saving, and the settings clock note. `ResourceRateMod.ini.example`
+`[Debug]` block documents export vs diagnostics modes.
+
+## DRIFT CAUGHT & FIXED (the harness needed debug mode)
+`test_d3d9_actual.c` asserts many breadcrumbs (chain tags, swapchain installs, tracer) that the diet
+now gates — it set `debug_enabled=1` at the top of `main()` and again at the start of
+`test_swapchain_hook()` so those lines are emitted. This is a DEV harness on purpose (full verbose
+stream); it does NOT change the shipped Debug=0 default.
+
+## HARNESS (ALL 6 GREEN)
+- `tests/test_rate_engine.exe` — **FAILURES: 0** (untouched).
+- `tests/test_d3d9_actual.exe` — **ALL D3D9 ACTUAL CHECKS PASSED** (after the debug_enabled=1 harness
+  fix — chain/[human-p1]/[fallback:]/[chain-break:] + swapchain/tracer asserts all emitted).
+- `tests/test_export.exe` (**NEW**) — **FAILURES: 0** — exact format string, `(int)(x+0.5f)` rounding
+  (99.6→100 / 200.5→201 / -0.5→0), NULL/0-size/tiny-buffer overflow safety, order under NULL.
+- `tests/test_widget_parse.py` (**NEW**) — **WIDGET-PARSE: PASS** — `parse_line` integer-only + locale-safe
+  (comma-decimal → None), whitespace/embedded variants, module-level PATTERN pins.
+- `tests/test_pe_structure.py` — **FAILURES: 0** — imports {KERNEL32,USER32,msvcrt}, 11 exports.
+- `tests/test_source_contract.py` — **SOURCE-CONTRACT: PASS** — R13 ovl-diag-unconditional pin FLIPPED to
+  gated, ~20 new R19 pins (format_export_line sig, thread+CreateThread, 500ms+Sleep, log truncate/append/
+  flush, debug-only launch, DETACH shutdown order, exactly-2 ovl-stop sites, tracer/heartbeat gated).
+
+## BUILD
+rc=0, zero warnings, **VERIFY PASS** (i386 PE32, imports subset {KERNEL32,USER32,msvcrt}, 11 exports).
+**d3d9.dll = 155,259 B, SHA256 `65d8e8801c1ac77161441497cea549e1eb98938cad1552e1f61cd85800f9c7d9`**,
+byte-identical 3-copy (repo root + game dir + tests), old game log deleted.
+
+---
+
 # BUILD — ROUND 18 (2026-09-07) — RESEARCH DOCUMENTATION (no code changes to d3d9.c/src)
 
 ## ROUND SUMMARY
