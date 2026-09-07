@@ -1,3 +1,13 @@
+# BUILD — UX ROUND (2026-09-07) — TASKBAR/DESKTOP SHORTCUT + FALLBACK CMD
+One-click launch for the rates app (no code/DLL changes). Desktop shortcut
+`C:\Users\dali\Desktop\AOE3 Rates.lnk` → `pythonw.exe "C:\Users\dali\aoe3rate-mod\app\app.py"`
+(WorkingDirectory = `app\`, pythonw = no console window), copy dropped into
+`%APPDATA%\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\`.
+Fallback `start_rates.cmd` (zero-dependency): repo root + game-folder copy, both
+pointing at the same absolute pythonw + app.py (pushd to `app\` then `start`).
+Taskbar pin may need one manual step: right-click desktop shortcut → Pin to
+taskbar (done once) if the User Pinned\TaskBar copy isn't picked up automatically.
+
 # BUILD — ROUND 21 (2026-09-07) — PYTHON PIPELINE ON DALI'S CORE + `rates.log`
 
 ## ROUND SUMMARY
