@@ -33,6 +33,7 @@ class RateEngine:
 
     def reset(self):
         """Drop all per-resource state (fresh session)."""
+        self.last = None                            # no sample yet -> raw == {}
         self._ema: Dict[str, float] = {}            # res -> income rate (res/sec)
         self._t_last: Dict[str, float] = {}         # res -> last accepted t_sec
         self._v_last: Dict[str, float] = {}         # res -> value at _t_last

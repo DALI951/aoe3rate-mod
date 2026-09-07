@@ -1,3 +1,56 @@
+# BUILD — ROUND 22 (2026-09-07) — FIX STUCK UI (truncation-blind tailer + silent pythonw)
+
+## ROUND SUMMARY
+Dali: "the ui is stuck and showing nothing." Diagnosed with EVIDENCE, not guesses:
+- **H1 RULED OUT (correct DLL, game ran):** deployed `d3d9.dll` == R21 build hash
+  `11473214…` (155,825 B, matches d3d9.sha256); `rates.log` EXISTS in the game folder
+  (14,887 B, live lines, mtime 15:43 — the game HAD run and WAS exporting).
+  Later confirmed the game was running live during this session (age3y PID ~9280,
+  rates.log advancing every 500 ms).
+- **H2 CONFIRMED — ROOT CAUSE:** the DLL truncates `rates.log` ONCE at export-thread
+  start (`fopen "w"`). Dali's `app/log_tailer.py follow()` opens at EOF and yields only
+  new content — if the file already existed when the app started, the reader's position
+  sits beyond EOF forever → `readline()` returns '' → UI stuck. REPRO: tiny script
+  (seed → follow → truncate → append) printed `lines yielded after truncation+rewrite: []`.
+- **H3 CONFIRMED — symptom amplifier:** pythonw shows nothing on error; the app's pre-fix
+  console mode printed NOTHING until the first line arrived (blank window), and any
+  polling-loop exception died silently.
+
+## FIX (Dali's 3 files — config.py / log_tailer.py / parser.py — STAY BYTE-IDENTICAL)
+- **NEW `app/filer.py` (OURS):** `follow()` with the same philosophy (only NEW complete
+  lines, poll-based, missing-file-safe, partial-line rewind) PLUS truncation/recreation
+  detection: on `getsize(path) < position` the file was truncated/recreated → reopen +
+  resume after the last complete line (drops torn tails); first open of an existing file
+  seeks to end (no stale flash). Survives: missing file (no crash), file appears later,
+  truncation mid-session, partial last line, garbage lines.
+- **`app/app.py`:** now uses `filer.follow`; GUI shows **"Waiting for data… (start a
+  match)"** in a visible dim color when nothing arrived, keeps last-known values
+  (never blanks out on a momentary read gap), and any polling-loop exception is appended
+  to **`app/app.error.log`** (timestamped, traceback) instead of dying silently under
+  pythonw. Console mode prints `reading <path>…` then a `waiting for data… (start a
+  match)` tick every ~2 s until the first line, then every live line.
+- **`app/engine.py`:** `reset()` now sets `self.last = None` (was unset before the first
+  sample → `engine.raw` AttributeError under pythonw = a silent-death path).
+
+## HARNESS (ALL 6 GREEN)
+- **NEW `tests/test_filer.py` — FILER: 12 checks PASS**: growing file yields new lines
+  only; truncation mid-stream recovers + continues; missing file → clean start; partial
+  line held until newline; no infinite loops; big-file truncation (15 KB → 3 lines)
+  reopens at end, no stale replay. Live app check: `python app\app.py --console`
+  against a simulated truncate showed `reading …` / `waiting for data…` then the NEW
+  session's lines (food 5→8→11→14→17→20, rates → +3.1/sec) — old history skipped.
+- `tests/test_app_core.py` APP-CORE PASS · `tests/test_source_contract.py` PASS ·
+  `tests/test_pe_structure.py` 0 · `tests/test_export.exe` FAILURES 0 ·
+  `tests/test_rate_engine.exe` FAILURES 0 · `tests/test_d3d9_actual.exe` ALL PASS.
+- build\build.bat: rc=0, VERIFY PASS, SHA `11473214…`, 155,825 B unchanged (NO C-side
+  change this round). Game-dir deploy [4/7] locked by the RUNNING age3y.exe — deployed
+  DLL already == R21 hash, so no action needed.
+
+## AGREEMENT/DX
+- Cause for Dali: **the app must be started AFTER the game (or while a match runs).**
+  Now robust to ANY order (start first / after / mid-match all work).
+
+---
 # BUILD — UX ROUND (2026-09-07) — TASKBAR/DESKTOP SHORTCUT + FALLBACK CMD
 One-click launch for the rates app (no code/DLL changes). Desktop shortcut
 `C:\Users\dali\Desktop\AOE3 Rates.lnk` → `pythonw.exe "C:\Users\dali\aoe3rate-mod\app\app.py"`

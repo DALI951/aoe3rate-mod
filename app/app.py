@@ -23,9 +23,28 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)  # makes `python app\\app.py` work from repo root
 
 from config import CONFIG            # noqa: E402
-from log_tailer import follow        # noqa: E402
+from filer import follow             # noqa: E402  (robust reader, ROUND 22)
 from parser import parse_line        # noqa: E402
 from engine import RateEngine        # noqa: E402
+
+import datetime                      # noqa: E402
+import threading                     # noqa: E402
+import time                          # noqa: E402
+import traceback                     # noqa: E402
+
+ERROR_LOG = os.path.join(_HERE, "app.error.log")
+
+
+def _log_error(exc, where):
+    """Append a timestamped failure to app.error.log (pythonw shows nothing)."""
+    try:
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}] "
+                    f"ERROR in {where}\n")
+            f.write(f"{type(exc).__name__}: {exc}\n")
+            f.write(traceback.format_exc())
+    except Exception:
+        pass
 
 # ---- look & feel (dark cinema, one accent; see taste skill) ---------------
 BG = "#0a0c0f"
@@ -42,14 +61,24 @@ FONT = ("Consolas", 16, "bold")
 
 def _run_loop(stdout_emit, engine):
     """Tail CONFIG.log_path -> parse -> engine.update -> emit(record) per line.
-    Runs in its own thread so the GUI timer is what repaints."""
-    for raw in follow(CONFIG.log_path, CONFIG.tail_poll_sec):
-        parsed = parse_line(raw)
-        if parsed is None:
-            continue
-        t_sec, values = parsed
-        engine.update(t_sec, values)
-        stdout_emit(engine)
+    Runs in its own thread so the GUI timer is what repaints. Any fault is
+    logged (not silent under pythonw) and the loop keeps polling."""
+    while True:
+        try:
+            for raw in follow(CONFIG.log_path, CONFIG.tail_poll_sec):
+                try:
+                    parsed = parse_line(raw)
+                    if parsed is None:
+                        continue
+                    t_sec, values = parsed
+                    engine.update(t_sec, values)
+                    stdout_emit(engine)
+                except Exception as exc:
+                    _log_error(exc, "_run_loop(line=%r)" % raw[:80])
+                    continue
+        except Exception as exc:
+            _log_error(exc, "_run_loop(follow)")
+            time.sleep(1.0)
 
 
 def emit_console(engine):
@@ -110,21 +139,29 @@ def build_window(items_tk, engine, log_path):
         w.bind("<Button-1>", press)
         w.bind("<B1-Motion>", move)
 
+    last = {}   # resource -> last good record (survives momentary gaps)
+
     def poke():
         rec = engine.raw
         res_map = rec.get("resources", {})
         for res, val_lab, rate_lab in rows:
             r = res_map.get(res)
+            if r is not None:
+                last[res] = r                              # remember last good
+            r = last.get(res)
             if r is None:
-                val_lab.configure(text="...")
-                rate_lab.configure(text="")
-                continue
+                val_lab.configure(text="…")                # never blank-out:
+                rate_lab.configure(text="")               # keep last known once
+                continue                                  # we have data
             val_lab.configure(text=f"{r['value']:.0f}")
             txt = r["formatted"] or "0"
             fg = RED if r["rate"] < 0 else GREEN
             rate_lab.configure(text=txt, fg=fg)
         if res_map:
             foot.configure(text=f"t={rec['t']:.2f}s — {log_path}")
+        else:
+            foot.configure(text="Waiting for data… (start a match)",
+                           fg=LABEL_FG)
         root.after(int(1000.0 / CONFIG.refresh_hz), poke)
 
     root.after(int(1000.0 / CONFIG.refresh_hz), poke)
@@ -145,7 +182,6 @@ def run_gui(engine, log_path):
         return
 
     root = build_window(tk, engine, log_path)
-    import threading
     t = threading.Thread(target=_run_loop, args=(emit_console, engine),
                          daemon=True)
     t.start()
@@ -153,7 +189,22 @@ def run_gui(engine, log_path):
 
 
 def run_console(engine):
-    _run_loop(emit_console, engine)
+    print(f"reading {CONFIG.log_path}…")
+    t = threading.Thread(target=_run_loop, args=(emit_console, engine),
+                         daemon=True)
+    t.start()
+    waited = 0
+    while not engine.raw:
+        if waited % 10 == 0:
+            print("waiting for data… (start a match)", flush=True)
+        time.sleep(0.2)
+        waited += 1
+    # keep running: _run_loop prints every line on its own thread
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        pass
 
 
 def main(argv):
