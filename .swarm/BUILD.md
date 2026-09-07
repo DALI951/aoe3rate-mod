@@ -1,3 +1,99 @@
+# BUILD — ROUND 11 (2026-09-07) — SETTINGS GAP + PANEL LAYOUT + VERSION TABLE + P0 DIAG
+
+## ROUND SUMMARY
+No crash this round (game not launched). R11 closes the P0/P1 spec gaps from the R10 "live
+expectations" report: full format/visibility/position settings, two-line hint bar, a
+data-driven version table, and a one-shot debug-gated render diagnostic to prove first draw.
+- **P0 one-shot render diagnostic** — the very first overlay draw logs, when `[Debug] Enabled=1`,
+  `ovl diag rt=<cur-rt> rect=<x>,<y>:<w>x<ht> alpha=0x<argb>` with the ACTUAL current render
+  target (released pointer value only, never dereferenced) and the exact panel rect/alpha from
+  `ui_panel_geometry`. Sits inside the first-draw block AFTER the `ovl first draw ok` marker;
+  `g_ovl_first_done` is set after the block so the guard literal
+  `!g_ovl_first_done && g_settings.debug_enabled` is true on the one shot.
+- **Settings gap (9 new keys)** — `DecimalPlaces` (0..3, default 1), `ShowPlusSign` (1),
+  `ShowResourceNames` (1), `ShowZeroRates` (1), `ShowFood/ShowWood/ShowCoin/ShowExport` (all 1),
+  `PositionMode` (`Default`|`TopLeft`|`TopRight`, default 0). Parsed in BOTH `settings_load` and
+  `profile_apply` (clamped after each), saved by `settings_save`; `PositionMode` round-trips as a
+  name. `ini_pos_mode()` is a case-insensitive `_stricmp` helper (msvcrt — no new imports).
+- **Format seam** — new non-static `format_rate_line(char*, size_t, slot, name, value, rate,
+  settings)` (declared in state.h, called by harness + the 4 main rows). Slot map 2->Food,
+  1->Wood, 0->Coin, 7->Export; a hidden resource or ~0 rate (when ShowZeroRates=0) returns 0 and
+  the row+its height are skipped. Decimals clamped 0..3, `+` prefix only when ShowPlusSign and
+  rate>=0 (negatives keep `-`), NULL name falls back to `SlotN`. `cli_panel_geometry()` is the
+  single owner of the rect (corner anchors only: Default uses PosX/PosY, TopLeft pins 12,12,
+  TopRight pins to the right edge using `g_bb_w`/`g_bb_h` captured from D3DPRESENT_PARAMETERS in
+  CreateDevice *and* CreateDeviceEx *and* reset_hook; 0 -> falls back to TopLeft). Two hint lines
+  (second = the F9+Alt reference), both clipped at `PANEL_LINE_MAX_CHARS 78` via `clip_line`
+  (fixed cap — font width measurement would need font-vtable slots 6/8, not in the proven set).
+- **Hotkeys: F9+Alt layer** — `g_key_prev` grown 8->17; bounds now sizeof-driven. `Alt+1` decimal
+  cycle, `Alt+2` plus, `Alt+3` names, `Alt+4` zeror, `Alt+5..8` food/wood/coin/export toggles,
+  `Alt+9` position cycle; plain layer is blocked while Alt is held (`!alt_down`); both layers need
+  the game window foreground (B2) and save immediately.
+- **Version table** — `struct ver_entry g_versions[]` in d3d9.c: row 0 = TAD 1.0.8 pinned from the
+  EXPECTED_* macros, rows 1..3 = `label NULL` TODO stubs (vanilla / WarChiefs / other TAD). The
+  gate picks the first row whose size matches the exe and checks base + PE version against that
+  row — reason strings byte-identical to R10.
+- **Docs P2** — README rewritten to 12 sections incl. trouble-shooting P0 checklist (verbatim log
+  chain), A/B isolation runs, multiplayer-safety, uninstallation, and four honest Known
+  Limitations (corner HUD v native bar, hotkeys v Options tab, UseGameTime remnant, no fabricated
+  offsets). ini.example + schema.md carry all 9 new keys.
+
+## LIVE EXPECTATIONS (verify against d3d9mod.log)
+```
+R14 DLL loaded base=00400000 real=.. version=OK reason=ok
+UI ready: d3dx9_25.dll loaded
+OVERLAY ARMED
+...
+chain .. n=3 .. [human-p1]
+--- match start n=3 .. ---
+UI: font created size=14 face=Georgia font=..
+ovl first draw ok frame=..
+ovl diag rt=.. rect=12,12:250x141 alpha=0xD8   <- ONE-SHOT, only when Debug Enabled=1
+      (TopRight: rect pins to the right edge via g_bb_w; Default: PosX/PosY)
+ovl heartbeat n=.. frame=.. res=.. food=.. wood=.. coin=.. export=..
+```
+F9 panel now shows TWO hint lines (78-char clip): `[..] 1:header 2:slots 3:gains 4:.. 5:..ms 6:..`
+and `Alt+1:dps 2:plus 3:names 4:zeror 5:food 6:wood 7:coin 8:exp 9:pos`. A/B runs (rename
+age3y.exe / move d3dx9_25.dll) must still show the DISABLED reason + red GDI line. Zero `FAULT`
+lines throughout.
+
+## File changes
+- `src/state.h` — R11: ModSettings += decimal_places/show_plus_sign/show_resource_names/
+  show_zero_rates/show_food/wood/coin/export/position_mode; `extern DWORD g_bb_w/g_bb_h`;
+  `PANEL_LINE_MAX_CHARS 78`; non-static `format_rate_line` decl.
+- `src/settings.c` — R11: defaults; `ini_pos_mode()` (_stricmp); 9 keys parsed in
+  `settings_load` + `profile_apply` (clamped), 9 lines in `settings_save` (`PositionMode=%s`).
+- `src/ui.c` — R11: `g_key_prev[17]` + sizeof bounds/init; `alt_down` + `!alt_down` guard +
+  F9+Alt block (edges 8..16); `ui_panel_geometry` + `clip_line` + `format_rate_line`;
+  main 4 rows via the seam, two clipped hint lines; first-draw block restructured with the P0
+  `ovl diag` (debug-gated, flag set after).
+- `d3d9.c` — R11: `g_bb_w/g_bb_h` globals + capture (fmt[0]/fmt[+4]) in CreateDevice,
+  CreateDeviceEx and reset_hook; `struct ver_entry g_versions[]` + row-selection gate loop
+  (reason strings verbatim).
+- `tests/test_rate_engine.c` — R11: `test_format_line` STEP (defaults/precision/clamps/plus/
+  names/zero-rate/visibility/sec-unit/48-byte buffer/version-table row 0 + TODO row 1).
+- `tests/test_source_contract.py` — R11 block: table + TODO rows + reason strings, state.h
+  EXPECTED_* + externs + PANEL_LINE_MAX_CHARS, 9 settings keys (parse x2 + save + example +
+  schema), VK_MENU/!alt_down/F9+Alt/hint/g_key_prev[17]/sizeof, geometry + PositionMode names,
+  format_rate_line seam, `ovl diag` guard + position.
+- `README.md`, `ResourceRateMod.ini.example`, `config/schema.md` — R11 docs/schema.
+
+## Build / harnesses (this round)
+- Build rc=0, zero warnings (-Wall -Wextra), VERIFY PASS (i386 PE32, imports
+  KERNEL32/USER32/msvcrt only, 11 exports via d3d9.def — unchanged set).
+- d3d9.dll = **148,853 B**, SHA256
+  `77957c78d6739d6c6b54d5e206ba5d165f98398311380ed6de6b30820613b919`, deployed byte-identical
+  to repo root + game dir + tests\d3d9.dll (all 3 SHA256 equal); `d3dx9_25.dll` restored to the
+  game dir from SysWOW64 (system DX9 runtime; loader also falls back to it); old d3d9mod.log
+  deleted.
+- Toolchain: w64devkit-x86 **v2.9.1** re-extracted to the Temp working dir (v2.8 TEMP install was
+  wiped with Temp cleanup; same bin + libexec\gcc\i686-w64-mingw32\16.2.0 layout, gcc 16.2.0).
+- Harnesses: test_rate_engine.exe FAILURES 0 (incl. new R11 format/table STEPs) ·
+  test_d3d9_actual.exe ALL PASS · loadsmoke_path.exe PASS · test_source_contract.py PASS
+  (R11 block + all R10/R14 pins green).
+
+---
+
 # BUILD — ROUND 10 (2026-09-07) — ARMED/DISABLED STATUS + GDI VISIBLE FALLBACK + DRAW HEARTBEAT
 
 ## ROUND SUMMARY

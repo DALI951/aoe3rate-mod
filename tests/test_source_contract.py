@@ -499,6 +499,89 @@ i_od = src.find('set_step("ovl-done")')
 check(i_fd != -1 and i_hb != -1 and i_od != -1 and i_fd < i_hb < i_od,
       "R10: heartbeat block sits between the first-draw marker and the ovl-done step")
 
+# ================= ROUND 11: settings gap + panel layout + version table =================
+# P0/P1 spec-gap closure: per-resource visibility, decimal places, plus sign,
+# position modes + hotkeys, a two-line hint bar, and a multi-version gate table.
+
+# 1) version table in d3d9.c, initialized from the EXPECTED_* macros; TODO rows.
+check("const struct ver_entry g_versions[]" in src,
+      "R11: g_versions[] present with struct ver_entry")
+check("TAD 1.0.8" in src, "R11: TAD 1.0.8 row label present")
+check(src.count("TODO: capture") >= 2, "R11: >=2 not-yet-captured TODO rows in the table")
+i_rowref = src.find("struct ver_entry *row = NULL;")
+check(i_rowref != -1 and src.find("row->base", i_rowref) != -1,
+      "R11: version_gate_check selects a row by size then reads row->base")
+check('"exe size=%lu expected=%lu"' in src and '"base=%08lX expected=%08lX"' in src and
+      '"pe ver=%u.%u.%u.%u expected=%u.%u.%u.%u"' in src,
+      "R11: the three version-gate reason strings retained verbatim")
+with open(os.path.join(ROOT, "src", "state.h"), "r", encoding="utf-8", errors="replace") as fsh:
+    stateh = fsh.read()
+for _m in ("EXPECTED_EXE_SIZE", "EXPECTED_IMAGE_BASE", "EXPECTED_PE_VER_HI",
+           "EXPECTED_PE_VER_LO", "EXPECTED_PE_VER_R", "EXPECTED_PE_VER_B"):
+    check(_m in stateh, f"R11: {_m} still defined in state.h")
+check("extern DWORD g_bb_w" in stateh and "extern DWORD g_bb_h" in stateh,
+      "R11: g_bb_w/g_bb_h extern'd in state.h")
+check("DWORD g_bb_w = 0;" in src and "DWORD g_bb_h = 0;" in src,
+      "R11: g_bb_w/g_bb_h defined in d3d9.c")
+check(code.count("g_bb_w = ") >= 3,
+      "R11: backbuffer dims captured in BOTH create paths AND reset_hook")
+check("PANEL_LINE_MAX_CHARS" in stateh and "PANEL_LINE_MAX_CHARS" in src,
+      "R11: PANEL_LINE_MAX_CHARS defined (state.h) and used in ui.c")
+
+# 2) settings: the 9 new keys — parsed (both paths) AND saved + documented.
+newkeys = ["DecimalPlaces", "ShowPlusSign", "ShowResourceNames", "ShowZeroRates",
+           "ShowFood", "ShowWood", "ShowCoin", "ShowExport", "PositionMode"]
+for _k in newkeys:
+    check(src.count(f'!strcmp(key, "{_k}")') >= 2 and f'"{_k}=' in src,
+          f"R11: {_k} parsed (load + profile) AND saved in settings.c")
+check('PositionMode=%s' in src, "R11: PositionMode saved as a string name")
+check(re.search(r"s->decimal_places\s*=\s*1;", src) is not None,
+      "R11: default decimal_places = 1")
+check(re.search(r"s->position_mode\s*=\s*0;", src) is not None,
+      "R11: default position_mode = 0 (Default)")
+check(re.search(r"s->show_plus_sign\s*=\s*1;", src) is not None and
+      re.search(r"s->show_resource_names\s*=\s*1;", src) is not None and
+      re.search(r"s->show_zero_rates\s*=\s*1;", src) is not None,
+      "R11: new show_* defaults on (1)")
+check('"ShowHeader"' in src and '"ShowSlots567"' in src and '"DiscontinuityRatio"' in src,
+      "R11: legacy keys ShowHeader/ShowSlots567/DiscontinuityRatio still parsed")
+with open(os.path.join(ROOT, "ResourceRateMod.ini.example"), "r", encoding="utf-8",
+          errors="replace") as fine:
+    ini_ex = fine.read()
+with open(os.path.join(ROOT, "config", "schema.md"), "r", encoding="utf-8",
+          errors="replace") as fsc:
+    schema = fsc.read()
+for _k in newkeys:
+    check(_k in ini_ex and _k in schema, f"R11: {_k} documented in ini.example + schema.md")
+
+# 3) panel layout + hotkeys: Alt layer, edge array sized by sizeof, geometry.
+check("VK_MENU" in src, "R11: Alt detected via VK_MENU")
+check("!alt_down" in code, "R11: plain toggles blocked while Alt is held")
+check("f9_down && fg && alt_down" in code, "R11: F9+Alt layer gated on foreground + Alt")
+check("Alt+1:dps 2:plus 3:names 4:zeror 5:food 6:wood 7:coin 8:exp 9:pos" in src,
+      "R11: two-line hint string present (F9+Alt reference)")
+check("g_key_prev[17]" in src, "R11: edge-tracking array grown to 17")
+check("sizeof(g_key_prev) / sizeof(g_key_prev[0])" in code,
+      "R11: key-edge bounds driven by sizeof (no stale literal 8)")
+check("ui_panel_geometry" in code and "position_mode" in stateh,
+      "R11: panel geometry helper + position_mode setting present")
+check('"Default"' in code and '"TopLeft"' in code and '"TopRight"' in code,
+      "R11: position-mode names Default/TopLeft/TopRight rendered in settings.c")
+check("format_rate_line" in stateh, "R11: format_rate_line declared in state.h")
+check("int format_rate_line(char *out, size_t n, int slot_id" in code,
+      "R11: format_rate_line defined non-static in ui.c")
+check("rate_get_ema(slot_map[r])" in code,
+      "R11: main rows feed rate_get_ema through format_rate_line")
+
+# 4) P0 one-shot render diagnostic (debug-gated, after the first-draw marker).
+i_fd = src.find('"ovl first draw ok frame=%d"')
+i_diag = src.find('ovl diag rt=%p rect=%ld,%ld:%ldx%ld alpha=0x%lX', i_fd)
+check(i_fd != -1 and i_diag != -1, "R11: ovl diag line present after the first-draw marker")
+check(i_fd != -1 and i_diag != -1 and src.find("g_settings.debug_enabled", i_fd) < i_diag,
+      "R11: g_settings.debug_enabled gates the diagnostic (marker < gate < diag)")
+check("!g_ovl_first_done && g_settings.debug_enabled" in code,
+      "R11: diagnostic guard literal (flag set AFTER the diag block)")
+
 # ================= R14: modular layout =================
 
 for mod in ("logger.c", "tracker.c", "rate.c", "gameif.c", "settings.c", "ui.c"):

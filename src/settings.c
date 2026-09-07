@@ -27,6 +27,12 @@ static void settings_defaults(void) {
     s->pos_y               = 12;
     s->show_header         = 1;
     s->show_slots_567      = 0;
+    s->decimal_places      = 1;   /* R11: %.1f — today's display */
+    s->show_plus_sign      = 1;
+    s->show_resource_names = 1;
+    s->show_zero_rates     = 1;
+    s->show_food = 1; s->show_wood = 1; s->show_coin = 1; s->show_export = 1;
+    s->position_mode       = 0;
     s->sample_ms           = (int)SAMPLE_MS_DEFAULT;
     lstrcpyA(s->smoothing, "med");
     s->use_unit_min        = 1;
@@ -55,6 +61,15 @@ static int ini_get_int(const char *v, int dflt) {
     int n = (int)strtol(v, NULL, 0);
     if (n == 0 && v[0] != '0') return dflt;
     return n;
+}
+
+static int ini_pos_mode(const char *v, int dflt) {
+    /* R11: panel position mode from the .ini ("Default"|"TopLeft"|"TopRight") */
+    if (v == NULL) return dflt;
+    if (_stricmp(v, "Default") == 0) return 0;
+    if (_stricmp(v, "TopLeft") == 0) return 1;
+    if (_stricmp(v, "TopRight") == 0) return 2;
+    return dflt;
 }
 
 static float ini_get_float(const char *v, float dflt) {
@@ -182,6 +197,15 @@ static void profile_apply(void) {
         else if (!strcmp(key, "PosY"))          s->pos_y = ini_get_int(value, s->pos_y);
         else if (!strcmp(key, "ShowHeader"))    s->show_header = ini_get_bool(value, s->show_header);
         else if (!strcmp(key, "ShowSlots567"))  s->show_slots_567 = ini_get_bool(value, s->show_slots_567);
+        else if (!strcmp(key, "DecimalPlaces")) { int n = ini_get_int(value, s->decimal_places); if (n < 0) n = 0; else if (n > 3) n = 3; s->decimal_places = n; }
+        else if (!strcmp(key, "ShowPlusSign"))  s->show_plus_sign = ini_get_bool(value, s->show_plus_sign);
+        else if (!strcmp(key, "ShowResourceNames")) s->show_resource_names = ini_get_bool(value, s->show_resource_names);
+        else if (!strcmp(key, "ShowZeroRates")) s->show_zero_rates = ini_get_bool(value, s->show_zero_rates);
+        else if (!strcmp(key, "ShowFood"))      s->show_food = ini_get_bool(value, s->show_food);
+        else if (!strcmp(key, "ShowWood"))      s->show_wood = ini_get_bool(value, s->show_wood);
+        else if (!strcmp(key, "ShowCoin"))      s->show_coin = ini_get_bool(value, s->show_coin);
+        else if (!strcmp(key, "ShowExport"))    s->show_export = ini_get_bool(value, s->show_export);
+        else if (!strcmp(key, "PositionMode"))  { int n = ini_pos_mode(value, s->position_mode); if (n < 0) n = 0; else if (n > 2) n = 2; s->position_mode = n; }
         else if (!strcmp(key, "SampleMs"))      s->sample_ms = ini_get_int(value, s->sample_ms);
         else if (!strcmp(key, "Smoothing"))     { lstrcpynA(s->smoothing, value, sizeof(s->smoothing)); }
         else if (!strcmp(key, "Unit"))          s->use_unit_min = (!strcmp(value, "min"));
@@ -259,6 +283,15 @@ void settings_load(void) {
             else if (!strcmp(key, "PosY"))      s->pos_y = ini_get_int(val, s->pos_y);
             else if (!strcmp(key, "ShowHeader")) s->show_header = ini_get_bool(val, s->show_header);
             else if (!strcmp(key, "ShowSlots567")) s->show_slots_567 = ini_get_bool(val, s->show_slots_567);
+            else if (!strcmp(key, "DecimalPlaces")) { int n = ini_get_int(val, s->decimal_places); if (n < 0) n = 0; else if (n > 3) n = 3; s->decimal_places = n; }
+            else if (!strcmp(key, "ShowPlusSign")) s->show_plus_sign = ini_get_bool(val, s->show_plus_sign);
+            else if (!strcmp(key, "ShowResourceNames")) s->show_resource_names = ini_get_bool(val, s->show_resource_names);
+            else if (!strcmp(key, "ShowZeroRates")) s->show_zero_rates = ini_get_bool(val, s->show_zero_rates);
+            else if (!strcmp(key, "ShowFood")) s->show_food = ini_get_bool(val, s->show_food);
+            else if (!strcmp(key, "ShowWood")) s->show_wood = ini_get_bool(val, s->show_wood);
+            else if (!strcmp(key, "ShowCoin")) s->show_coin = ini_get_bool(val, s->show_coin);
+            else if (!strcmp(key, "ShowExport")) s->show_export = ini_get_bool(val, s->show_export);
+            else if (!strcmp(key, "PositionMode")) { int n = ini_pos_mode(val, s->position_mode); if (n < 0) n = 0; else if (n > 2) n = 2; s->position_mode = n; }
         } else if (!strcmp(section, "Rate")) {
             if (!strcmp(key, "SampleMs"))       s->sample_ms = ini_get_int(val, s->sample_ms);
             else if (!strcmp(key, "Smoothing")) lstrcpynA(s->smoothing, val, sizeof(s->smoothing));
@@ -299,6 +332,15 @@ void settings_save(void) {
             "PosY=%d\r\n"
             "ShowHeader=%d\r\n"
             "ShowSlots567=%d\r\n"
+            "DecimalPlaces=%d\r\n"
+            "ShowPlusSign=%d\r\n"
+            "ShowResourceNames=%d\r\n"
+            "ShowZeroRates=%d\r\n"
+            "ShowFood=%d\r\n"
+            "ShowWood=%d\r\n"
+            "ShowCoin=%d\r\n"
+            "ShowExport=%d\r\n"
+            "PositionMode=%s\r\n"
             "\r\n"
             "[Rate]\r\n"
             "SampleMs=%d\r\n"
@@ -314,6 +356,10 @@ void settings_save(void) {
             s->enabled, (unsigned)s->hotkey, s->start_hidden,
             s->font_name, s->font_size, s->opacity,
             s->pos_x, s->pos_y, s->show_header, s->show_slots_567,
+            s->decimal_places, s->show_plus_sign, s->show_resource_names,
+            s->show_zero_rates, s->show_food, s->show_wood, s->show_coin,
+            s->show_export,
+            (s->position_mode == 1 ? "TopLeft" : (s->position_mode == 2 ? "TopRight" : "Default")),
             s->sample_ms, s->smoothing,
             s->use_unit_min ? "min" : "sec",
             s->use_game_time, s->discontinuity_ratio, s->show_gains,

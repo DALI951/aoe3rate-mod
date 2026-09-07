@@ -67,6 +67,8 @@ void  *g_font_dev = NULL;       /* R16 B1: device the ID3DXFont is bound to */
 ModSettings g_settings;
 int g_panel_visible = 1;
 int g_ini_missing = 0;   /* R10: ResourceRateMod.ini fopen failed (status-line suffix) */
+DWORD g_bb_w = 0;        /* R11: latest BackBufferWidth from D3DPRESENT_PARAMETERS */
+DWORD g_bb_h = 0;        /* R11: latest BackBufferHeight (TopRight panel anchor) */
 
 /* version gate state */
 int  g_version_ok = 0;
@@ -167,13 +169,19 @@ static int STDMETHODCALLTYPE w_create_device(void *self, UINT adapter, UINT type
     D3D9W *w = (D3D9W *)self;
     int hr = ((int (STDMETHODCALLTYPE *)(void *, UINT, UINT, HWND, DWORD, void *, void **))
         ((void ***)w->real)[0][16])(w->real, adapter, type, focus, flags, pparams, ppdev);
-    if (hr >= 0 && ppdev != NULL && *ppdev != NULL) {
+    if (hr >= 0) {
+        if (pparams != NULL) {   /* fmt[0]=BackBufferWidth, fmt[+4]=BackBufferHeight */
+            g_bb_w = ((const DWORD *)pparams)[0];
+            g_bb_h = ((const DWORD *)pparams)[1];
+        }
+        if (ppdev != NULL && *ppdev != NULL) {
         int patched = patch_device_present(*ppdev);
         dlog("CreateDevice hr=%#010x dev=%p patched=%s",
              (unsigned)hr, *ppdev, patched ? "yes" : "no");
         g_frames_since_reset = 0;
         if (patched) ui_create_font(*ppdev);   /* R9: only bind a font to a device
                                                   whose Present hook runs the overlay */
+        }
     }
     return hr;
 }
@@ -182,13 +190,19 @@ static int STDMETHODCALLTYPE w_create_device_ex(void *self, UINT adapter, UINT t
     D3D9W *w = (D3D9W *)self;
     int hr = ((int (STDMETHODCALLTYPE *)(void *, UINT, UINT, HWND, DWORD, void *, void *, void **))
         ((void ***)w->real)[0][17])(w->real, adapter, type, focus, flags, pparams, pfs, ppdev);
-    if (hr >= 0 && ppdev != NULL && *ppdev != NULL) {
+    if (hr >= 0) {
+        if (pparams != NULL) {   /* fmt[0]=BackBufferWidth, fmt[+4]=BackBufferHeight */
+            g_bb_w = ((const DWORD *)pparams)[0];
+            g_bb_h = ((const DWORD *)pparams)[1];
+        }
+        if (ppdev != NULL && *ppdev != NULL) {
         int patched = patch_device_present(*ppdev);
         dlog("CreateDeviceEx hr=%#010x dev=%p patched=%s",
              (unsigned)hr, *ppdev, patched ? "yes" : "no");
         g_frames_since_reset = 0;
         if (patched) ui_create_font(*ppdev);   /* R9: only bind a font to a device
                                                   whose Present hook runs the overlay */
+        }
     }
     return hr;
 }
@@ -233,6 +247,10 @@ static D3D9W *wrap_d3d9(void *real) {
 static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
     g_device = self;
     g_frames_since_reset = 0;
+    if (pp != NULL) {   /* R11: refresh the backbuffer dims after a Reset */
+        g_bb_w = ((const DWORD *)pp)[0];
+        g_bb_h = ((const DWORD *)pp)[1];
+    }
     set_step("reset-hook");
     g_fault_dev = self;
     g_fault_vt  = (self != NULL) ? *(void ***)self : NULL;
@@ -348,6 +366,26 @@ static int patch_device_present(void *dev) {
 
 /* ========================= version gate ========================= */
 
+/* R11: multi-version table. Each row pins the exe size + PE identity for one
+ * known executable. Row 0 is The Asian Dynasties 1.0.8 (age3y.exe). The rest
+ * are TODO stubs (NULL -> not yet measured): filling them just needs the size
+ * + IMAGE_BASE + 4-part version resource read off the matching exe once —
+ * the gate machinery below already iterates the table. */
+struct ver_entry {
+    const char *label;
+    DWORD size, pe_hi, pe_lo, pe_r, pe_b, base;
+};
+const struct ver_entry g_versions[] = {
+    { "TAD 1.0.8",
+      EXPECTED_EXE_SIZE,
+      EXPECTED_PE_VER_HI, EXPECTED_PE_VER_LO,
+      EXPECTED_PE_VER_R, EXPECTED_PE_VER_B,
+      EXPECTED_IMAGE_BASE },
+    { NULL, 0, 0, 0, 0, 0, 0 },   /* TODO: capture age3.exe (vanilla) */
+    { NULL, 0, 0, 0, 0, 0, 0 },   /* TODO: capture age3x.exe (WarChiefs) */
+    { NULL, 0, 0, 0, 0, 0, 0 },   /* TODO: capture other TAD builds */
+};
+
 void version_gate_check(void) {
     g_version_ok = 0;
     g_version_reason[0] = '\0';
@@ -362,7 +400,16 @@ void version_gate_check(void) {
     if (hf == INVALID_HANDLE_VALUE) { lstrcpyA(g_version_reason, "cannot open exe"); return; }
     DWORD fsize = GetFileSize(hf, NULL);
     CloseHandle(hf);
-    if (fsize != EXPECTED_EXE_SIZE) {
+
+    /* pick the first row whose measured size matches (null rows never match) */
+    struct ver_entry *row = NULL;
+    for (size_t i = 0; i < sizeof(g_versions) / sizeof(g_versions[0]); i++) {
+        if (g_versions[i].size != 0 && g_versions[i].size == fsize) {
+            row = (struct ver_entry *)&g_versions[i];
+            break;
+        }
+    }
+    if (row == NULL) {
         _snprintf(g_version_reason, sizeof(g_version_reason),
                   "exe size=%lu expected=%lu",
                   (unsigned long)fsize, (unsigned long)EXPECTED_EXE_SIZE);
@@ -381,11 +428,11 @@ void version_gate_check(void) {
         nth->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
         lstrcpyA(g_version_reason, "not i386 PE32"); return;
     }
-    if (nth->OptionalHeader.ImageBase != EXPECTED_IMAGE_BASE) {
+    if (nth->OptionalHeader.ImageBase != row->base) {
         _snprintf(g_version_reason, sizeof(g_version_reason),
                   "base=%08lX expected=%08lX",
                   (unsigned long)nth->OptionalHeader.ImageBase,
-                  (unsigned long)EXPECTED_IMAGE_BASE);
+                  (unsigned long)row->base);
         return;
     }
 
@@ -409,15 +456,15 @@ void version_gate_check(void) {
         }
         DWORD ms = *(const DWORD *)(const void *)(pv + sig_off + 8);
         DWORD ls = *(const DWORD *)(const void *)(pv + sig_off + 12);
-        DWORD ems = (EXPECTED_PE_VER_HI << 16) | EXPECTED_PE_VER_LO;
-        DWORD els = (EXPECTED_PE_VER_R << 16) | EXPECTED_PE_VER_B;
+        DWORD ems = (row->pe_hi << 16) | row->pe_lo;
+        DWORD els = (row->pe_r << 16) | row->pe_b;
         if (ms != ems || ls != els) {
             _snprintf(g_version_reason, sizeof(g_version_reason),
                       "pe ver=%u.%u.%u.%u expected=%u.%u.%u.%u",
                       (unsigned)(ms >> 16), (unsigned)(ms & 0xFFFF),
                       (unsigned)(ls >> 16), (unsigned)(ls & 0xFFFF),
-                      EXPECTED_PE_VER_HI, EXPECTED_PE_VER_LO,
-                      EXPECTED_PE_VER_R, EXPECTED_PE_VER_B);
+                      (unsigned)row->pe_hi, (unsigned)row->pe_lo,
+                      (unsigned)row->pe_r, (unsigned)row->pe_b);
             return;
         }
     }

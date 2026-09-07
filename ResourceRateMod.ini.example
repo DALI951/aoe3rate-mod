@@ -13,6 +13,15 @@ PosX=12
 PosY=12
 ShowHeader=1
 ShowSlots567=0
+DecimalPlaces=1
+ShowPlusSign=1
+ShowResourceNames=1
+ShowZeroRates=1
+ShowFood=1
+ShowWood=1
+ShowCoin=1
+ShowExport=1
+PositionMode=Default
 
 [Rate]
 SampleMs=500

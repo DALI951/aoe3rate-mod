@@ -93,7 +93,7 @@ static int     g_ui_ready = 0;
 static int     g_font_guard_warned = 0;
 static int     s_font_fail_n = 0;   /* consecutive font-create fails (R16 B4) */
 static DWORD   s_ovl_draws = 0;     /* R10: completed overlay draws (600-frame heartbeat) */
-static unsigned short g_key_prev[8];
+static unsigned short g_key_prev[17];  /* 6 plain toggles + indices 6/7 (F9/scratch) + 9 Alt toggles (R11) */
 
 static void set_trace(void *dev, void **vt, int slot, const char *step);
 
@@ -140,8 +140,8 @@ static void font_destroy(void) {
 }
 
 void ui_init(void) {
-    g_key_prev[0] = g_key_prev[1] = g_key_prev[2] = g_key_prev[3] = 0;
-    g_key_prev[4] = g_key_prev[5] = g_key_prev[6] = g_key_prev[7] = 0;
+    for (size_t i = 0; i < sizeof(g_key_prev) / sizeof(g_key_prev[0]); i++)
+        g_key_prev[i] = 0;
     g_d3dx = LoadLibraryA("d3dx9_25.dll");
     g_ui_ready = (g_d3dx != NULL);
     if (!g_ui_ready) {
@@ -173,8 +173,9 @@ void ui_on_reset(void *dev) {
 
 static int ui_key_edge(int vk, int idx) {
     unsigned short now = (unsigned short)((GetAsyncKeyState(vk) & 0x8000) ? 1 : 0);
-    int edge = (idx >= 0 && idx < 8) ? (now && !g_key_prev[idx]) : now;
-    if (idx >= 0 && idx < 8) g_key_prev[idx] = now;
+    int n = (int)(sizeof(g_key_prev) / sizeof(g_key_prev[0]));
+    int edge = (idx >= 0 && idx < n) ? (now && g_key_prev[idx] == 0) : now;
+    if (idx >= 0 && idx < n) g_key_prev[idx] = now;
     return edge;
 }
 
@@ -205,9 +206,10 @@ void ui_check_hotkey(void) {
      * game window foreground AND F9 held simultaneously (R16 B2): no phantom
      * toggles when typing in chat or driving the window from elsewhere. */
     int f9_down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    int alt_down = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;  /* R11 panel-position layer */
     int fg = ui_is_foreground();
     int changed = 0;
-    if (f9_down && fg) {
+    if (f9_down && fg && !alt_down) {
         static const int keys[6] = { '1','2','3','4','5','6' };
         for (int i = 0; i < 6; i++) {
             if (!ui_key_edge(keys[i], i)) continue;
@@ -230,6 +232,31 @@ void ui_check_hotkey(void) {
                 else
                     lstrcpyA(g_settings.smoothing, "low");
                 break;
+            }
+            changed = 1;
+        }
+    }
+    /* R11: F9+Alt layer — format/visibility/position toggles. Same
+     * foreground+F9-held edge rules as the plain layer (no phantom presses
+     * while chat-typing); arbitrates on the shared edge array indices 8..16. */
+    if (f9_down && fg && alt_down) {
+        static const int keys2[9] = { '1','2','3','4','5','6','7','8','9' };
+        for (int i = 0; i < 9; i++) {
+            if (!ui_key_edge(keys2[i], 8 + i)) continue;
+            switch (i) {
+            case 0: g_settings.decimal_places++;
+                    if (g_settings.decimal_places > 3) g_settings.decimal_places = 0;
+                    break;
+            case 1: g_settings.show_plus_sign = !g_settings.show_plus_sign; break;
+            case 2: g_settings.show_resource_names = !g_settings.show_resource_names; break;
+            case 3: g_settings.show_zero_rates = !g_settings.show_zero_rates; break;
+            case 4: g_settings.show_food = !g_settings.show_food; break;
+            case 5: g_settings.show_wood = !g_settings.show_wood; break;
+            case 6: g_settings.show_coin = !g_settings.show_coin; break;
+            case 7: g_settings.show_export = !g_settings.show_export; break;
+            case 8: g_settings.position_mode++;
+                    if (g_settings.position_mode > 2) g_settings.position_mode = 0;
+                    break;
             }
             changed = 1;
         }
@@ -288,6 +315,88 @@ static void ui_format_rate(char *out, size_t n, float rate) {
         _snprintf(out, n, "%+.1f", rate);
 }
 
+/* R11: truncate a line to PANEL_LINE_MAX_CHARS visible chars + "..". No font
+ * width measurement is used here on purpose: GetTextMetricsA / GetDC sit at
+ * font-vtable slots 6 and 8, which are NOT in the proven slot set {14,16,17},
+ * so the 78-char cap is a fixed-text estimate for the hint rows (unused-byte
+ * safe: only the buffer contents change, never the DrawTextA call shape). */
+static void clip_line(char *s, size_t n) {
+    if (s == NULL || n == 0) return;
+    size_t len = strlen(s);
+    if (len <= (size_t)PANEL_LINE_MAX_CHARS) return;
+    if (n <= (size_t)PANEL_LINE_MAX_CHARS) return;
+    s[PANEL_LINE_MAX_CHARS - 2] = '.';
+    s[PANEL_LINE_MAX_CHARS - 1] = '.';
+    s[PANEL_LINE_MAX_CHARS] = '\0';
+}
+
+/* R11: single owner of the panel rect so the P0 diagnostic logs the EXACT
+ * rectangle ui_draw_backdrop paints. Position modes are corner anchors only:
+ * Default honours pos_x/pos_y, TopLeft pins 12,12, TopRight pins to the right
+ * edge using g_bb_w/g_bb_h captured by d3d9.c (0 -> falls back to TopLeft).
+ * This is a corner-anchored HUD; it is NOT a native resource-bar integration
+ * (that would need unverified render-pipeline hooks — README Known
+ * Limitations). Height covers the worst case (all rows visible), rows that are
+ * skipped (hidden resource / zero rate) just leave slack in the backdrop. */
+static void ui_panel_geometry(int *px, int *py, int *pw, int *ph) {
+    int fs = (g_settings.font_size >= 8 && g_settings.font_size <= 40)
+           ? g_settings.font_size : 14;
+    int row = fs + 5;
+    int lines = 4 + (g_settings.show_header ? 1 : 0)
+              + (g_settings.show_slots_567 ? 4 : 0) + 2;   /* 4 rows + hint x2 */
+    int w = 250;
+    int h = lines * row + 8;
+    int x, y;
+    switch (g_settings.position_mode) {
+    case 2: x = (g_bb_w > (DWORD)w) ? (int)((int)g_bb_w - w - 12) : 12;
+            y = 12;
+            break;
+    case 1: x = 12; y = 12;
+            break;
+    default: x = g_settings.pos_x; y = g_settings.pos_y;
+            break;
+    }
+    *px = x; *py = y; *pw = w; *ph = h;
+}
+
+/* R11: the seam the RATE rows (and the harness) use. Returns 1 when the line
+ * was written, 0 when the row must be SKIPPED entirely (resource hidden via
+ * its show_* switch, or zero rate with ShowZeroRates off). Slot mapping:
+ * 2->Food, 1->Wood, 0->Coin, 7->Export; any other slot_id is always eligible
+ * (pairs with the untouched slots 3..6 loop below). The name argument is the
+ * label already known at the call site; when NULL/empty and names are off the
+ * slot-number fallback "Slot%d" is used so unnamed rows stay identifiable. */
+int format_rate_line(char *out, size_t n, int slot_id, const char *name,
+                     float value, float rate, const ModSettings *s) {
+    if (s == NULL || out == NULL || n == 0) return 0;
+    int eligible = 1;
+    switch (slot_id) {
+    case 2: eligible = s->show_food;      break;
+    case 1: eligible = s->show_wood;      break;
+    case 0: eligible = s->show_coin;      break;
+    case 7: eligible = s->show_export;    break;
+    default: break;
+    }
+    if (!eligible) return 0;
+    float disp = rate * (s->use_unit_min ? 60.0f : 1.0f);
+    if (!s->show_zero_rates && disp > -0.0005f && disp < 0.0005f) return 0;
+    char name_str[32];
+    if (name != NULL && name[0] != '\0') {
+        if (s->show_resource_names)
+            lstrcpynA(name_str, name, sizeof(name_str));
+        else
+            name_str[0] = '\0';
+    } else {
+        _snprintf(name_str, sizeof(name_str), "Slot%d", slot_id);
+    }
+    int dec = s->decimal_places;
+    if (dec < 0) dec = 0; else if (dec > 3) dec = 3;
+    const char *plus = (s->show_plus_sign && disp >= 0.0f) ? "+" : "";
+    const char *unit = s->use_unit_min ? "/min" : "/s";
+    _snprintf(out, n, "%s %8.0f  %s%.*f%s", name_str, value, plus, dec, disp, unit);
+    return 1;
+}
+
 static void ui_draw_panel(void *dev) {
     /* double-guard (round-7): never call through the font unless the object AND
      * its vtable are actually mapped readable. A broken/dangling font faults
@@ -307,11 +416,11 @@ static void ui_draw_panel(void *dev) {
      * PreloadTextA and slot-15 "End" was DrawTextW, so those dispatches were
      * calling garbage. The text below (DrawTextA, slot 14) is the whole draw. */
 
+    int px, py, pw, ph;
+    ui_panel_geometry(&px, &py, &pw, &ph);
     int fs = (g_settings.font_size >= 8 && g_settings.font_size <= 40)
            ? g_settings.font_size : 14;
     int row = fs + 5;
-    int px = g_settings.pos_x;
-    int py = g_settings.pos_y;
 
     DWORD alpha = (DWORD)((g_settings.opacity * 255.0f) + 0.5f);
     if (alpha > 255) alpha = 255;
@@ -320,23 +429,7 @@ static void ui_draw_panel(void *dev) {
     DWORD text_col = UI_D3DCOLOR_ARGB(alpha, 0xFF, 0xF3, 0xD6);
     DWORD dim_col = UI_D3DCOLOR_ARGB(alpha, 0xA8, 0x90, 0x60);
 
-    char food[80], wood[80], coin[80], expo[80];
-    float rf = rate_get_ema(2), rw = rate_get_ema(1), rc = rate_get_ema(0), rx = rate_get_ema(7);
-    _snprintf(food, sizeof(food), "Food %8.0f", g_last_values[2]);
-    _snprintf(wood, sizeof(wood), "Wood %8.0f", g_last_values[1]);
-    _snprintf(coin, sizeof(coin), "Coin %8.0f", g_last_values[0]);
-    _snprintf(expo, sizeof(expo), "Export %8.0f", g_last_values[7]);
-
-    char rf_s[40], rw_s[40], rc_s[40], rx_s[40];
-    ui_format_rate(rf_s, sizeof(rf_s), rf);
-    ui_format_rate(rw_s, sizeof(rw_s), rw);
-    ui_format_rate(rc_s, sizeof(rc_s), rc);
-    ui_format_rate(rx_s, sizeof(rx_s), rx);
-    const char *un = rate_unit_label();
-
-    int lines = 4 + (g_settings.show_header ? 1 : 0) + (g_settings.show_slots_567 ? 4 : 0) + 1;
-    int pw = 250;
-    int ph = lines * row + 8;
+    const char *un = rate_unit_label();   /* slots 3..6 loop still uses ui_format_rate */
     ui_draw_backdrop(dev, px, py, pw, ph, panel_col);
 
     /* breadcrumb the font call: a fault inside DrawTextA is then nameable
@@ -349,14 +442,20 @@ static void ui_draw_panel(void *dev) {
         yy += row;
     }
     char tmp[160];
-    _snprintf(tmp, sizeof(tmp), "%s  %s%s", food, rf_s, un);
-    ui_font_draw(g_font, tmp, px + 8, yy, text_col); yy += row;
-    _snprintf(tmp, sizeof(tmp), "%s  %s%s", wood, rw_s, un);
-    ui_font_draw(g_font, tmp, px + 8, yy, text_col); yy += row;
-    _snprintf(tmp, sizeof(tmp), "%s  %s%s", coin, rc_s, un);
-    ui_font_draw(g_font, tmp, px + 8, yy, text_col); yy += row;
-    _snprintf(tmp, sizeof(tmp), "%s  %s%s", expo, rx_s, un);
-    ui_font_draw(g_font, tmp, px + 8, yy, text_col); yy += row;
+    char line[160];
+    /* R11: the four main resource rows route through format_rate_line so the
+     * per-resource visibility switches, decimal places and plus-sign settings
+     * apply uniformly (hidden or zero-rate rows skip the line AND its row). */
+    static const int slot_map[4] = { 2, 1, 0, 7 };
+    static const char *slot_names[4] = { "Food", "Wood", "Coin", "Export" };
+    for (int r = 0; r < 4; r++) {
+        if (format_rate_line(line, sizeof(line), slot_map[r], slot_names[r],
+                             g_last_values[slot_map[r]],
+                             rate_get_ema(slot_map[r]), &g_settings)) {
+            ui_font_draw(g_font, line, px + 8, yy, text_col);
+            yy += row;
+        }
+    }
 
     if (g_settings.show_slots_567) {
         for (int s = 3; s <= 6; s++) {
@@ -372,11 +471,17 @@ static void ui_draw_panel(void *dev) {
         }
     }
 
-    /* settings hint line */
+    /* settings hint lines (R11: two rows; both clip at PANEL_LINE_MAX_CHARS) */
     _snprintf(tmp, sizeof(tmp), "[%s] 1:header 2:slots 3:gains 4:%s 5:%dms 6:%s",
               g_panel_visible ? "ON" : "OFF",
               g_settings.use_unit_min ? "sec" : "min",
               g_settings.sample_ms, g_settings.smoothing);
+    clip_line(tmp, sizeof(tmp));
+    ui_font_draw(g_font, tmp, px + 8, yy, dim_col);
+    yy += row;
+    _snprintf(tmp, sizeof(tmp),
+              "Alt+1:dps 2:plus 3:names 4:zeror 5:food 6:wood 7:coin 8:exp 9:pos");
+    clip_line(tmp, sizeof(tmp));
     ui_font_draw(g_font, tmp, px + 8, yy, dim_col);
 
     set_step("ovl-panel"); /* font draws done — back on the device view */
@@ -547,7 +652,25 @@ void ui_draw(void) {
         srs(dev, D3DRS_ZENABLE, st_z);
     }
     if (crel != NULL) crel(cur);   /* release our GetRenderTarget reference */
-    if (!g_ovl_first_done) { g_ovl_first_done = 1; dlog("ovl first draw ok frame=%d", g_frames_since_reset); }
+    if (!g_ovl_first_done) {
+        dlog("ovl first draw ok frame=%d", g_frames_since_reset);
+        /* R11 P0: ONE-SHOT render diagnostic (debug-gated, so a shipped
+         * DebugEnabled=0 run logs nothing extra). The nested
+         * "!g_ovl_first_done" is still true here — the flag is set AFTER this
+         * block. Logs the CURRENT render target (the released pointer value
+         * only, never dereferenced) plus the exact panel rect/alpha that
+         * ui_draw_panel used this same frame. */
+        if (!g_ovl_first_done && g_settings.debug_enabled) {
+            int dpx, dpy, dpw, dph;
+            ui_panel_geometry(&dpx, &dpy, &dpw, &dph);
+            DWORD dal = (DWORD)((g_settings.opacity * 255.0f) + 0.5f);
+            if (dal > 255) dal = 255;
+            dlog("ovl diag rt=%p rect=%ld,%ld:%ldx%ld alpha=0x%lX",
+                 cur, (long)dpx, (long)dpy, (long)dpw, (long)dph,
+                 (unsigned long)dal);
+        }
+        g_ovl_first_done = 1;
+    }
     /* ROUND 10 heartbeat: every 600 completed draws (~10s at 60fps) prove the
      * draw path is STILL completing long after first-frame — not debug-gated
      * (max ~6 lines/min), value/res reads reuse what ui_draw already has. */

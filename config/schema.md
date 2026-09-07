@@ -15,13 +15,25 @@ PosX = 12                    ; int — panel top-left X
 PosY = 12                    ; int — panel top-left Y
 ShowHeader = 1               ; int 0/1
 ShowSlots567 = 0             ; int 0/1 — show unknown slots 3..6 when nonzero
+DecimalPlaces = 1            ; int 0..3 — rate decimals ("+2"/"+2.4"/"+2.37"/"+2.375")
+ShowPlusSign = 1             ; int 0/1 — "+" prefix on positive rates
+ShowResourceNames = 1        ; int 0/1 — resource labels (Food/Wood/Coin/Export)
+ShowZeroRates = 1            ; int 0/1 — hide rows whose rate is ~0 (row skipped)
+ShowFood = 1                 ; int 0/1 — Food row visible
+ShowWood = 1                 ; int 0/1 — Wood row visible
+ShowCoin = 1                 ; int 0/1 — Coin row visible
+ShowExport = 1               ; int 0/1 — Export row visible
+PositionMode = Default       ; Default (PosX/PosY) | TopLeft (12,12) | TopRight
+                             ;   (right edge of the backbuffer; needs the DLL to
+                             ;    have seen a CreateDevice/Reset to know the size)
 
 [Rate]
 SampleMs = 500               ; int 100..1000 — ring-sample interval (game-time ms)
 Smoothing = med              ; low|med|high — EMA alpha 0.1 / 0.2 / 0.4
 Unit = min                   ; min|sec — display "+x.x" per minute or per second
-UseGameTime = 1              ; int 0/1 — clock source; 1 = game tick (1 tick = 1 ms),
-                             ;            0 = realtime (QueryPerformanceCounter)
+UseGameTime = 1              ; int 0/1 — REMNANT switch: both modes wall-clock QPC;
+                             ;            s_tick is a per-Present frame counter, not
+                             ;            game time (see README Known Limitations)
 DiscontinuityRatio = 3.0     ; float — spending spike: skip sample when the instant
                              ;           negative rate exceeds EMA * this ratio
 ShowGains = 1                ; int 0/1 — positive jumps (instant gains) counted

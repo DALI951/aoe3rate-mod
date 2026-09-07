@@ -399,6 +399,92 @@ static void test_fault_filters(void) {
           "vectored filter: NULL pointers -> CONTINUE_SEARCH safe");
 }
 
+/* ---- R11 STEP: format_rate_line + version table ---- */
+static void test_format_line(void) {
+    ModSettings def;
+    memset(&def, 0, sizeof(def));
+    def.use_unit_min = 1;
+    def.decimal_places = 1;
+    def.show_plus_sign = 1;
+    def.show_resource_names = 1;
+    def.show_zero_rates = 1;
+    def.show_food = 1; def.show_wood = 1; def.show_coin = 1; def.show_export = 1;
+
+    char b[96];
+
+    /* defaults: Food, value 100, +2.0, /min */
+    int r = format_rate_line(b, sizeof(b), 2, "Food", 100.0f, 2.0f/60.0f, &def);
+    CHECK(r == 1 && strstr(b, "Food") != NULL && strstr(b, "100") != NULL &&
+          strstr(b, "+2.0") != NULL && strstr(b, "/min") != NULL,
+          "R11: format_rate_line defaults (Food 100 +2.0/min)");
+
+    /* decimal places 0..3, and out-of-range clamp to 3 */
+    for (int d = 0; d <= 3; d++) {
+        def.decimal_places = d;
+        format_rate_line(b, sizeof(b), 1, "Wood", 60.0f, 2.0f/60.0f, &def);
+        char chk[16];
+        if (d == 0) lstrcpyA(chk, "+2");
+        else _snprintf(chk, sizeof(chk), "+2.%.*s", d, "000");
+        CHECK(strstr(b, chk) != NULL, "R11: decimal_places precision respected");
+    }
+    def.decimal_places = 5;
+    format_rate_line(b, sizeof(b), 1, "Wood", 60.0f, 2.0f/60.0f, &def);
+    CHECK(strstr(b, "+2.000") != NULL, "R11: decimal_places clamped to 3");
+
+    /* plus sign off: positive rate strips the '+' (negative keeps '-') */
+    def.decimal_places = 1;
+    def.show_plus_sign = 0;
+    format_rate_line(b, sizeof(b), 1, "Wood", 60.0f, 2.0f/60.0f, &def);
+    CHECK(strstr(b, "2.0/min") != NULL && strstr(b, "+2") == NULL,
+          "R11: show_plus_sign=0 strips '+' on positive rates");
+    format_rate_line(b, sizeof(b), 1, "Wood", 60.0f, -2.0f/60.0f, &def);
+    CHECK(strstr(b, "-2.0") != NULL, "R11: negative rate always keeps '-'");
+    def.show_plus_sign = 1;
+
+    /* NULL name + names off -> Slot%d fallback (still readable) */
+    def.show_resource_names = 0;
+    format_rate_line(b, sizeof(b), 2, NULL, 100.0f, 2.0f/60.0f, &def);
+    CHECK(strstr(b, "Slot2") != NULL, "R11: NULL name falls back to Slot2");
+    def.show_resource_names = 1;
+
+    /* zero-rate suppression */
+    def.show_zero_rates = 0;
+    CHECK(format_rate_line(b, sizeof(b), 2, "Food", 100.0f, 0.0f, &def) == 0,
+          "R11: show_zero_rates=0 hides a zero-rate row (returns 0)");
+    CHECK(format_rate_line(b, sizeof(b), 2, "Food", 100.0f, 3.0f, &def) == 1,
+          "R11: show_zero_rates=0 keeps a nonzero row");
+    def.show_zero_rates = 1;
+
+    /* per-resource visibility */
+    def.show_food = 0;
+    CHECK(format_rate_line(b, sizeof(b), 2, "Food", 100.0f, 2.0f/60.0f, &def) == 0,
+          "R11: show_food=0 hides Food (slot 2)");
+    def.show_food = 1;
+    CHECK(format_rate_line(b, sizeof(b), 2, "Food", 100.0f, 2.0f/60.0f, &def) == 1,
+          "R11: show_food=1 keeps Food (slot 2)");
+
+    /* sec unit: no *60, rate as-is, /s suffix */
+    def.use_unit_min = 0;
+    format_rate_line(b, sizeof(b), 2, "Food", 100.0f, 3.0f, &def);
+    CHECK(strstr(b, "+3.0") != NULL && strstr(b, "/s") != NULL && strstr(b, "/min") == NULL,
+          "R11: use_unit_min=0 -> per-second, no *60");
+    def.use_unit_min = 1;
+
+    /* tiny buffer: long value/rate stays inside */
+    float big = 123456789.0f;
+    format_rate_line(b, 48, 2, "Food", big, big * 60.0f, &def);
+    CHECK(strlen(b) < 48, "R11: long value/rate stays inside a 48-byte buffer");
+
+    /* version table row 0 = TAD 1.0.8 pinned to the EXPECTED_* macros */
+    CHECK(g_versions[0].size == EXPECTED_EXE_SIZE &&
+          g_versions[0].base == EXPECTED_IMAGE_BASE,
+          "R11: g_versions[0] pins TAD size + image base from EXPECTED_*");
+    CHECK(g_versions[0].label != NULL && strcmp(g_versions[0].label, "TAD 1.0.8") == 0,
+          "R11: g_versions[0] labeled TAD 1.0.8");
+    CHECK(g_versions[1].label == NULL && g_versions[1].size == 0,
+          "R11: g_versions[1] is an uncaptured TODO row (label NULL)");
+}
+
 int main(void) {
     tracker_init();
     test_rate_game_time();
@@ -413,6 +499,8 @@ int main(void) {
     test_observer_rates_line();
     printf("---\n");
     test_ui_guards();
+    printf("---\n");
+    test_format_line();
     printf("---\n");
     test_fault_filters();
     printf("\nFAILURES: %d\n", failures);

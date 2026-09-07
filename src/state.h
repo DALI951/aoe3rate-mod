@@ -58,7 +58,10 @@ extern int     g_frames_since_reset;
 #define RESET_COOLDOWN_FRAMES 30   /* ~0.5s @60fps of no-draw after Create/Reset */
 extern int     g_player_idx;
 extern int     s_snap_have;
-extern DWORD   g_obs_player;
+extern DWORD g_obs_player;
+extern DWORD g_bb_w;   /* R11: latest backbuffer width (0 = not captured yet) */
+extern DWORD g_bb_h;   /* R11: latest backbuffer height */
+#define PANEL_LINE_MAX_CHARS 78   /* R11: fixed-cap hint-line truncation (see ui.c) */
 extern DWORD   s_last_ctx;
 extern DWORD   s_last_player;
 extern int     s_last_n;
@@ -160,6 +163,15 @@ typedef struct {
     int    pos_y;
     int    show_header;
     int    show_slots_567;
+    int    decimal_places;       /* R11: 0..3 display decimals for the RATE (default 1 = current %.1f) */
+    int    show_plus_sign;       /* R11: 1 = '+' mark for non-negative rates (current) */
+    int    show_resource_names;  /* R11: 1 = "Food"/"Wood"/"Coin"/"Export"; 0 = "Slot%d" */
+    int    show_zero_rates;      /* R11: 1 = current (always draw); 0 = hide |display|<0.0005 */
+    int    show_food;            /* R11: per-resource row visibility (independent of ShowSlots567) */
+    int    show_wood;
+    int    show_coin;
+    int    show_export;
+    int    position_mode;        /* R11: 0=Default(PosX/PosY) 1=TopLeft 2=TopRight */
     int    sample_ms;
     char   smoothing[16];
     int    use_unit_min;
@@ -195,6 +207,8 @@ void ui_toggle_panel(void);
 void ui_check_hotkey(void);
 int  ui_ready(void);                            /* R10: d3dx9_25.dll loaded accessor */
 int  ui_gdi_fallback_draw(void);                /* R10: red GDI line when overlay disabled */
+int  format_rate_line(char *out, size_t n, int slot_id, const char *name,
+                      float value, float rate, const ModSettings *s);   /* R11 seam */
 #ifdef SWARM_TEST
 void ui_test_set_ready(int v);                  /* R10 harness seam: force g_ui_ready */
 #endif
