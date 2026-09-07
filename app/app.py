@@ -28,11 +28,80 @@ from parser import parse_line        # noqa: E402
 from engine import RateEngine        # noqa: E402
 
 import datetime                      # noqa: E402
+import queue                         # noqa: E402
 import threading                     # noqa: E402
 import time                          # noqa: E402
 import traceback                     # noqa: E402
 
 ERROR_LOG = os.path.join(_HERE, "app.error.log")
+
+# ---- R25: log-path auto-detection ------------------------------------------
+# config.py's log_path default predates this PC's move of the game install to
+# Documents\gaames (note the missing "gaames" segment). Rather than touch Dali's
+# config.py, the app resolves the ACTIVE path itself: the configured/--log path
+# has priority, then the real game install here, then the shipped config default,
+# then rates.log in the CWD. A path only wins if the file exists AND was written
+# within FRESH_SEC — nothing is locked in, the choice is re-made every probe so a
+# dead/stale path never holds the app hostage.
+_DEFAULT_LOG_PATH = CONFIG.log_path          # the shipped config.py default
+_FALLBACK_RATES = [
+    r"C:\Users\Dali\Documents\gaames\Age of Empires III - Complete Collection\rates.log",
+    _DEFAULT_LOG_PATH,
+    os.path.join(os.getcwd(), "rates.log"),
+]
+FRESH_SEC = 60.0                              # file must have been written recently
+_PROBE_SEC = 1.0                              # path re-check cadence in the reader
+_STALE_SEC = 5.0                              # footer flips to "no new samples"
+
+
+def _pick_log_path(primary=None, now=None):
+    """The path to tail right now, or None to keep polling.
+
+    1. If the configured/--log path (`primary`) exists AND is fresh it wins
+       (explicit user intent outranks auto-detection).
+    2. Otherwise scan the auto-fallback candidates in order and pick the FIRST
+       whose file exists AND was written within FRESH_SEC — the real fix for
+       this PC, where config.py's default predates the move of the install to
+       Documents\\gaames.
+    3. If nothing fresh exists but the configured path does, fall back to it
+       (an explicit --log to an existing file is always honored) — the footer's
+       liveness state makes staleness visible.
+    4. Else None -> keep polling (nothing exists yet; the game has not been
+       launched, or its log is old).
+    """
+    now = time.time() if now is None else now
+
+    def fresh(path):
+        try:
+            return os.path.exists(path) and \
+                   (now - os.path.getmtime(path)) <= FRESH_SEC
+        except OSError:
+            return False
+
+    if primary is not None and fresh(primary):
+        return primary
+    for path in _FALLBACK_RATES:
+        if path == primary:
+            continue
+        if fresh(path):
+            return path
+    try:
+        if primary is not None and os.path.exists(primary):
+            return primary
+    except OSError:
+        pass
+    return None
+
+
+def _staleness_text(has_data, last_at, now=None):
+    """Footer text for the liveness state. has_data = engine has values;
+    last_at = wall-clock time of the last accepted line (or None)."""
+    now = time.time() if now is None else now
+    if has_data and last_at is not None and (now - last_at) <= _STALE_SEC:
+        return "live"
+    if has_data:
+        return "stale"
+    return "none"
 
 
 def _log_error(exc, where):
@@ -59,26 +128,76 @@ T_FG = "#556677"
 FONT = ("Consolas", 16, "bold")
 
 
-def _run_loop(stdout_emit, engine):
-    """Tail CONFIG.log_path -> parse -> engine.update -> emit(record) per line.
-    Runs in its own thread so the GUI timer is what repaints. Any fault is
-    logged (not silent under pythonw) and the loop keeps polling."""
+def _spawn_follow(path, out_q, tag):
+    """Run filer.follow() on `path` in a daemon thread, pushing (tag, raw)
+    tuples into out_q so the reader can switch paths without losing a line.
+    On path change the old worker is simply abandoned (daemon; it drifts off
+    when the stale path stops delivering — harmless)."""
+    def run():
+        try:
+            for raw in follow(path, CONFIG.tail_poll_sec):
+                out_q.put((tag, raw))
+        except Exception:
+            pass
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _run_loop(stdout_emit, engine, status, announce=None):
+    """Tail the ACTIVE rates.log path -> parse -> engine.update -> emit(record).
+
+    The path is re-resolved every _PROBE_SEC against the candidate list, so the
+    app follows the game's rates.log even when Dali's config.log_path is wrong
+    for this PC or the file appears late — and never stays pinned to a stale
+    path. `status` carries {path, last_at} for the GUI footer; `announce` (if
+    any) is a console callback. Any fault is logged (not silent under pythonw)
+    and the loop keeps polling."""
+    out_q = queue.Queue()
+    path = None
+    tag = 0
     while True:
         try:
-            for raw in follow(CONFIG.log_path, CONFIG.tail_poll_sec):
-                try:
-                    parsed = parse_line(raw)
-                    if parsed is None:
-                        continue
-                    t_sec, values = parsed
-                    engine.update(t_sec, values)
-                    stdout_emit(engine)
-                except Exception as exc:
-                    _log_error(exc, "_run_loop(line=%r)" % raw[:80])
+            now = time.time()
+            want = _pick_log_path(CONFIG.log_path, now=now)
+            if want != path:
+                _announce_path_change(announce, path, want)
+                path = want
+                if path is not None:
+                    tag += 1
+                    _spawn_follow(path, out_q, tag)
+            status["path"] = path
+            if path is None:
+                time.sleep(_PROBE_SEC)
+                continue
+            try:
+                raw = out_q.get(timeout=_PROBE_SEC)
+            except queue.Empty:
+                continue
+            if raw[0] != tag:
+                continue           # stale worker line from the old path
+            try:
+                parsed = parse_line(raw[1])
+                if parsed is None:
                     continue
+                t_sec, values = parsed
+                engine.update(t_sec, values)
+                status["last_at"] = time.time()
+                stdout_emit(engine)
+            except Exception as exc:
+                _log_error(exc, "_run_loop(line=%r)" % raw[1][:80])
+                continue
         except Exception as exc:
             _log_error(exc, "_run_loop(follow)")
             time.sleep(1.0)
+
+
+def _announce_path_change(announce, prev, now):
+    """One console line per path change when --console is active."""
+    if announce is None or prev == now:
+        return
+    if prev is None and now is not None:
+        announce(f"[app] using rates.log: {now}")
+    elif now is None:
+        announce("[app] no fresh rates.log — polling candidates…")
 
 
 def emit_console(engine):
@@ -93,8 +212,10 @@ def emit_console(engine):
     print(f"t={t:8.2f}s  " + "  ".join(parts))
 
 
-def build_window(items_tk, engine, log_path):
-    """Return the Tk root + per-resource (value label, rate label) widgets."""
+def build_window(items_tk, engine, log_path, status):
+    """Return the Tk root + per-resource (value, rate, spend) widgets.
+    `status` (a dict shared with the reader thread) carries the ACTIVE path and
+    the wall-clock time of the last accepted record for the liveness footer."""
     tk = items_tk
 
     root = tk.Tk()
@@ -118,7 +239,9 @@ def build_window(items_tk, engine, log_path):
         val.pack(side="left")
         rate = tk.Label(row, text="", bg=BG, fg=GREEN, font=FONT)
         rate.pack(side="left")
-        rows.append((res, val, rate))
+        spend = tk.Label(row, text="", bg=BG, fg=RED, font=("Consolas", 10))
+        spend.pack(side="left")
+        rows.append((res, val, rate, spend))
 
     foot = tk.Label(root, text=f"waiting for {log_path}…", bg=BG, fg=T_FG,
                     font=("Consolas", 8))
@@ -135,7 +258,7 @@ def build_window(items_tk, engine, log_path):
     def move(ev):
         root.geometry(f"+{ev.x_root - drag['x']}+{ev.y_root - drag['y']}")
 
-    for w in [root] + [v for _r, v, _rt in rows] + [foot]:
+    for w in [root] + [v for _r, v, _rt, _sp in rows] + [foot]:
         w.bind("<Button-1>", press)
         w.bind("<B1-Motion>", move)
 
@@ -144,7 +267,7 @@ def build_window(items_tk, engine, log_path):
     def poke():
         rec = engine.raw
         res_map = rec.get("resources", {})
-        for res, val_lab, rate_lab in rows:
+        for res, val_lab, rate_lab, spend_lab in rows:
             r = res_map.get(res)
             if r is not None:
                 last[res] = r                              # remember last good
@@ -152,13 +275,27 @@ def build_window(items_tk, engine, log_path):
             if r is None:
                 val_lab.configure(text="…")                # never blank-out:
                 rate_lab.configure(text="")               # keep last known once
-                continue                                  # we have data
+                spend_lab.configure(text="")              # we have data
+                continue
             val_lab.configure(text=f"{r['value']:.0f}")
             txt = r["formatted"] or "0"
             fg = RED if r["rate"] < 0 else GREEN
             rate_lab.configure(text=txt, fg=fg)
-        if res_map:
-            foot.configure(text=f"t={rec['t']:.2f}s — {log_path}")
+            # R25 spend suffix: the engine records spent events/min per resource
+            # (rec['spent_min']); show a red "-N/min spent" when nonzero this
+            # window. If a record ever lacks the field, leave it empty.
+            spent_min = r.get("spent_min", 0.0) or 0.0
+            if spent_min > 0:
+                spend_lab.configure(text=f"-{spent_min:.0f}/min spent")
+            else:
+                spend_lab.configure(text="")
+        state = _staleness_text(bool(res_map), status.get("last_at"))
+        active = status.get("path") or log_path
+        if state == "live":
+            foot.configure(text=f"t={rec['t']:.2f}s — {active}", fg=T_FG)
+        elif state == "stale":
+            foot.configure(text="waiting for rates.log … (no new samples)",
+                           fg=T_FG)
         else:
             foot.configure(text="Waiting for data… (start a match)",
                            fg=LABEL_FG)
@@ -181,16 +318,19 @@ def run_gui(engine, log_path):
         run_console(engine)
         return
 
-    root = build_window(tk, engine, log_path)
-    t = threading.Thread(target=_run_loop, args=(emit_console, engine),
+    status = {"path": None, "last_at": None}
+    root = build_window(tk, engine, log_path, status)
+    t = threading.Thread(target=_run_loop, args=(emit_console, engine, status),
                          daemon=True)
     t.start()
     root.mainloop()
 
 
 def run_console(engine):
-    print(f"reading {CONFIG.log_path}…")
-    t = threading.Thread(target=_run_loop, args=(emit_console, engine),
+    status = {"path": None, "last_at": None}
+    print(f"reading {CONFIG.log_path}…", flush=True)
+    t = threading.Thread(target=_run_loop,
+                         args=(emit_console, engine, status, print),
                          daemon=True)
     t.start()
     waited = 0

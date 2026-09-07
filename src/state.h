@@ -188,6 +188,7 @@ typedef struct {
     float  discontinuity_ratio;
     int    show_gains;
     int    debug_enabled;
+    int    player_idx;          /* R25: [General] PlayerIdx (-1=auto, else force player index) */
 } ModSettings;
 extern ModSettings g_settings;
 extern int g_panel_visible;

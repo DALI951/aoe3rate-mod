@@ -4,6 +4,7 @@
 Enabled=1
 Hotkey=0x78
 StartHidden=0
+PlayerIdx=-1  ; -1=auto, else force human player index (e.g. 1 for SP skirmish)
 
 [Display]
 FontName=

@@ -518,6 +518,29 @@ static int   s_last_diag_idx  = -1;    /* last diag'd selected index */
 static int   s_last_diag_n    = -1;    /* last diag'd player count */
 static int   s_last_diag_lock = -1;    /* last diag'd lock state */
 
+/* R25: carry whether the chain/base was previously seen non-null so a
+ * mid-match no-candidate skip can be distinguished from the very first read
+ * (menu) and logged (debug-gated) at most once per 10 skips. */
+static int   s_prev_seen      = 0;     /* saw a live chain before this sample */
+static int   s_skip_log_n     = 0;     /* consecutive no-candidate skips */
+
+/* R25: reset ALL persistent selection statics when the chain is detected
+ * broken (ctx==0 / n==0 / no players) so the next match re-locks fresh instead
+ * of carrying a stale player from a previous match. */
+static void r25_reset_lock(void) {
+    s_lock_idx       = -1;
+    s_lock_rule_init = 0;
+    s_lock_rule[0]   = '\0';
+    s_last_diag_idx  = -1;
+    s_last_diag_n    = -1;
+    s_last_diag_lock = -1;
+    for (int i = 0; i < EXPORT_MAX_CANDS; i++) {
+        g_export_cands[i].idx = -1;
+        g_export_cands[i].prev = 0.0f;
+        g_export_cands[i].big_drops = 0;
+    }
+}
+
 int resolve_export_player(DWORD base, int limit, DWORD *out_res, int *out_idx) {
     g_export_ncand = 0;
     g_export_n = 0;
@@ -541,7 +564,20 @@ int resolve_export_player(DWORD base, int limit, DWORD *out_res, int *out_idx) {
             }
         }
     }
-    if (n <= 0 || arr == 0) return 0;
+
+    /* R25: a broken chain (menu/loading/no players) means the previous match
+     * ended — reset the lock so the next match re-acquires fresh. Only when
+     * the chain was previously live (a real break, not the initial read). */
+    if (n <= 0 || arr == 0) {
+        if (s_prev_seen) {
+            if (g_settings.debug_enabled)
+                dlog("R25 lock reset (chain break)");
+            r25_reset_lock();
+        }
+        s_prev_seen = 0;
+        return 0;
+    }
+    s_prev_seen = 1;
 
     /* per-candidate totals + prev-tracking + big-drop count.
      * The static g_export_cands[] array persists across calls; candidate slots
@@ -569,12 +605,64 @@ int resolve_export_player(DWORD base, int limit, DWORD *out_res, int *out_idx) {
         g_export_cands[c].total = total;
         g_export_ncand++;
     }
-    if (g_export_ncand == 0) return 0;
+
+    /* R25 export-skip visibility: no candidate while the chain was previously
+     * live (a mid-match freeze, NOT the menu's very first read) -> log a
+     * debug-gated line at most once per 10 consecutive skips. NEVER rates.log
+     * (that stays 100% Dali-spec); this goes to the d3d9mod.log only. */
+    if (g_export_ncand == 0) {
+        s_skip_log_n++;
+        if (g_settings.debug_enabled && s_skip_log_n % 10 == 1) {
+            dlog("R25 export skip: idx=%d n=%d", s_lock_idx, g_export_n);
+        }
+        return 0;
+    }
 
     /* --- selection rules (first match wins) --- */
     int sel_idx = -1;
     const char *rule = "first";
     DWORD sel_res = 0;
+
+    /* rule 0 (R25): [General] PlayerIdx override. If a forced human index is
+     * configured and it is a live nonzero candidate this sample, use it
+     * EXCLUSIVELY — skip the lock/spend-switch logic entirely. If the forced
+     * index is out of range / not a candidate (zero/garbage), fall back to the
+     * auto rules (debug-gated note). */
+    if (g_settings.player_idx >= 0) {
+        int found_forced = 0;
+        for (int k = 0; k < g_export_ncand; k++) {
+            if (g_export_cands[k].idx == g_settings.player_idx &&
+                g_export_cands[k].total != 0.0f) {
+                sel_idx = g_export_cands[k].idx;
+                rule = "PlayerIdx";
+                found_forced = 1;
+                break;
+            }
+        }
+        if (!found_forced) {
+            if (g_settings.debug_enabled)
+                dlog("R25 PlayerIdx=%d not usable (idx=%d n=%d); falling back to auto",
+                     g_settings.player_idx, g_export_ncand, g_export_n);
+        } else {
+            /* forced: resolve + lock without spend-switch */
+            s_lock_idx = sel_idx;
+            s_lock_rule_init = 1;
+            _snprintf(s_lock_rule, sizeof(s_lock_rule), "%s", rule);
+            sel_res = 0;
+            for (int i = 0; i < n; i++) {
+                DWORD p = safe_r32(arr + (DWORD)i * 4);
+                if (p == 0) continue;
+                DWORD r = safe_r32(p + OFF_PLAYER_RES);
+                DWORD ic = safe_r32(p + OFF_PLAYER_INCOME);
+                if (r == 0 || ic == 0) continue;
+                if (i == sel_idx) { sel_res = r; break; }
+            }
+            if (sel_res == 0) return 0;
+            if (out_res) *out_res = sel_res;
+            if (out_idx) *out_idx = sel_idx;
+            return 1;
+        }
+    }
 
     /* rule 1: locked index still present this sample */
     if (s_lock_idx >= 0) {

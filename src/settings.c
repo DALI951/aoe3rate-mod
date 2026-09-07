@@ -40,6 +40,7 @@ static void settings_defaults(void) {
     s->discontinuity_ratio = 3.0f;
     s->show_gains          = 1;
     s->debug_enabled       = 0;
+    s->player_idx          = -1;
 }
 
 static int ini_get_bool(const char *v, int dflt) {
@@ -191,6 +192,7 @@ static void profile_apply(void) {
         if (!strcmp(key, "Enabled"))            s->enabled = ini_get_bool(value, s->enabled);
         else if (!strcmp(key, "Hotkey"))        s->hotkey = ini_get_int(value, s->hotkey);
         else if (!strcmp(key, "StartHidden"))   s->start_hidden = ini_get_bool(value, s->start_hidden);
+        else if (!strcmp(key, "PlayerIdx"))     { int n = ini_get_int(value, s->player_idx); if (n < -1) n = -1; if (n > 255) n = 255; s->player_idx = n; }
         else if (!strcmp(key, "FontSize"))      s->font_size = ini_get_int(value, s->font_size);
         else if (!strcmp(key, "Opacity"))       s->opacity = ini_get_float(value, s->opacity);
         else if (!strcmp(key, "PosX"))          s->pos_x = ini_get_int(value, s->pos_x);
@@ -276,6 +278,7 @@ void settings_load(void) {
             if (!strcmp(key, "Enabled"))        s->enabled = ini_get_bool(val, s->enabled);
             else if (!strcmp(key, "Hotkey"))    s->hotkey = ini_get_int(val, s->hotkey);
             else if (!strcmp(key, "StartHidden")) s->start_hidden = ini_get_bool(val, s->start_hidden);
+            else if (!strcmp(key, "PlayerIdx")) { int n = ini_get_int(val, s->player_idx); if (n < -1) n = -1; if (n > 255) n = 255; s->player_idx = n; }
         } else if (!strcmp(section, "Display")) {
             if (!strcmp(key, "FontName"))       lstrcpynA(s->font_name, val, sizeof(s->font_name));
             else if (!strcmp(key, "FontSize"))  s->font_size = ini_get_int(val, s->font_size);
@@ -324,6 +327,7 @@ void settings_save(void) {
             "Enabled=%d\r\n"
             "Hotkey=0x%X\r\n"
             "StartHidden=%d\r\n"
+            "PlayerIdx=%d\r\n"
             "\r\n"
             "[Display]\r\n"
             "FontName=%s\r\n"
@@ -354,7 +358,7 @@ void settings_save(void) {
             "[Debug]\r\n"
             "Enabled=%d\r\n"
             "\r\n",
-            s->enabled, (unsigned)s->hotkey, s->start_hidden,
+            s->enabled, (unsigned)s->hotkey, s->start_hidden, s->player_idx,
             s->font_name, s->font_size, s->opacity,
             s->pos_x, s->pos_y, s->show_header, s->show_slots_567,
             s->decimal_places, s->show_plus_sign, s->show_resource_names,

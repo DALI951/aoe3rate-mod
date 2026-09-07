@@ -1,6 +1,7 @@
 /*
  * test_r24_selection.c — independent SWARM harness for ROUND 24's selection
- * logic: `resolve_export_player()` in src/gameif.c.
+ * logic in src/gameif.c, extended in R25 for the [General] PlayerIdx override,
+ * the match-end lock reset, and the PlayerIdx-unusable fallback.
  *
  * R24 changed player selection from "pick the LARGEST total each sample"
  * (which FLIPPED between idx1/idx2 as the leader changed) to a STABLE human
@@ -8,6 +9,15 @@
  * spend-signature switch and a no-candidate skip. This harness verifies the
  * RUNTIME behaviour (the actual selection decisions over repeated samples),
  * not just that the strings/symbols exist.
+ *
+ * R25 addition: [General] PlayerIdx (gameif.c rule 0) forces a specific
+ * player index and uses it EXCLUSIVELY (the spend-signature switch is
+ * skipped); an unusable index (out of range / empty player) falls back to the
+ * auto rules. When the chain breaks mid-session (menu/load) all persistent
+ * selection statics are reset so the next match re-locks fresh.
+ *
+ * Build (from tests dir):
+ *   i686-w64-mingw32-gcc.exe test_r24_selection.c -o test_r24_selection.exe -luser32 -lwinmm
  *
  * Plan requirements asserted (R24, .swarm/BUILD.md):
  *   (a) STABLE LOCK instead of max-total flip — once idx1 is locked, a higher
@@ -17,9 +27,6 @@
  *       sample), the lock switches to that candidate.
  *   (c) NO-CANDIDATE SKIP — when every player's chain/res is zero/garbage the
  *       resolver returns 0 (write NOTHING), not a zero line.
- *
- * Build (from tests dir):
- *   i686-w64-mingw32-gcc.exe test_r24_selection.c -o test_r24_selection.exe -luser32 -lwinmm
  */
 #define SWARM_TEST
 #define WIN32_LEAN_AND_MEAN
@@ -107,7 +114,7 @@ static LPVOID make_world(int n, const int *valid,
     return p;
 }
 
-/* reset the R24 persistent selection state between scenarios. Because this
+/* reset the R24/R25 persistent selection state between scenarios. Because this
  * harness #includes the real d3d9.c in the SAME translation unit, the
  * file-scope statics are directly reachable here. */
 static void reset_r24_state(void) {
@@ -124,6 +131,10 @@ static void reset_r24_state(void) {
     }
     g_export_ncand = 0;
     g_export_n = 0;
+    s_prev_seen = 0;
+    s_skip_log_n = 0;
+    g_settings.player_idx = -1;   /* R25: back to auto between scenarios */
+    g_settings.debug_enabled = 0; /* harness runs the default quiet path */
 }
 
 /* =====================================================================
@@ -330,6 +341,178 @@ static void test_no_candidate_skip(void) {
 }
 
 /* =====================================================================
+ * R25: [General] PlayerIdx override — FORCED index wins EXCLUSIVELY.
+ * PlayerIdx=2 while idx1 is the "obvious" human: the forced index beats rule 2
+ * (sp_locked on idx1) AND survives a spend-signature situation that would
+ * switch an auto lock away from the tracked player.
+ * ===================================================================== */
+static void test_playeridx_forced(void) {
+    reset_r24_state();
+    g_settings.player_idx = 2;
+    /* idx0 empty, idx1 total 100, idx2 total 40 (idx2 is NOT the natural pick) */
+    int valid[3] = {0, 1, 1};
+    float food[3] = {0, 100.0f, 40.0f};
+    float wood[3] = {0, 0, 0};
+    float coin[3] = {0, 0, 0};
+    float expo[3] = {0, 0, 0};
+    LPVOID img = make_world(3, valid, food, wood, coin, expo);
+    if (!img) { printf("FAIL: alloc (playeridx_forced)\n"); failures++; return; }
+    DWORD b = (DWORD)(DWORD_PTR)img;
+    g_base = img;
+
+    DWORD res = 0; int idx = -1;
+    CHECK(resolve_export_player(b, EXPORT_MAX_CANDS, &res, &idx) == 1,
+          "(R25 forced) s1: resolves");
+    CHECK(idx == 2, "(R25 forced) s1: PlayerIdx=2 chosen though auto rules would pick idx1");
+    CHECK(res != 0, "(R25 forced) s1: out_res points at idx2's resource container");
+    CHECK(strcmp(s_lock_rule, "PlayerIdx") == 0,
+          "(R25 forced) s1: lock rule recorded as PlayerIdx");
+    CHECK(s_lock_idx == 2, "(R25 forced) s1: lock set to 2");
+
+    /* idx2 (forced) accumulates 2 big drops (150->60, 110->20) while idx1
+     * climbs smoothly at 100. Under the auto rules the spend-signature switch
+     * would move the lock to idx1 (track=0, other>=2). Forced must NOT switch. */
+    set_encrypted_slot(b + 0x4000 + 2*0x1000 + 0x300, 2, 150.0f, KEY_BYTES);
+    resolve_export_player(b, EXPORT_MAX_CANDS, &res, &idx);   /* prev 150 */
+    idx = -1;
+    set_encrypted_slot(b + 0x4000 + 2*0x1000 + 0x300, 2, 60.0f, KEY_BYTES);
+    resolve_export_player(b, EXPORT_MAX_CANDS, &res, &idx);   /* big drop #1 */
+    idx = -1;
+    set_encrypted_slot(b + 0x4000 + 2*0x1000 + 0x300, 2, 110.0f, KEY_BYTES);
+    resolve_export_player(b, EXPORT_MAX_CANDS, &res, &idx);   /* climb */
+    idx = -1;
+    set_encrypted_slot(b + 0x4000 + 2*0x1000 + 0x300, 2, 20.0f, KEY_BYTES);
+    CHECK(resolve_export_player(b, EXPORT_MAX_CANDS, &res, &idx) == 1,
+          "(R25 forced) switch-sample: resolves");
+    CHECK(idx == 2, "(R25 forced) switch-sample: PlayerIdx lock HOLDS (spend-signature switch skipped)");
+    CHECK(strcmp(s_lock_rule, "PlayerIdx") == 0,
+          "(R25 forced) switch-sample: rule still PlayerIdx");
+
+    VirtualFree(img, 0, MEM_RELEASE);
+    g_base = NULL;
+    reset_r24_state();
+}
+
+/* =====================================================================
+ * R25: player_idx unusable -> fall back to the auto rules.
+ * (a) out of range (9 when only 3 players), (b) pointing at an EMPTY player
+ * (idx0 has zero res/income). Both must behave exactly like auto (sp_locked).
+ * ===================================================================== */
+static void test_playeridx_fallback(void) {
+    reset_r24_state();
+    int valid[3] = {0, 1, 1};
+    float food[3] = {0, 100.0f, 90.0f};
+    float wood[3] = {0, 0, 0};
+    float coin[3] = {0, 0, 0};
+    float expo[3] = {0, 0, 0};
+
+    /* (a) out of range */
+    g_settings.player_idx = 9;
+    LPVOID img = make_world(3, valid, food, wood, coin, expo);
+    if (!img) { printf("FAIL: alloc (playeridx_oob)\n"); failures++; return; }
+    DWORD b = (DWORD)(DWORD_PTR)img;
+    g_base = img;
+    {
+        DWORD r = 0; int i = -1;
+        CHECK(resolve_export_player(b, EXPORT_MAX_CANDS, &r, &i) == 1,
+              "(R25 oob) auto fallback resolves");
+        CHECK(i == 1, "(R25 oob) auto rules pick idx1 (sp_locked)");
+        CHECK(strcmp(s_lock_rule, "sp_locked") == 0,
+              "(R25 oob) lock rule is sp_locked, NOT PlayerIdx");
+    }
+    VirtualFree(img, 0, MEM_RELEASE);
+
+    /* (b) forced index is an EMPTY player (idx0 invalid -> not a candidate) */
+    reset_r24_state();
+    g_settings.player_idx = 0;
+    LPVOID img2 = make_world(3, valid, food, wood, coin, expo);
+    if (!img2) { printf("FAIL: alloc (playeridx_empty)\n"); failures++; return; }
+    DWORD b2 = (DWORD)(DWORD_PTR)img2;
+    g_base = img2;
+    {
+        DWORD r = 0; int i = -1;
+        CHECK(resolve_export_player(b2, EXPORT_MAX_CANDS, &r, &i) == 1,
+              "(R25 empty) forced idx0 not a candidate -> auto resolves");
+        CHECK(i == 1, "(R25 empty) auto rules pick idx1");
+        CHECK(strcmp(s_lock_rule, "sp_locked") == 0,
+              "(R25 empty) rule is sp_locked (PlayerIdx not usable)");
+    }
+    VirtualFree(img2, 0, MEM_RELEASE);
+    g_base = NULL;
+    reset_r24_state();
+}
+
+/* =====================================================================
+ * R25: match-end lock reset.
+ * A live match locks idx2 (via PlayerIdx) and accumulates spend-drops. The
+ * chain then breaks (menu) -> resolver returns 0 AND the reset clears every
+ * persistent selection static, so the NEXT match re-locks fresh (no stale
+ * prev/big_drops/diag state carried across matches).
+ * ===================================================================== */
+static void test_lock_reset_on_chain_break(void) {
+    reset_r24_state();
+    g_settings.player_idx = 2;
+    int valid[3] = {0, 1, 1};
+    float food[3] = {0, 100.0f, 40.0f};
+    float wood[3] = {0, 0, 0};
+    float coin[3] = {0, 0, 0};
+    float expo[3] = {0, 0, 0};
+    LPVOID img = make_world(3, valid, food, wood, coin, expo);
+    if (!img) { printf("FAIL: alloc (lock_reset)\n"); failures++; return; }
+    DWORD b = (DWORD)(DWORD_PTR)img;
+    g_base = img;
+
+    DWORD res = 0; int idx = -1;
+    CHECK(resolve_export_player(b, EXPORT_MAX_CANDS, &res, &idx) == 1
+          && idx == 2 && s_lock_idx == 2 && s_prev_seen == 1,
+          "(R25 reset) match: locks idx2, s_prev_seen=1");
+    /* accumulate spend-drops so the pre-break state is non-trivial */
+    set_encrypted_slot(b + 0x4000 + 2*0x1000 + 0x300, 2, 150.0f, KEY_BYTES);
+    resolve_export_player(b, EXPORT_MAX_CANDS, &res, &idx);
+    set_encrypted_slot(b + 0x4000 + 2*0x1000 + 0x300, 2, 60.0f, KEY_BYTES);
+    resolve_export_player(b, EXPORT_MAX_CANDS, &res, &idx);   /* big_drop #1 on idx2 */
+    VirtualFree(img, 0, MEM_RELEASE);
+
+    /* menu: chain broken -> return 0 AND full reset */
+    int valid0[1] = {0};
+    float f0[1] = {0}, w0[1] = {0}, c0[1] = {0}, e0[1] = {0};
+    LPVOID m = make_world(0, valid0, f0, w0, c0, e0);
+    if (!m) { printf("FAIL: alloc (menu)\n"); failures++; return; }
+    DWORD bm = (DWORD)(DWORD_PTR)m;
+    g_base = m;
+    {
+        DWORD r = 0; int i = -1;
+        CHECK(resolve_export_player(bm, EXPORT_MAX_CANDS, &r, &i) == 0,
+              "(R25 reset) menu: resolves 0 (write NOTHING)");
+        CHECK(s_lock_idx == -1 && s_lock_rule_init == 0 && s_lock_rule[0] == '\0',
+              "(R25 reset) menu: lock cleared (s_lock_idx/s_lock_rule_init/s_lock_rule)");
+        CHECK(s_last_diag_idx == -1 && s_last_diag_n == -1 && s_last_diag_lock == -1,
+              "(R25 reset) menu: one-shot diag statics cleared");
+        CHECK(g_export_cands[0].idx == -1 && g_export_cands[0].prev == 0.0f
+              && g_export_cands[0].big_drops == 0,
+              "(R25 reset) menu: candidate prev/big_drops cleared");
+        CHECK(s_prev_seen == 0, "(R25 reset) menu: s_prev_seen cleared");
+    }
+    VirtualFree(m, 0, MEM_RELEASE);
+
+    /* next match: fresh lock + fresh prev/big_drops (nothing stale carried) */
+    LPVOID img2 = make_world(3, valid, food, wood, coin, expo);
+    if (!img2) { printf("FAIL: alloc (relock)\n"); failures++; return; }
+    DWORD b2 = (DWORD)(DWORD_PTR)img2;
+    g_base = img2;
+    {
+        DWORD r = 0; int i = -1;
+        CHECK(resolve_export_player(b2, EXPORT_MAX_CANDS, &r, &i) == 1 && i == 2,
+              "(R25 reset) next match: re-locks the forced player fresh");
+        CHECK(g_export_cands[0].prev == 100.0f && g_export_cands[0].big_drops == 0,
+              "(R25 reset) next match: candidate prev/big_drops recomputed fresh (no stale carry)");
+    }
+    VirtualFree(img2, 0, MEM_RELEASE);
+    g_base = NULL;
+    reset_r24_state();
+}
+
+/* =====================================================================
  * (regression sanity) base == NULL / base garbage must be safe and return 0
  * ===================================================================== */
 static void test_null_base(void) {
@@ -350,6 +533,12 @@ int main(void) {
     test_spend_switch();
     printf("--- R24 selection: (c) no-candidate skip ---\n");
     test_no_candidate_skip();
+    printf("--- R25: PlayerIdx forced override ---\n");
+    test_playeridx_forced();
+    printf("--- R25: PlayerIdx unusable fallback ---\n");
+    test_playeridx_fallback();
+    printf("--- R25: lock reset on chain break ---\n");
+    test_lock_reset_on_chain_break();
     printf("--- R24 selection: (extra) null base ---\n");
     test_null_base();
     printf("\nFAILURES: %d\n", failures);

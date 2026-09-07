@@ -240,5 +240,79 @@ feed_constant(r_eng, rate_per_sec=2.0)
 check(abs(r_eng.rate("food") - 2.0) < 0.01,
       "engine: reset() clears state, next series re-converges")
 
+# =====================================================================
+# R25: app path auto-detect + liveness helpers (app.py — pure, no GUI/DLL)
+# =====================================================================
+import app as appmod  # noqa: E402
+
+r25 = tempfile.mkdtemp(prefix="rre_r25_")
+mk = lambda n: os.path.join(r25, f"r25_{n}.log")  # noqa: E731
+for _n in ("primary", "fb1", "fb2", "dead"):
+    with open(mk(_n), "w", encoding="utf-8"):
+        pass
+now = time.time()
+os.utime(mk("primary"), (now - 1.0, now - 1.0))          # fresh (test 2 uses it)
+os.utime(mk("fb1"),     (now - 120.0, now - 120.0))      # stale (2min)
+os.utime(mk("fb2"),     (now - 600.0, now - 600.0))      # stale for test 1; refreshed later
+os.utime(mk("dead"),    (now - 600.0, now - 600.0))      # dead (10min)
+
+_orig_fb = appmod._FALLBACK_RATES
+appmod._FALLBACK_RATES = [mk("fb1"), mk("fb2"), mk("dead")]
+no = os.path.join(r25, "r25_missing.log")
+if os.path.exists(no):
+    os.remove(no)
+
+# 1) nothing exists/fresh -> None (keep polling, don't lock in)
+got = appmod._pick_log_path(no, now=now)
+check(got is None, f"R25 path: nothing fresh -> None (poll), got {got!r}")
+
+# 2) primary (configured/--log) fresh wins over everything
+got = appmod._pick_log_path(mk("primary"), now=now)
+check(got == mk("primary"),
+      f"R25 path: fresh configured path outranks fallbacks, got {got!r}")
+
+# 3) primary stale/absent -> first FRESH fallback wins (order matters: fb1 old, fb2 fresh)
+os.utime(mk("fb2"), (now - 3.0, now - 3.0))              # fb2 now fresh
+got = appmod._pick_log_path(no, now=now)
+check(got == mk("fb2"),
+      f"R25 path: stale fb1 skipped -> fresh fb2 wins, got {got!r}")
+
+# 4) configured path went STALE but a fresh fallback exists -> the fresh WINS
+#    (a dead configured path must not hold the app hostage)
+os.utime(mk("primary"), (now - 500.0, now - 500.0))    # primary now stale/dead
+got = appmod._pick_log_path(mk("primary"), now=now)
+check(got == mk("fb2"),
+      f"R25 path: stale/dead configured path does not beat a fresh fallback, got {got!r}")
+os.utime(mk("primary"), (now - 1.0, now - 1.0))        # restored
+
+# 5) nothing fresh anywhere but the configured path EXISTS -> honor it (last resort)
+os.utime(mk("primary"), (now - 500.0, now - 500.0))   # stale too now
+os.utime(mk("fb2"),     (now - 500.0, now - 500.0))
+os.utime(mk("fb1"),     (now - 500.0, now - 500.0))
+got = appmod._pick_log_path(mk("primary"), now=now)
+check(got == mk("primary"),
+      f"R25 path: stale configured path used when NO fallback is fresh, got {got!r}")
+os.utime(mk("fb1"), (now - 3.0, now - 3.0))             # restore fb1 fresh
+os.utime(mk("fb2"), (now - 3.0, now - 3.0))             # restore fb2 fresh
+
+# re-check each poll: fresh source appearing later is picked up, not locked out
+got = appmod._pick_log_path(no, now=now)
+check(got == mk("fb1"),
+      f"R25 path: re-probe picks the first now-fresh fallback, got {got!r}")
+appmod._FALLBACK_RATES = _orig_fb                     # restore
+
+# 6) liveness footer states
+t = appmod.time.time()
+check(appmod._staleness_text(False, None, now=t) == "none",
+      "R25 liveness: no data yet -> none (Waiting for data)")
+check(appmod._staleness_text(True, t - 1.0, now=t) == "live",
+      "R25 liveness: fresh last record -> live (shows t=)")
+check(appmod._staleness_text(True, t - 5.0, now=t) == "live",
+      "R25 liveness: exactly at the 5s threshold -> still live")
+check(appmod._staleness_text(True, t - 5.1, now=t) == "stale",
+      "R25 liveness: past 5s -> stale (no new samples)")
+check(appmod._staleness_text(True, t - 300.0, now=t) == "stale",
+      "R25 liveness: long gap -> stale, values never blanked")
+
 print("APP-CORE:", "PASS" if failures == 0 else f"{failures} FAILURES")
 sys.exit(0 if failures == 0 else 1)

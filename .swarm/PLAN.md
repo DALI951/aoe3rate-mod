@@ -12,7 +12,7 @@ verified). New `app/engine.py` (`RateEngine`: EMA income rate, spend-spike rule 
 ⇒ SPEND excluded from EMA, display formatting) + `app/app.py` (frameless always-on-top Tk viewer,
 headless `--console`, `--log` override) + `tests/test_app_core.py`. DLL export thread now writes
 **`rates.log`** (was `d3d9mod.log`); `d3d9mod.log` is debug-only. `tools/rates_widget.py` + its test
-**removed** (superseded). All harnesses green; built DLL auto-deploys to the game folder. Full detail:
+**removed** (superseded by `app\app.py`). All harnesses green; built DLL auto-deploys to the game folder. Full detail:
 `.swarm/BUILD.md` ROUND 21.
 
 **ROUND 20 (2026-09-07):** export line re-formatted to the exact

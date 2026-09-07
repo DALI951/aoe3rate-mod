@@ -2,10 +2,10 @@
 rem build.bat — AoE3 resource-rate mod build + verify + deploy (R14)
 setlocal enabledelayedexpansion
 
-set "W64=C:\Users\dali\AppData\Local\Temp\opencode\w64devkit-x86\w64devkit"
+set "W64=C:\Users\Dali\Documents\gaames\w64devkit-x86\w64devkit"
 set "GCC=%W64%\bin\i686-w64-mingw32-gcc.exe"
-set "PY=C:\Users\dali\AppData\Local\Programs\Python\Python312\python.exe"
-set "GAME=C:\Users\dali\Documents\Age of Empires III - Complete Collection"
+set "PY=C:\Python314\python.exe"
+set "GAME=C:\Users\Dali\Documents\gaames\Age of Empires III - Complete Collection"
 set "ROOT=%~dp0.."
 
 if not exist "%GCC%" (

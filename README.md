@@ -124,7 +124,7 @@ rewritten atomically (temp + replace) and the active `Users\DefaultProfile*.xml`
 | | `UseGameTime` | 1 | **remnant switch** — both modes wall-clock QPC (see Known Limitations) |
 | | `DiscontinuityRatio` | 3.0 | spend-spike skip threshold |
 | | `ShowGains` | 1 | count positive jumps |
-| `[Debug]` | `Enabled` | 0 | **0 = export mode** (log = only the `t=%lu,food=%d,wood=%d,coin=%d,export=%d` lines, read by `rates_widget.py`); **1 = full diagnostics** (`ovl diag`, chain, heartbeats; export lines suppressed) |
+| `[Debug]` | `Enabled` | 0 | **0 = export mode** (log = only the `t=%lu,food=%d,wood=%d,coin=%d,export=%d` lines, read by `app\app.py`); **1 = full diagnostics** (`ovl diag`, chain, heartbeats; export lines suppressed) |
 
 ### Hotkeys
 
@@ -278,7 +278,7 @@ VERIFIED_ADDRESSES.md  address notes
 |-----|-------|----------|
 | R21 | **Current — Python pipeline on Dali's core (byte-identical `app/config.py`, `app/log_tailer.py`, `app/parser.py` + new `RateEngine` + `app.py`; export now writes `rates.log`)** | `d3d9.dll` + `app/` (see `.swarm/BUILD.md`) |
 | R20 | Export line `t=ms` + export field (`t=%lu,food=%d,wood=%d,coin=%d,export=%d`, 155,825 B, `9b99c2a3…`) | `d3d9.dll` + `tools/rates_widget.py` (removed in R21) |
-| R19-PIVOT | File-export + external widget + logging diet (155,259 B, `65d8e880…`) | `d3d9.dll` + `tools/rates_widget.py` |
+| R19-PIVOT | File-export + external widget + logging diet (155,259 B, `65d8e880…`) | `d3d9.dll` + `app/app.py` |
 | R11 (this round) | **Settings gap (decimal/plus/visibility/position) + two-line hints + version table + P0 `ovl diag`** | `d3d9.dll` (see `.swarm/BUILD.md` for size + SHA256) |
 | R14 | Overlay + rate engine + observer (previous) | `d3d9.dll` |
 | R13 | Observer-only proxy — verified vs HUD 2026-09-06 | 83,272 B `E6F79C46EF26FD430D3366B06418752B5E3E59870116295DF3BF75DA5D7DF6D0` |

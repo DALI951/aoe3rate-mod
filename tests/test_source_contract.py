@@ -28,7 +28,12 @@ R14 contracts (new):
     atomic write-back; DefaultProfile*.xml merge with mtime gate.
   - version gate in d3d9.c refuses to arm the overlay on mismatch.
 
-Usage: C:\\Python312\\python.exe tests\\test_source_contract.py
+R25 adds: [General] PlayerIdx (default -1 = auto; forced index used EXCLUSIVELY,
+skipping the lock/spend-switch; out-of-range/zero falls back to auto), a
+match-end lock reset when the chain breaks, and debug-gated export-skip
+visibility. All R25 diagnostics go to d3d9mod.log — NEVER rates.log.
+
+Usage: python tests\\test_source_contract.py
 """
 import os
 import sys
@@ -921,6 +926,51 @@ check(len(ovl_stop_sites) == 2,
 # DLL_PROCESS_DETACH sets s_export_running=0 (via export_shutdown)
 check("s_export_running = 0;" in code and "DLL_PROCESS_DETACH" in code,
       "R20/21: DLL_PROCESS_DETACH path sets s_export_running=0 (shutdown)")
+
+# ================= ROUND 25: PlayerIdx override + lock reset + skip visibility =================
+# (1) INI key: parsed on BOTH settings paths (INI load + DefaultProfile merge),
+#     saved back, documented in the example INI, default -1 = auto. Clamp [-1,255].
+check(src.count('!strcmp(key, "PlayerIdx")') >= 2,
+      "R25: PlayerIdx parsed in both settings_load and profile apply paths")
+check("PlayerIdx=%d\\r\\n" in src, "R25: PlayerIdx written back by settings_save")
+with open(os.path.join(ROOT, "ResourceRateMod.ini.example"), "r", encoding="utf-8",
+          errors="replace") as fine_ex:
+    ini_ex = fine_ex.read()
+check("PlayerIdx" in ini_ex, "R25: PlayerIdx documented in ResourceRateMod.ini.example")
+check(re.search(r"s->player_idx\s*=\s*-1;", src) is not None,
+      "R25: default player_idx = -1 (auto)")
+check("int n = ini_get_int(value, s->player_idx); if (n < -1) n = -1; if (n > 255) n = 255;"
+      in code,
+      "R25: PlayerIdx clamped to [-1, 255] in the INI load path")
+check('rule = "PlayerIdx"' in code,
+      "R25: forced selection uses the 'PlayerIdx' rule (diag visible)")
+
+# (2) match-end lock reset: all persistent selection statics cleared when the
+#     chain breaks DURING a session; the reset log is debug-gated only.
+check("r25_reset_lock" in code and "s_prev_seen" in code and "s_skip_log_n" in code,
+      "R25: lock-reset helper + prev-chain + skip-count statics present")
+check('dlog("R25 lock reset (chain break)")' in code,
+      "R25: lock-reset diagnostic string present (d3d9mod.log only, never rates.log)")
+check("s_lock_idx       = -1;" in code and "s_lock_rule[0]   = '\\0';" in code,
+      "R25: r25_reset_lock clears s_lock_idx + s_lock_rule")
+check("s_last_diag_idx  = -1;" in code and "s_last_diag_n    = -1;" in code
+      and "s_last_diag_lock = -1;" in code,
+      "R25: r25_reset_lock clears the diag one-shot-change statics")
+check("g_export_cands[i].big_drops = 0;" in code,
+      "R25: r25_reset_lock clears per-candidate spend-drop trackers")
+
+# (3) export-skip visibility: mid-match no-candidate skip logged debug-gated,
+#     at most once per 10 skips. Never in rates.log (d3d9mod.log only) — the
+#     only thing the export thread ever fopen("a") writes is format_export_line.
+check('dlog("R25 export skip: idx=%d n=%d", s_lock_idx, g_export_n)' in code,
+      "R25: export-skip diagnostic present with the exact format")
+check("s_skip_log_n % 10 == 1" in code,
+      "R25: export-skip log throttled to at most once per 10 skips")
+i_r25 = code.find('dlog("R25 export skip')
+check(i_r25 != -1 and "g_settings.debug_enabled" in code[i_r25 - 200:i_r25],
+      "R25: export-skip dlog sits inside a debug_enabled gate (quiet by default)")
+check('"R25 PlayerIdx=%d not usable (idx=%d n=%d); falling back to auto"' in code,
+      "R25: forced-index-unusable note present (debug-gated, auto fallback)")
 
 print("SOURCE-CONTRACT:", "PASS" if failures == 0 else f"{failures} FAILURES")
 sys.exit(0 if failures == 0 else 1)
