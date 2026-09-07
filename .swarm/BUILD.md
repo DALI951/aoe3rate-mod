@@ -1,3 +1,77 @@
+# BUILD — ROUND 12 (2026-09-07) — TESTER-FINDING CLOSURES (names-off real fix + tightened harnesses)
+
+## ROUND SUMMARY
+No crash this round (game not launched). R12 is the small, surgical closure round from the
+R11 tester audit: ONE code behavior change (the MEDIUM finding) plus tighter test pins.
+- **FIX 1 (MEDIUM, the only code change)** — `ShowResourceNames=0` previously printed a BLANK
+  label: `format_rate_line` only falls back to "Slot%d" when the name arg is NULL/empty, but
+  `ui_draw_panel` (src/ui.c, line ~458) ALWAYS passed the real labels ("Food"/"Wood"/"Coin"/"Export").
+  Now the panel passes `g_settings.show_resource_names ? "Food" : NULL` (and Wood/Coin/Export) so
+  names-off yields "Slot%d" via the helper's existing NULL fallback — the spec behavior. Default
+  (names on) unchanged.
+- **FIX 2 (tests/test_rate_engine.c, LOW findings)** — decimal-precision loop tightened to EXACT
+  match (`+2/min` / `+2.0/min` / `+2.00/min` / `+2.000/min`) with finer-precision ABSENCE asserts
+  (e.g. `+2.` must not appear when decimal_places==0); the clamp test now requires `+2.000` with NO
+  `2.0000`; per-resource visibility pairs added for slot 1 "Wood", slot 0 "Coin", slot 7 "Export"
+  mirroring the existing show_food pair; a slot-map/name-order probe drives `format_rate_line` for
+  2/1/0/7 and pins each names-off NULL fallback. The 48-byte/8-byte buffer tests FORCE truncation
+  (huge value + long name + huge rate) and pin the ACTUAL bound the helper guarantees: probing
+  showed mingw/msvcrt `_snprintf` writes exactly `n` bytes with NO NUL terminator when truncated
+  (the helper's one hard rule), so the tests pin "exact n-char prefix + guard byte after n is
+  untouched" (no write past n) instead of assuming 47+NUL. `clip_line` driven >78 chars and pinned
+  to exactly PANEL_LINE_MAX_CHARS with trailing ".." at 76/77 + short-path untouched; version table
+  pins ALL SIX row-0 fields == the six EXPECTED_* macros and rows 1..3 EACH individually have
+  label==NULL and all-zero fields. Names-off now pins BOTH helper paths: real label + names off ->
+  blank (the R11 caller bug, no longer reachable), NULL + names off -> "Slot%d" (the FIX 1 path).
+- **FIX 3 (tests/test_source_contract.py)** — replaced the weak `code.count("g_bb_w = ") >= 3` with
+  `_fn_body()` slices that require the g_bb_w AND g_bb_h capture inside each specific function body
+  (w_create_device, w_create_device_ex, reset_hook); added the `show_resource_names ? "Food" : NULL`
+  (and Wood/Coin/Export) pattern asserts at the 4 main rows. No other existing pins changed.
+- **FIX 4 (docs)** — `.swarm/BUILD.md` R11 LIVE EXPECTATIONS: `alpha=0xD8` -> `alpha=0xD9`
+  (code computes (DWORD)(0.85*255+0.5)=217=0xD9); `src/state.h` show_resource_names comment now
+  states names-off -> "Slot%d" via the NULL path for the 4 main rows.
+
+## LIVE EXPECTATIONS (verify against d3d9mod.log)
+Same chain as R11, but the P0 diagnostic's alpha is now **0xD9** (not 0xD8):
+```
+R14 DLL loaded base=00400000 real=.. version=OK reason=ok
+UI ready: d3dx9_25.dll loaded
+OVERLAY ARMED
+...
+chain .. n=3 .. [human-p1]
+--- match start n=3 .. ---
+UI: font created size=14 face=Georgia font=..
+ovl first draw ok frame=..
+ovl diag rt=.. rect=12,12:250x141 alpha=0xD9   <- ONE-SHOT, only when Debug Enabled=1
+      (0xD9 = (DWORD)(0.85*255+0.5)=217, the default opacity of 0.85)
+ovl heartbeat n=.. frame=.. res=.. food=.. wood=.. coin=.. export=..
+```
+With `[General] ShowResourceNames=0` the four main rows now show `Slot2 Slot1 Slot0 Slot7`
+instead of blank labels. A/B disable runs + F9+Alt toggle checks unchanged.
+
+## File changes
+- `src/ui.c` — R12: 4 main rows pass `g_settings.show_resource_names ? slot_names[r] : NULL`
+  so names-off yields "Slot%d" (comment added).
+- `src/state.h` — R12: show_resource_names comment clarified (names-off -> Slot%d via NULL path).
+- `tests/test_rate_engine.c` — R12: decimal EXACT-match + finer-absence, clamp bound, Wood/Coin/
+  Export visibility pairs, slot-map order probe, forced 48-byte (and 8-byte) truncation bound,
+  clip_line 78-cap + short-path, version table == ALL six macros + rows 1..3 all-zero.
+- `tests/test_source_contract.py` — R12: per-function-body g_bb_w/g_bb_h capture (replaces
+  count>=3), names-off NULL ternary at the 4 main rows.
+- `.swarm/BUILD.md` — R12: 0xD8 -> 0xD9 in the R11 LIVE EXPECTATIONS block + this section.
+
+## Build / harnesses (this round)
+- Build rc=0, zero warnings (-Wall -Wextra), VERIFY PASS (i386 PE32, imports
+  KERNEL32/USER32/msvcrt only, 11 exports via d3d9.def — unchanged set).
+- d3d9.dll = **149,815 B**, SHA256 `1cf285b6a730a0e531be8bb1ab36db7bbca64ec6e10b5d77815911ef2e38cbeb`,
+  deployed byte-identical to repo root + game dir + tests\d3d9.dll (all 3 SHA256 equal); old
+  d3d9mod.log deleted.
+- Harnesses (rebuilt from tests\\, then run with Python312): test_rate_engine.exe FAILURES 0 (incl.
+  all new R12 asserts) · test_d3d9_actual.exe ALL PASS · test_pe_structure.py 0 failures ·
+  test_source_contract.py PASS (R12 block + all R11/R14 pins green).
+
+---
+
 # BUILD — ROUND 11 (2026-09-07) — SETTINGS GAP + PANEL LAYOUT + VERSION TABLE + P0 DIAG
 
 ## ROUND SUMMARY
@@ -48,7 +122,8 @@ chain .. n=3 .. [human-p1]
 --- match start n=3 .. ---
 UI: font created size=14 face=Georgia font=..
 ovl first draw ok frame=..
-ovl diag rt=.. rect=12,12:250x141 alpha=0xD8   <- ONE-SHOT, only when Debug Enabled=1
+ovl diag rt=.. rect=12,12:250x141 alpha=0xD9   <- ONE-SHOT, only when Debug Enabled=1
+      (0xD9 = (DWORD)(0.85*255+0.5)=217, the default opacity of 0.85)
       (TopRight: rect pins to the right edge via g_bb_w; Default: PosX/PosY)
 ovl heartbeat n=.. frame=.. res=.. food=.. wood=.. coin=.. export=..
 ```

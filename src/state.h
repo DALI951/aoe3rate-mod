@@ -165,7 +165,8 @@ typedef struct {
     int    show_slots_567;
     int    decimal_places;       /* R11: 0..3 display decimals for the RATE (default 1 = current %.1f) */
     int    show_plus_sign;       /* R11: 1 = '+' mark for non-negative rates (current) */
-    int    show_resource_names;  /* R11: 1 = "Food"/"Wood"/"Coin"/"Export"; 0 = "Slot%d" */
+    int    show_resource_names;  /* R11: 1 = "Food"/"Wood"/"Coin"/"Export"; 0 = "Slot%d" for the
+                                    4 main rows (caller passes NULL when off -> Slot%d fallback) */
     int    show_zero_rates;      /* R11: 1 = current (always draw); 0 = hide |display|<0.0005 */
     int    show_food;            /* R11: per-resource row visibility (independent of ShowSlots567) */
     int    show_wood;

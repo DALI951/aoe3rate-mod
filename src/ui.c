@@ -446,15 +446,35 @@ static void ui_draw_panel(void *dev) {
     /* R11: the four main resource rows route through format_rate_line so the
      * per-resource visibility switches, decimal places and plus-sign settings
      * apply uniformly (hidden or zero-rate rows skip the line AND its row). */
-    static const int slot_map[4] = { 2, 1, 0, 7 };
-    static const char *slot_names[4] = { "Food", "Wood", "Coin", "Export" };
-    for (int r = 0; r < 4; r++) {
-        if (format_rate_line(line, sizeof(line), slot_map[r], slot_names[r],
-                             g_last_values[slot_map[r]],
-                             rate_get_ema(slot_map[r]), &g_settings)) {
-            ui_font_draw(g_font, line, px + 8, yy, text_col);
-            yy += row;
-        }
+    /* R12: ShowResourceNames=0 must yield "Slot%d", not a blank label — the
+     * helper only falls back to "Slot%d" when the name arg is NULL/empty, and
+     * this is the only caller that always had the real label, so names-off
+     * used to print a blank label. Pass NULL whenever names are hidden and the
+     * helper's existing NULL fallback does the right thing. Default (names on)
+     * unchanged. Rows ordered by the slot map 2/1/0/7 (Food/Wood/Coin/Export). */
+    if (format_rate_line(line, sizeof(line), 2,
+                         g_settings.show_resource_names ? "Food" : NULL,
+                         g_last_values[2], rate_get_ema(2), &g_settings)) {
+        ui_font_draw(g_font, line, px + 8, yy, text_col);
+        yy += row;
+    }
+    if (format_rate_line(line, sizeof(line), 1,
+                         g_settings.show_resource_names ? "Wood" : NULL,
+                         g_last_values[1], rate_get_ema(1), &g_settings)) {
+        ui_font_draw(g_font, line, px + 8, yy, text_col);
+        yy += row;
+    }
+    if (format_rate_line(line, sizeof(line), 0,
+                         g_settings.show_resource_names ? "Coin" : NULL,
+                         g_last_values[0], rate_get_ema(0), &g_settings)) {
+        ui_font_draw(g_font, line, px + 8, yy, text_col);
+        yy += row;
+    }
+    if (format_rate_line(line, sizeof(line), 7,
+                         g_settings.show_resource_names ? "Export" : NULL,
+                         g_last_values[7], rate_get_ema(7), &g_settings)) {
+        ui_font_draw(g_font, line, px + 8, yy, text_col);
+        yy += row;
     }
 
     if (g_settings.show_slots_567) {

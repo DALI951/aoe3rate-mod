@@ -418,18 +418,40 @@ static void test_format_line(void) {
           strstr(b, "+2.0") != NULL && strstr(b, "/min") != NULL,
           "R11: format_rate_line defaults (Food 100 +2.0/min)");
 
-    /* decimal places 0..3, and out-of-range clamp to 3 */
+    /* decimal places 0..3, and out-of-range clamp to 3 — R12 tightens to
+     * EXACT match (the stock value is `%8.0f`, separate from the RATE's `%.*f`),
+     * and asserts the finer precision is NOT present (so "+2.0" can't satisfy a
+     * `decimal_places=0` expectation and "+2.00" can't satisfy `decimal_places=2`
+     * via a prefix match on "+2"). */
     for (int d = 0; d <= 3; d++) {
         def.decimal_places = d;
         format_rate_line(b, sizeof(b), 1, "Wood", 60.0f, 2.0f/60.0f, &def);
-        char chk[16];
-        if (d == 0) lstrcpyA(chk, "+2");
-        else _snprintf(chk, sizeof(chk), "+2.%.*s", d, "000");
-        CHECK(strstr(b, chk) != NULL, "R11: decimal_places precision respected");
+        char exp[24];
+        if (d == 0) lstrcpyA(exp, "+2/min");       /* whole number, no '.' */
+        else _snprintf(exp, sizeof(exp), "+2.%.*d/min", d, 0);
+        char msg[96];
+        _snprintf(msg, sizeof(msg), "R12: decimal_places=%d EXACT rate match", d);
+        char *hr = strstr(b, exp);
+        CHECK(hr != NULL, msg);
+        if (d == 0) {
+            CHECK(strstr(b, "+2.") == NULL, "R12: decimal_places=0 -> no '.' in the rate");
+        } else {
+            /* one finer decimal must NOT appear right after the "+2.": build
+             * "+2." + (d+1) zeros and require it absent (only when buffer kept it) */
+            char finer[24];
+            _snprintf(finer, sizeof(finer), "+2.%.*d", d + 1, 0);
+            if (strlen(b) + strlen(finer) < sizeof(b)) {  /* room to attempt the match */
+                char msg2[96];
+                _snprintf(msg2, sizeof(msg2),
+                          "R12: decimal_places=%d -> finer precision absent", d);
+                CHECK(strstr(b, finer) == NULL, msg2);
+            }
+        }
     }
     def.decimal_places = 5;
     format_rate_line(b, sizeof(b), 1, "Wood", 60.0f, 2.0f/60.0f, &def);
-    CHECK(strstr(b, "+2.000") != NULL, "R11: decimal_places clamped to 3");
+    CHECK(strstr(b, "+2.000/min") != NULL && strstr(b, "2.0000") == NULL,
+          "R12: decimal_places clamped to 3 (no 4th decimal, exact bound)");
 
     /* plus sign off: positive rate strips the '+' (negative keeps '-') */
     def.decimal_places = 1;
@@ -445,6 +467,20 @@ static void test_format_line(void) {
     def.show_resource_names = 0;
     format_rate_line(b, sizeof(b), 2, NULL, 100.0f, 2.0f/60.0f, &def);
     CHECK(strstr(b, "Slot2") != NULL, "R11: NULL name falls back to Slot2");
+    def.show_resource_names = 1;
+
+    /* R12: pin the TWO helper paths under show_resource_names=0. (a) NULL/empty
+     * name -> "Slot%d" fallback (this is what FIX 1 makes the panel call). (b) a
+     * REAL (non-NULL) label with names off -> blank label — that was the R11 bug
+     * the panel hit, which FIX 1 removes by passing NULL instead. */
+    def.show_resource_names = 0;
+    format_rate_line(b, sizeof(b), 1, "Wood", 60.0f, 2.0f/60.0f, &def);
+    CHECK(strstr(b, "Wood") == NULL && strstr(b, "Slot1") == NULL &&
+          strstr(b, "2.0/min") != NULL,
+          "R12: names off + real label -> blank label (panel never does this now)");
+    format_rate_line(b, sizeof(b), 1, NULL, 60.0f, 2.0f/60.0f, &def);
+    CHECK(strstr(b, "Slot1") != NULL && strstr(b, "2.0/min") != NULL,
+          "R12: names off + NULL name -> Slot1 (FIX 1 path)");
     def.show_resource_names = 1;
 
     /* zero-rate suppression */
@@ -470,19 +506,122 @@ static void test_format_line(void) {
           "R11: use_unit_min=0 -> per-second, no *60");
     def.use_unit_min = 1;
 
-    /* tiny buffer: long value/rate stays inside */
-    float big = 123456789.0f;
-    format_rate_line(b, 48, 2, "Food", big, big * 60.0f, &def);
-    CHECK(strlen(b) < 48, "R11: long value/rate stays inside a 48-byte buffer");
+    /* tiny buffer: FORCE truncation and pin the ACTUAL bound the helper
+     * guarantees. The helper formats via _snprintf(out, n, ...). The
+     * mingw/msvcrt _snprintf, when the formatted length would exceed n, writes
+     * exactly n bytes and does NOT NUL-terminate (probed: r==-1, buffer holds n
+     * chars, no terminator). So the one hard guarantee is "never writes past n"
+     * and the content equals the first n chars of the untruncated line. Pin
+     * that with a guard byte AND an exact-prefix compare. */
+    {
+        static const float huge = 987654321.0f;
+        static const char *long_name = "WoodiestWoodOfTheWesternWood"; /* 28 chars */
+        char full[256];
+        format_rate_line(full, sizeof(full), 2, long_name, huge, huge * 60.0f, &def);
+        CHECK(strlen(full) > 48, "R12: overflow fixture is >48 chars");
+        char tight[49];
+        memset(tight, 0x55, sizeof(tight));          /* guard at tight[48] */
+        format_rate_line(tight, 48, 2, long_name, huge, huge * 60.0f, &def);
+        CHECK(memcmp(tight, full, 48) == 0 && tight[48] == 0x55,
+              "R12: 48-byte buffer = exact 48-char prefix, no write past n");
+        char tiny8[9];
+        memset(tiny8, 0x55, sizeof(tiny8));          /* guard at tiny8[8] */
+        format_rate_line(tiny8, 8, 2, long_name, huge, huge * 60.0f, &def);
+        CHECK(memcmp(tiny8, full, 8) == 0 && tiny8[8] == 0x55,
+              "R12: 8-byte buffer = exact 8-char prefix, no write past n");
+        def.decimal_places = 1;
+    }
 
-    /* version table row 0 = TAD 1.0.8 pinned to the EXPECTED_* macros */
-    CHECK(g_versions[0].size == EXPECTED_EXE_SIZE &&
-          g_versions[0].base == EXPECTED_IMAGE_BASE,
-          "R11: g_versions[0] pins TAD size + image base from EXPECTED_*");
+    /* per-resource visibility — R12 adds the Wood/Coin/Export pairs mirroring
+     * the show_food pair, pinning that mutating EACH field gates its row (the
+     * R11 test only covered Food). */
+    def.show_wood = 0;
+    CHECK(format_rate_line(b, sizeof(b), 1, "Wood", 60.0f, 2.0f/60.0f, &def) == 0,
+          "R12: show_wood=0 hides Wood (slot 1)");
+    def.show_wood = 1;
+    CHECK(format_rate_line(b, sizeof(b), 1, "Wood", 60.0f, 2.0f/60.0f, &def) == 1,
+          "R12: show_wood=1 keeps Wood (slot 1)");
+    def.show_coin = 0;
+    CHECK(format_rate_line(b, sizeof(b), 0, "Coin", 60.0f, 2.0f/60.0f, &def) == 0,
+          "R12: show_coin=0 hides Coin (slot 0)");
+    def.show_coin = 1;
+    CHECK(format_rate_line(b, sizeof(b), 0, "Coin", 60.0f, 2.0f/60.0f, &def) == 1,
+          "R12: show_coin=1 keeps Coin (slot 0)");
+    def.show_export = 0;
+    CHECK(format_rate_line(b, sizeof(b), 7, "Export", 60.0f, 2.0f/60.0f, &def) == 0,
+          "R12: show_export=0 hides Export (slot 7)");
+    def.show_export = 1;
+    CHECK(format_rate_line(b, sizeof(b), 7, "Export", 60.0f, 2.0f/60.0f, &def) == 1,
+          "R12: show_export=1 keeps Export (slot 7)");
+
+    /* R12: slot-map / name order probe — the 4 main rows and their labels. */
+    {
+        static const int slot_map[4] = { 2, 1, 0, 7 };
+        static const char *slot_names[4] = { "Food", "Wood", "Coin", "Export" };
+        for (int r = 0; r < 4; r++) {
+            def.show_food = 1; def.show_wood = 1; def.show_coin = 1; def.show_export = 1;
+            char nm[32];
+            _snprintf(nm, sizeof(nm), "Slot%d", slot_map[r]);
+            char msg[96];
+            def.show_resource_names = 1;
+            format_rate_line(b, sizeof(b), slot_map[r], slot_names[r],
+                             100.0f, 2.0f/60.0f, &def);
+            _snprintf(msg, sizeof(msg), "R12: row slot-map[%d]=slot %d renders %s",
+                      r, slot_map[r], slot_names[r]);
+            CHECK(strstr(b, slot_names[r]) != NULL, msg);
+            def.show_resource_names = 0;
+            format_rate_line(b, sizeof(b), slot_map[r], NULL, 100.0f,
+                             2.0f/60.0f, &def);
+            _snprintf(msg, sizeof(msg), "R12: names-off renders %s (NULL fallback)", nm);
+            CHECK(strstr(b, nm) != NULL, msg);
+        }
+    }
+
+    /* R12: clip_line 78-char cap — an >78-char line must truncate to EXACTLY
+     * PANEL_LINE_MAX_CHARS chars total with the trailing ".." at 76/77, and the
+     * short path (< cap) must be left untouched. (clip_line is static in ui.c,
+     * reachable because this harness #includes d3d9.c.) */
+    {
+        char cl[160];
+        memset(cl, 'A', sizeof(cl) > 120 ? 120 : sizeof(cl));   /* 120 'A's */
+        cl[120] = '\0';
+        size_t len0 = strlen(cl);
+        CHECK(len0 > (size_t)PANEL_LINE_MAX_CHARS, "R12: clip_line overflow fixture");
+        clip_line(cl, sizeof(cl));
+        CHECK(strlen(cl) == (size_t)PANEL_LINE_MAX_CHARS &&
+              cl[PANEL_LINE_MAX_CHARS - 2] == '.' &&
+              cl[PANEL_LINE_MAX_CHARS - 1] == '.' &&
+              cl[PANEL_LINE_MAX_CHARS] == '\0',
+              "R12: clip_line truncates >78-char line to exactly 78 + trailing '..'");
+        lstrcpyA(cl, "short line");
+        clip_line(cl, sizeof(cl));
+        CHECK(strcmp(cl, "short line") == 0, "R12: clip_line leaves short lines untouched");
+    }
+
+    /* version table: R12 pins ALL SIX row-0 fields equal the EXPECTED_* macros
+     * (R11 only checked size + base), and rows 1..3 EACH have label==NULL and
+     * all-zero fields. */
     CHECK(g_versions[0].label != NULL && strcmp(g_versions[0].label, "TAD 1.0.8") == 0,
-          "R11: g_versions[0] labeled TAD 1.0.8");
-    CHECK(g_versions[1].label == NULL && g_versions[1].size == 0,
-          "R11: g_versions[1] is an uncaptured TODO row (label NULL)");
+          "R12: g_versions[0] labeled TAD 1.0.8");
+    CHECK(g_versions[0].size   == EXPECTED_EXE_SIZE  &&
+          g_versions[0].base   == EXPECTED_IMAGE_BASE &&
+          g_versions[0].pe_hi  == EXPECTED_PE_VER_HI &&
+          g_versions[0].pe_lo  == EXPECTED_PE_VER_LO &&
+          g_versions[0].pe_r   == EXPECTED_PE_VER_R  &&
+          g_versions[0].pe_b   == EXPECTED_PE_VER_B,
+          "R12: g_versions[0] all six fields == EXPECTED_* macros");
+    for (int i = 1; i < 4; i++) {
+        char msg[96];
+        _snprintf(msg, sizeof(msg), "R12: g_versions[%d] all-zero TODO row", i);
+        CHECK(g_versions[i].label == NULL &&
+              g_versions[i].size == 0 &&
+              g_versions[i].base == 0 &&
+              g_versions[i].pe_hi == 0 &&
+              g_versions[i].pe_lo == 0 &&
+              g_versions[i].pe_r  == 0 &&
+              g_versions[i].pe_b  == 0,
+              msg);
+    }
 }
 
 int main(void) {

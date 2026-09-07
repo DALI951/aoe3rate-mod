@@ -523,8 +523,41 @@ check("extern DWORD g_bb_w" in stateh and "extern DWORD g_bb_h" in stateh,
       "R11: g_bb_w/g_bb_h extern'd in state.h")
 check("DWORD g_bb_w = 0;" in src and "DWORD g_bb_h = 0;" in src,
       "R11: g_bb_w/g_bb_h defined in d3d9.c")
-check(code.count("g_bb_w = ") >= 3,
-      "R11: backbuffer dims captured in BOTH create paths AND reset_hook")
+
+
+def _fn_body(sig):
+    """Return the brace-balanced body of the DEFINITION of `sig` (the part of
+    the signature AFTER 'static int STDMETHODCALLTYPE '), or None. Requires the
+    '{' right at the end of the signature so a forward DECLARATION (which ends
+    in ';') is never mistaken for the definition."""
+    m = re.search(r"static int STDMETHODCALLTYPE " + re.escape(sig) + r"\s*\{", src)
+    if not m:
+        return None
+    i = m.end() - 1                      # points at the '{'
+    depth = 0
+    for k in range(i, len(src)):
+        if src[k] == "{":
+            depth += 1
+        elif src[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[i:k + 1]
+    return None
+
+
+# R12: g_bb_w capture must appear inside EACH specific body (the weak
+# count>=3 only proved "some 3 places exist"). reset_hook reads `pp`, the
+# create paths read `pparams` — pin each function individually.
+for _sig, _fn in (("w_create_device(void *self, UINT adapter, UINT type,\n"
+                   "        HWND focus, DWORD flags, void *pparams, void **ppdev)",
+                   "w_create_device"),
+                  ("w_create_device_ex(void *self, UINT adapter, UINT type,\n"
+                   "        HWND focus, DWORD flags, void *pparams, void *pfs, void **ppdev)",
+                   "w_create_device_ex"),
+                  ("reset_hook(void *self, const void *pp)", "reset_hook")):
+    _body = _fn_body(_sig)
+    check(_body is not None and "g_bb_w = " in _body and "g_bb_h = " in _body,
+          f"R12: g_bb_w/g_bb_h captured inside {_fn}")
 check("PANEL_LINE_MAX_CHARS" in stateh and "PANEL_LINE_MAX_CHARS" in src,
       "R11: PANEL_LINE_MAX_CHARS defined (state.h) and used in ui.c")
 
@@ -570,8 +603,14 @@ check('"Default"' in code and '"TopLeft"' in code and '"TopRight"' in code,
 check("format_rate_line" in stateh, "R11: format_rate_line declared in state.h")
 check("int format_rate_line(char *out, size_t n, int slot_id" in code,
       "R11: format_rate_line defined non-static in ui.c")
-check("rate_get_ema(slot_map[r])" in code,
-      "R11: main rows feed rate_get_ema through format_rate_line")
+# R12: the four main rows feed rate_get_ema(slot) through format_rate_line and
+# pass NULL when names are off (FIX 1) so the helper's "Slot%d" fallback wins.
+for _sl, _nm in ((2, "Food"), (1, "Wood"), (0, "Coin"), (7, "Export")):
+    _patt = f'g_settings.show_resource_names ? "{_nm}" : NULL'
+    check(_patt in code and
+          f"format_rate_line(line, sizeof(line), {_sl}," in code and
+          f"rate_get_ema({_sl})" in code,
+          f"R12: row {_sl} ({_nm}) names-off->NULL via format_rate_line+rate_get_ema")
 
 # 4) P0 one-shot render diagnostic (debug-gated, after the first-draw marker).
 i_fd = src.find('"ovl first draw ok frame=%d"')
