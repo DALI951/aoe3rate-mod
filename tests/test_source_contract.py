@@ -718,24 +718,28 @@ i_mg = src.find("g_match_active")
 check(i_mg != -1 and src.find("match start n=%d", i_mg) != -1,
       "R15: match-start separator (where the latch is set) present")
 
-# ================= ROUND 16: present-path tracer =================
-# R15 live log (Dali 1-min run, R15 build 61d8317d): ZERO `patch_swapchain:`
-# lines while the match rendered on a dead device-Present hook => the game never
-# called our wrapped IDirect3DDevice9::GetSwapChain. R16 is instrument-first:
-# (1) counters of BOTH present kinds log `present-path dev=%u sw=%u frames=%u`
-# once per 300 combined calls (NOT debug-gated — the deciding diagnostic);
-# (2) CreateAdditionalSwapChain (device slot 13) is wrapped so the OTHER
-# acquisition path is captured+patched too; (3) `device-count: n_devices=%u`
-# reports when a SECOND device vtable shows up (D3D9Ex/CreateDeviceEx).
-# Slot truth re-verified against the real mingw-w64 d3d9.h (IDirect3DDevice9
-# interface lines 1195-1218): 13 CreateAdditionalSwapChain, 14 GetSwapChain,
-# 15 GetNumberOfSwapChains, 16 Reset, 17 Present, 18 GetBackBuffer.
+# ================= ROUND 16/17: merged present-path + scene tracer =================
+# R15 live log (build 61d8317d): ZERO `patch_swapchain:` lines while the match
+# rendered on a dead device-Present hook => the game never called our wrapped
+# IDirect3DDevice9::GetSwapChain -> in-match present is an UNBOUND path. R16
+# instrumented both present kinds; R17 MERGED the line to
+# `present-path dev=%u sw=%u scene=%u frames=%u` (one mod-300 site per hook,
+# one shared tracer_tick), wrapped EndScene (slot 42) as the scene-alive probe,
+# and EAGERLY captures the runtime's IMPLICIT swapchain at device create.
+# Slot truth (R17 re-verified against the REAL mingw-w64 d3d9.h of this
+# toolchain, IDirect3DDevice9 interface): BeginScene=41 (line 1244), EndScene
+# =42 (line 1245) — ARGLESS stdcall (STDMETHOD(EndScene)(THIS)), device slots
+# 13 CreateAdditionalSwapChain / 14 GetSwapChain / 16 Reset / 17 Present all
+# unchanged -> the pinned d9mac set is unchanged: 42 was already pinned.
 check("static unsigned int s_dev_presents" in code,
       "R16: device-present counter static at file scope")
 check("static unsigned int s_sw_presents" in code,
       "R16: swapchain-present counter static at file scope")
-check(code.count("s_dev_presents++;") == 1 and code.count("s_sw_presents++;") == 1,
-      "R16: counters incremented on exactly one path each")
+check("static unsigned int s_scene_ends" in code,
+      "R17: EndScene counter static at file scope")
+check(code.count("s_dev_presents++;") == 1 and code.count("s_sw_presents++;") == 1
+      and code.count("s_scene_ends++;") == 1,
+      "R16/R17: counters incremented on exactly one path each")
 i_dev_inc = code.find("s_dev_presents++;")
 i_dev_cmn = code.find("overlay_present_common(self, 0);")
 i_sw_inc = code.find("s_sw_presents++;")
@@ -744,12 +748,15 @@ check(i_dev_inc != -1 and i_dev_cmn != -1 and i_dev_inc < i_dev_cmn,
       "R16: device counter increments BEFORE the enabled check (present_hook top)")
 check(i_sw_inc != -1 and i_sw_cmn != -1 and i_sw_inc < i_sw_cmn,
       "R16: swapchain counter increments BEFORE the enabled check (sw_present_hook top)")
-check(code.count('dlog("present-path dev=%u sw=%u frames=%u"') == 2,
-      "R16: present-path tracer line present in BOTH hooks (one mod-300 site each)")
-check("(s_dev_presents + s_sw_presents) % 300" in code,
-      "R16: tracer logs once per 300 combined present calls (mod-300)")
-check("s_dev_presents, s_sw_presents, (unsigned)g_frames_since_reset" in code,
-      "R16: tracer frames field carries the post-Reset frame counter")
+check(code.count('dlog("present-path dev=%u sw=%u scene=%u frames=%u"') == 1,
+      "R17: merged tracer format defined EXACTLY once (shared tracer_tick)")
+check(code.count("tracer_tick();") == 3,
+      "R17: all three hooks call the single tracer tick (dev + sw + scene)")
+check("(s_dev_presents + s_sw_presents + s_scene_ends) % 300" in code,
+      "R17: tracer logs once per 300 COMBINED Dev/Sw/Scene calls (mod-300)")
+check("s_dev_presents, s_sw_presents, s_scene_ends," in code
+      and "(unsigned)g_frames_since_reset" in code,
+      "R16/R17: tracer fields carry dev/sw/scene counters + the post-Reset frame counter")
 check("D9_CASC         13" in src or "D9_CASC 13" in src,
       "R16: Device::CreateAdditionalSwapChain slot 13 constant")
 check("static int STDMETHODCALLTYPE w_casc" in code,
@@ -764,8 +771,39 @@ check('dlog("device-count: n_devices=%u"' in code,
       "R16: device-count line logged on the second-vtable path")
 check("s_second_vt_logged = 0;" in code,
       "R16: second-vtable latch reset on process attach")
-check("s_orig_casc = NULL;" in code and "s_dev_presents = 0;" in code and "s_sw_presents = 0;" in code,
-      "R16: tracer statics reset on process attach")
+check("s_orig_casc = NULL;" in code and "s_dev_presents = 0;" in code
+      and "s_sw_presents = 0;" in code and "s_scene_ends = 0;" in code
+      and "s_orig_endscene = NULL;" in code,
+      "R16/R17: tracer + EndScene statics reset on process attach")
+
+# ================= ROUND 17: eager implicit-swapchain capture + EndScene probe =================
+# The runtime creates an implicit swapchain AT DEVICE CREATION (no game call).
+# Dali's R16 log (build ecca3c5f) froze the device Present hook exactly at
+# match start (dev=7500, then silence) — in fullscreen the driver hands Present
+# off to that implicit swapchain. R17 captures+patches it EAGERLY, on the
+# game's behalf, right after patch_device_present — and wraps EndScene so the
+# merged tracer proves whether the device is still alive when Present is not.
+check("static int STDMETHODCALLTYPE w_endscene" in code,
+      "R17: EndScene wrapped (the scene-alive probe)")
+check("DEV_ENDSCENE o = s_orig_endscene;" in code and "o(self)" in code,
+      "R17: w_endscene forwards to the saved original EndScene")
+check("s_orig_endscene = (DEV_ENDSCENE)vt[D9_ENDSCENE];" in code
+      and "vt[D9_ENDSCENE] = (void *)w_endscene;" in code,
+      "R17: device slot 42 saved once + patched inside patch_device_present")
+check("static void eager_implicit_swapchain" in code,
+      "R17: eager implicit-swapchain capture helper defined")
+check(code.count("eager_implicit_swapchain(*ppdev);") == 2,
+      "R17: eager capture called from BOTH CreateDevice and CreateDeviceEx")
+i_pd = code.find("int patched = patch_device_present(*ppdev);")
+i_ea = code.find("if (patched) eager_implicit_swapchain(*ppdev);")
+i_font = code.find("if (patched) ui_create_font(*ppdev);")
+check(i_pd != -1 and i_ea != -1 and i_font != -1 and i_pd < i_ea < i_font,
+      "R17: eager capture runs AFTER patch, BEFORE the R9 font bind (both paths)")
+check("int shr = w_get_swapchain(dev, 0, &sw);" in code,
+      "R17: eager capture calls the WRAPPED slot 14 (flows through R15 patch logic)")
+check('dlog("swapchain-impl: sw=%p patched=%d"' in code
+      and 'dlog("swapchain-impl: n/a hr=0x%08X"' in code,
+      "R17: swapchain-impl line (patched / n/a) logged once per device")
 
 print("SOURCE-CONTRACT:", "PASS" if failures == 0 else f"{failures} FAILURES")
 sys.exit(0 if failures == 0 else 1)

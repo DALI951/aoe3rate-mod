@@ -540,6 +540,30 @@ static void test_swapchain_hook(void) {
         printf("PASS: device slot 14 -> w_get_swapchain (capture in place)\n");
     }
 
+    /* R17 EAGER implicit-swapchain capture: w_create_device ran
+     * eager_implicit_swapchain() on the game's behalf INSIDE the create call —
+     * the runtime's implicit swapchain was captured+patched before THIS test
+     * ever called GetSwapChain. (Slot-3 hook + saved original + g_sw + BOTH
+     * the patch_swapchain AND swapchain-impl lines must already be present.) */
+    if (s_orig_sw_present == NULL || g_sw == NULL) {
+        printf("FAIL: w_create_device did not eagerly capture the implicit swapchain\n");
+        failures++;
+    } else {
+        printf("PASS: implicit swapchain eagerly captured+patched at device create (no game GetSwapChain call)\n");
+    }
+    if (!log_contains("swapchain-impl: sw=")) {
+        printf("FAIL: swapchain-impl capture line not logged\n");
+        failures++;
+    } else {
+        printf("PASS: `swapchain-impl: sw=.. patched=1` logged at create\n");
+    }
+    if (!log_contains("patch_swapchain: sw=")) {
+        printf("FAIL: patch_swapchain install line not logged for the implicit swapchain\n");
+        failures++;
+    } else {
+        printf("PASS: implicit swapchain went through the R15 patch logic (patch_swapchain: sw=..)\n");
+    }
+
     void *sw = NULL;
     int h2 = ((DEV_GETSC)vt[14])(dev, 0, &sw);
     if (h2 < 0 || sw == NULL) {
@@ -616,13 +640,47 @@ static void test_swapchain_hook(void) {
             printf("FAIL: present-path tracer line not logged at the 300-boundary\n");
             failures++;
         } else {
-            printf("PASS: `present-path dev=150 sw=150 frames=..` logged once per 300 calls\n");
+            printf("PASS: `present-path dev=150 sw=150 scene=0 frames=..` logged at the 300-boundary\n");
         }
         if (s_orig_casc != NULL && ((DEV_CASC)vt[13]) == (DEV_CASC)w_casc) {
             printf("PASS: device slot 13 -> w_casc (CreateAdditionalSwapChain captured)\n");
         } else {
             printf("FAIL: device slot 13 (CreateAdditionalSwapChain) not wrapped\n");
             failures++;
+        }
+
+        /* R17 scene-alive probe: drive REAL EndScene through the patched slot
+         * 42 (w_endscene -> forwards to real d3d9 EndScene). +300 combined
+         * calls take the merged counter 300 -> 600, so the mod-300 tracer MUST
+         * fire a SECOND line and it MUST show the scene field climbing while
+         * dev/sw hold at 150 (the exact R17 in-match scenario shape). */
+        if (vt[42] != (void *)w_endscene) {
+            printf("FAIL: device EndScene (slot 42) is not w_endscene (scene probe absent)\n");
+            failures++;
+        } else {
+            printf("PASS: device slot 42 -> w_endscene (EndScene probe in place)\n");
+        }
+        {
+            int k2;
+            for (k2 = 0; k2 < 300; k2++) ((DEV_ENDSCENE)vt[42])(dev);
+        }
+        if (s_scene_ends != 300) {
+            printf("FAIL: scene counter wrong (%u)\n", s_scene_ends);
+            failures++;
+        } else {
+            printf("PASS: scene counter rose to 300 via real EndScene calls\n");
+        }
+        if (s_dev_presents != 150 || s_sw_presents != 150) {
+            printf("FAIL: dev/sw counters moved during the scene probe\n");
+            failures++;
+        } else {
+            printf("PASS: dev/sw hold at 150/150 while scene climbs (device alive, present frozen)\n");
+        }
+        if (!log_contains("scene=300")) {
+            printf("FAIL: merged tracer line missing the scene=300 boundary\n");
+            failures++;
+        } else {
+            printf("PASS: `present-path dev=150 sw=150 scene=300 frames=..` at the 600-boundary\n");
         }
     }
 

@@ -143,10 +143,12 @@ static unsigned int s_re_present_n = 0;  /* R13: consecutive reentrant-present f
 
 typedef int  (STDMETHODCALLTYPE *DEV_GETSC)(void *self, UINT i, void **pp);
 typedef int  (STDMETHODCALLTYPE *DEV_CASC)(void *self, const void *pp, void **sc);
+typedef int  (STDMETHODCALLTYPE *DEV_ENDSCENE)(void *self);   /* argless stdcall (STDMETHOD(EndScene)(THIS)) */
 typedef int  (STDMETHODCALLTYPE *SW_PRESENT_FN)(void *sw, const RECT *a,
         const RECT *b, HWND hwnd, const void *dirty, DWORD flags);
 static DEV_GETSC s_orig_get_swapchain = NULL;  /* device slot 14, saved ONCE (R6 semantics) */
 static DEV_CASC  s_orig_casc          = NULL;  /* device slot 13, saved ONCE (R16) */
+static DEV_ENDSCENE s_orig_endscene   = NULL;  /* device slot 42, saved ONCE (R17) */
 static SW_PRESENT_FN s_orig_sw_present = NULL; /* swapchain slot 3, saved ONCE */
 static void *g_sw = NULL;                      /* last captured swapchain (re-patch + diagnostics) */
 static int g_ovl_last_draw_frame = -1;         /* R15: frame marker for the same-frame double-call guard */
@@ -169,7 +171,30 @@ static int g_ovl_last_draw_frame = -1;         /* R15: frame marker for the same
  * tracker, chain and font semantics are untouched. */
 static unsigned int s_dev_presents = 0;   /* IDirect3DDevice9::Present (slot 17) calls, every one */
 static unsigned int s_sw_presents  = 0;   /* IDirect3DSwapChain9::Present (slot 3) calls, every one */
+static unsigned int s_scene_ends   = 0;   /* IDirect3DDevice9::EndScene (slot 42) calls, every one (R17) */
 static unsigned int s_n_dev_seen   = 0;   /* distinct device vtables seen through patch_device_present */
+
+/* R17: the MERGED tracer — ONE line every 300 combined Dev/Sw/Scene entry
+ * points (keeps the R16 format and adds `scene`):
+ *   present-path dev=%u sw=%u scene=%u frames=%u
+ * Each counter bumps at the TOP of its own hook (BEFORE the enabled check +
+ * common body), then ALL THREE call this tick — exactly ONE line is logged
+ * wherever the 300-boundary lands. Reading the next log:
+ *   - scene climbing + dev+sw frozen -> device ALIVE, only Present is
+ *     rerouted -> the R17 EndScene-draw hook point is the architecture.
+ *   - sw climbing -> the eager implicit-swapchain capture is working.
+ *   - dev climbing -> the device Present path IS alive, revisit R15.
+ *   - all three frozen while frames continue -> present is external/2nd
+ *     context -> D3D9Ex second-device tracing next.
+ * The R16 comment above this block explains the origin (R15 build 61d8317d:
+ * ZERO patch_swapchain lines => in-match present was never an EXPLICIT
+ * swapchain acquisition; R17 then proves two live questions in one run). */
+static void tracer_tick(void) {
+    if (((s_dev_presents + s_sw_presents + s_scene_ends) % 300) == 0)
+        dlog("present-path dev=%u sw=%u scene=%u frames=%u",
+             s_dev_presents, s_sw_presents, s_scene_ends,
+             (unsigned)g_frames_since_reset);
+}
 
 /* (patch_device_present forward-declared above) */
 
@@ -178,9 +203,11 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
         HWND hwnd, const void *dirty);
 static int STDMETHODCALLTYPE sw_present_hook(void *sw, const RECT *a, const RECT *b,
         HWND hwnd, const void *dirty, DWORD flags);
+static int STDMETHODCALLTYPE w_endscene(void *self);
 static int STDMETHODCALLTYPE w_get_swapchain(void *self, UINT i, void **pp);
 static int STDMETHODCALLTYPE w_casc(void *self, const void *pp, void **sc);
 static void patch_swapchain(void *sw);
+static void eager_implicit_swapchain(void *dev);
 
 static int  STDMETHODCALLTYPE w_query_interface(void *self, const void *iid, void **p);
 static unsigned long STDMETHODCALLTYPE w_add_ref(void *self);
@@ -252,6 +279,7 @@ static int STDMETHODCALLTYPE w_create_device(void *self, UINT adapter, UINT type
         dlog("CreateDevice hr=%#010x dev=%p patched=%s",
              (unsigned)hr, *ppdev, patched ? "yes" : "no");
         g_frames_since_reset = 0;
+        if (patched) eager_implicit_swapchain(*ppdev);  /* R17: capture+patch the IMPLICIT swapchain (the runtime makes one at creation) */
         if (patched) ui_create_font(*ppdev);   /* R9: only bind a font to a device
                                                   whose Present hook runs the overlay */
         }
@@ -273,6 +301,7 @@ static int STDMETHODCALLTYPE w_create_device_ex(void *self, UINT adapter, UINT t
         dlog("CreateDeviceEx hr=%#010x dev=%p patched=%s",
              (unsigned)hr, *ppdev, patched ? "yes" : "no");
         g_frames_since_reset = 0;
+        if (patched) eager_implicit_swapchain(*ppdev);  /* R17: capture+patch the IMPLICIT swapchain (the runtime makes one at creation) */
         if (patched) ui_create_font(*ppdev);   /* R9: only bind a font to a device
                                                   whose Present hook runs the overlay */
         }
@@ -408,9 +437,7 @@ static int STDMETHODCALLTYPE sw_present_hook(void *sw, const RECT *a, const RECT
      * disabled overlay can never hide the path; one line per 300 combined
      * presents of either kind (`frames` = the post-Reset frame counter). */
     s_sw_presents++;
-    if (((s_dev_presents + s_sw_presents) % 300) == 0)
-        dlog("present-path dev=%u sw=%u frames=%u",
-             s_dev_presents, s_sw_presents, (unsigned)g_frames_since_reset);
+    tracer_tick();
     overlay_present_common(sw, 1);
     SW_PRESENT_FN fl = s_orig_sw_present;
     return (fl != NULL) ? fl(sw, a, b, hwnd, dirty, flags) : (int)0x8876086c;
@@ -465,6 +492,58 @@ static int STDMETHODCALLTYPE w_casc(void *self, const void *pp, void **sc) {
     return hr;
 }
 
+/* R17: device EndScene wrapper (slot 42) — the scene-alive probe. Answers
+ * whether the device still runs SCENE methods while Device::Present is frozen
+ * in-match. Slot truth re-verified against the REAL mingw-w64 d3d9.h of this
+ * toolchain (IDirect3DDevice9 interface): BeginScene=41 (line 1244), EndScene
+ * =42 (line 1245), signature `STDMETHOD(EndScene)(THIS)` = ARGLESS stdcall,
+ * one `this` on i386. Forward-only + one scene counter + the merged tracer
+ * tick. NO drawing here: ROUND 17 deliberately leaves a commented hook point
+ * below — the EndScene-draw body is wired ONLY when this round's tracer
+ * PROVES `scene` climbs in-match while dev/sw stay frozen. */
+static int STDMETHODCALLTYPE w_endscene(void *self) {
+    s_scene_ends++;
+    tracer_tick();
+    DEV_ENDSCENE o = s_orig_endscene;
+    if (o == NULL) return (int)0x8876086c;
+    int hr = o(self);
+    /* R17 conditional EndScene-draw (DO NOT ENABLE — diagnostics run first):
+     * if the tracer shows `scene` climbing in-match while dev+sw stay frozen,
+     * the device is ALIVE and only Present is rerouted -> the overlay body
+     * belongs HERE: this frame is the game's final scene, back buffer holds
+     * the finished frame. Mirror the Present path via
+     * overlay_present_common(self, 0) with the same once-per-frame guard
+     * g_ovl_last_draw_frame + the B7 tripwire, running AFTER the real EndScene
+     * (like present_hook runs after the real Present). Wire it ONLY on
+     * evidence — never speculatively. */
+    return hr;
+}
+
+/* R17: eager capture of the IMPLICIT swapchain — the decisive instrument of
+ * this round. The D3D9 runtime ALWAYS creates a swapchain at device creation
+ * (GetNumberOfSwapChains() >= 1) without the game ever calling GetSwapChain /
+ * CreateAdditionalSwapChain, and in FULLSCREEN the driver hands Device::Present
+ * off to that implicit swapchain internally. R15/R16 only wrapped EXPLICIT
+ * acquisitions, and Dali's R16 log proved the device Present hook freezes
+ * EXACTLY at match start (dev=7500, ZERO explicit swapchain requests, ZERO
+ * patch_swapchain lines). So on the game's behalf, call OUR WRAPPED slot 14
+ * here: w_get_swapchain flows through the R15 patch logic and the implicit
+ * swapchain is captured + patched (+ one `patch_swapchain:` line) immediately.
+ * Idempotent: patch_swapchain returns early when that vtable is already
+ * patched. Logged once per device by w_create_device/w_create_device_ex. */
+static void eager_implicit_swapchain(void *dev) {
+    if (dev == NULL) return;
+    void *sw = NULL;
+    int shr = w_get_swapchain(dev, 0, &sw);
+    if (shr >= 0 && sw != NULL) {
+        void **vts = *(void ***)sw;
+        int pt = (vts != NULL && vts[D9_SW_PRESENT] == (void *)sw_present_hook) ? 1 : 0;
+        dlog("swapchain-impl: sw=%p patched=%d", sw, pt);
+    } else {
+        dlog("swapchain-impl: n/a hr=0x%08X", (unsigned)shr);
+    }
+}
+
 static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
     g_device = self;
     g_frames_since_reset = 0;
@@ -494,9 +573,7 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
      * disabled overlay can never hide the path; one line per 300 combined
      * presents of either kind (`frames` = the post-Reset frame counter). */
     s_dev_presents++;
-    if (((s_dev_presents + s_sw_presents) % 300) == 0)
-        dlog("present-path dev=%u sw=%u frames=%u",
-             s_dev_presents, s_sw_presents, (unsigned)g_frames_since_reset);
+    tracer_tick();
     /* R15: the ONCE-PER-FRAME overlay body now lives in
      * overlay_present_common() (shared with the swapchain hook — one code
      * path, no duplication). This hook keeps the MENU path intact: run the
@@ -567,6 +644,18 @@ static int patch_device_present(void *dev) {
             VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
             s_orig_casc = (DEV_CASC)vt[13];
             vt[13] = (void *)w_casc;
+            VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
+        }
+        if (s_orig_endscene == NULL) {
+            /* R17: wrap EndScene (slot 42) — the scene-alive probe. Dali's R16
+             * log froze the device Present hook in-match (dev=7500, no further
+             * present-path lines); if EndScene keeps running there, the device
+             * is ALIVE and the overlay belongs at scene end (the conditional
+             * hook point in w_endscene is documented, NOT enabled). */
+            DWORD slot = (DWORD)(DWORD_PTR)&vt[D9_ENDSCENE];
+            VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
+            s_orig_endscene = (DEV_ENDSCENE)vt[D9_ENDSCENE];
+            vt[D9_ENDSCENE] = (void *)w_endscene;
             VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
         }
         s_n_dev_seen++;   /* R16: distinct device vtable seen (patched) */
@@ -838,11 +927,13 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         s_orig_reset = NULL;
         s_orig_get_swapchain = NULL;
         s_orig_casc = NULL;
+        s_orig_endscene = NULL;
         s_orig_sw_present = NULL;
         g_sw = NULL;
         g_ovl_last_draw_frame = -1;
         s_dev_presents = 0;
         s_sw_presents = 0;
+        s_scene_ends = 0;
         s_n_dev_seen = 0;
         s_second_vt_logged = 0;
         g_devvt = NULL;

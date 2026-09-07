@@ -1,3 +1,101 @@
+# BUILD — ROUND 17 (2026-09-07) — TWO DECISIVE INSTRUMENTS: EAGER IMPLICIT-SWAPCHAIN CAPTURE + ENDSCENE PROBE (the fullscreen Present handoff, proven not theorized)
+
+## ROUND SUMMARY
+No crash this round (game NOT launched). Dali's R16 live log froze the mystery and pointed the gun:
+`present-path dev=300 sw=0 ... dev=7500 sw=0 frames=2925` during menu+loading, then the device Present
+hook went SILENT exactly at match start while the game kept rendering — and ZERO `patch_swapchain:`
+lines ever. Deduction 1 (testable): the in-match frames present through the **IMPLICIT swapchain** the
+D3D9 runtime creates at device creation — never captured because we only patched EXPLICIT acquisitions;
+in fullscreen the driver hands Present off to it internally. Deduction 2 (testable): the device may
+STILL run scene methods in-match (EndScene alive + Present frozen => the overlay belongs at scene end).
+
+## Dali 1-MIN LIVE LOG (R16 build ecca3c5f, session dev=0ca5a1e0 — the EVIDENCE)
+```
+present-path dev=300 sw=0 ... dev=7500 sw=0 frames=2925   <- device Present hook runs THROUGH loading
+chain ... n=3 [human-p1]
+--- match start n=3 player=0F387800 res=125E9F80 ---
+RES t=1 ...                                             <- ONE sample
+UI: font created ...
+ovl first draw ok frame=3095
+ovl diag rt=01129a60 rect=12,12:250x141 alpha=0xD9
+(END — dev counter freezes at 7500; no further present-path lines despite the
+ match continuing; user saw the overlay flash once at match start)
+```
+Decisive reading: our device Present hook ran 7,500 times through menu+loading, then ZERO more at match
+start while rendering visibly continued. Combined with zero explicit swapchain requests, the ONLY
+self-consistent D3D9 explanation is the runtime's implicit swapchain (fullscreen Present handoff).
+
+## CHANGE LIST (all diagnostic-only — zero behavior change to gates/tracker/chain/fonts)
+- **Eager implicit-swapchain capture (the fix that likely makes sw count in-match):** new
+  `eager_implicit_swapchain(dev)` called from BOTH w_create_device and w_create_device_ex, AFTER
+  patch_device_present and BEFORE the R9 font bind. It calls OUR WRAPPED slot 14
+  (`w_get_swapchain(dev, 0, &sw)`) on the game's behalf — the call flows through the existing R15
+  patch logic (patch + `patch_swapchain: sw=.. vt=.. present=..` log), so the implicit swapchain the
+  runtime made at creation is captured+patched up-front, WITHOUT the game ever asking. Logs
+  `swapchain-impl: sw=%p patched=%d` per device (or `swapchain-impl: n/a hr=0x%08X` if GetSwapChain(0)
+  fails). Idempotent: patch_swapchain returns early on an already-patched vtable. The lazy
+  w_get_swapchain/w_casc wrappers stay.
+- **Scene-alive probe:** `w_endscene` (device slot 42) — forward to the saved original, bump
+  `s_scene_ends`, log only via the merged tracer. Slot truth RE-VERIFIED against the REAL mingw-w64
+  d3d9.h of this toolchain (IDirect3DDevice9 interface lines 1244-1245): **BeginScene=41, EndScene=42,
+  BOTH ARGLESS `STDMETHOD(EndScene)(THIS)`** (one `this` stdcall on i386) — the existing D9_ENDSCENE 42
+  define (ui.c) and the pinned slot set {3,13,14,16,38,41,42,57,58,83,89,90} are confirmed correct,
+  no set change. patched slot 42 inside patch_device_present (original saved ONCE).
+- **MERGED tracer:** `tracer_tick()` shared by all three hooks; counters bump at the TOP of each hook
+  (before the enabled check), then the tick logs ONE line per 300 COMBINED Dev/Sw/Scene increments:
+  `present-path dev=%u sw=%u scene=%u frames=%u` (R16 fields kept, `scene` added, NOT debug-gated).
+- **CONDITIONAL ENDSCENE DRAW READY (documented, NOT enabled):** a clearly-marked commented hook point
+  in w_endscene explains exactly how the overlay body would run at scene end (post-EndScene, mirroring
+  present_hook, same g_ovl_last_draw_frame guard + B7 tripwire) — wired ONLY if the tracer proves
+  `scene` climbs in-match. We add code per evidence, not before.
+
+## TEST EVIDENCE (all 4 harnesses green)
+- `test_source_contract.py`: **SOURCE-CONTRACT: PASS** — R16 pins updated to the MERGED format
+  (format defined EXACTLY once in tracer_tick, `tracer_tick();` exactly 3 sites, mod-300 over the
+  Dev+Sw+Scene triple, scene counter static + one increment path, ordering pins intact, attach resets
+  incl. s_scene_ends + s_orig_endscene) plus NEW R17 pins: w_endscene exists + forwards `o(self)`
+  + saves originals once (vt[D9_ENDSCENE] patched), eager helper defined, eager call in BOTH create
+  wrappers, eager ordering AFTER patch_device_present BEFORE the R9 font bind, wrapped-slot call
+  `w_get_swapchain(dev, 0, &sw)`, both swapchain-impl line formats. All R15/R16 pins still pass.
+- `tests\test_rate_engine.exe`: **FAILURES: 0** (untouched).
+- `tests\test_d3d9_actual.exe`: **ALL D3D9 ACTUAL CHECKS PASSED** — new R17 asserts on the REAL
+  device: (a) after CreateDevice through OUR wrapper, the implicit swapchain was ALREADY captured+
+  patched WITHOUT any test-side GetSwapChain (s_orig_sw_present + g_sw set, `swapchain-impl: sw=..
+  patched=1` AND `patch_swapchain: sw=..` both logged); (b) slot 42 -> w_endscene; (c) 300 real
+  EndScene calls => s_scene_ends==300, dev/sw hold at 150/150, and the merged tracer fires its
+  SECOND line: log literally shows `present-path dev=150 sw=150 scene=0 frames=0` then
+  `present-path dev=150 sw=150 scene=300 frames=0` — the exact in-match shape (device alive, present
+  frozen) reproduced live. All R15/R16 asserts still green.
+- `tests\test_pe_structure.py`: **FAILURES: 0** — imports unchanged {KERNEL32.dll, msvcrt.dll,
+  USER32.dll}, 11 exports, i386.
+
+## RESULT
+```
+sha256=97fc2adf5a8780aab2463561acee43ce0567cfd39281c8666dc2c39e56a21f31
+size=152736
+```
+Deployed byte-identical to repo root + game dir + tests; old d3d9mod.log deleted; game NOT launched.
+
+## EXPECTED-LOG for Dali's next run (ACCEPTANCE — run >=90s so the mod-300 tracer certainly fires)
+```
+swapchain-impl: sw=.. patched=1                  <- NEW: eager capture at device create (both create paths)
+patch_swapchain: sw=.. vt=.. present=..          <- the implicit swapchain install (via the same patch logic)
+present-path dev=.. sw=.. scene=.. frames=..     <- every ~5s TOGETHER IN-MATCH is the deciding marker
+```
+Reading table (the whole point of the two instruments):
+- `sw` CLIMBING in-match  => the implicit capture WORKED — the match presents through the runtime's
+  swapchain and we now own its Present hook. Next step: wire the redundant draw (the overlay body on
+  that Present is already installed — expect it VISIBLE) and only then any render geometry fixes.
+- `scene` CLIMBING + `dev`/`sw` both frozen while the game renders => device is ALIVE but Present is
+  rerouted somewhere external (a windowed swapchain we still can't see, or explicit-window Handoff):
+  ENABLE the already-prepared EndScene-draw hook point (documented in w_endscene) as the architecture.
+- `dev` CLIMBING in-match  => the device Present path returned (unlikely; revisit what changed).
+- All three frozen while the game renders => present is external/2nd context entirely -> next round
+  traces the D3D9Ex/CreateDeviceEx second device (`device-count: n_devices=` already reports it).
+- Everything frozen AND the game breaks => our patching broke the game -> revert the tracer, compare.
+
+---
+
 # BUILD — ROUND 16 (2026-09-07) — INSTRUMENT-FIRST: PRESENT-PATH TRACER (the R15 theory produced NO install line — prove it, don't theorize)
 
 ## ROUND SUMMARY
