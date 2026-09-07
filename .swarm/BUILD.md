@@ -1,3 +1,95 @@
+# BUILD — ROUND 16 (2026-09-07) — INSTRUMENT-FIRST: PRESENT-PATH TRACER (the R15 theory produced NO install line — prove it, don't theorize)
+
+## ROUND SUMMARY
+No crash this round (game NOT launched). R15's swapchain theory is now DECISIVELY INVALIDATED as the
+complete answer: Dali's R15 live log contains **ZERO `patch_swapchain:` lines** => the game NEVER called
+our wrapped `IDirect3DDevice9::GetSwapChain` (slot 14), yet the match rendered fine with the device
+`Present` hook dead (zero `RES t=2+`, zero heartbeats, zero `ovl stop`). The in-match present runs through
+a path we do NOT intercept: either a swapchain acquired via **CreateAdditionalSwapChain (slot 13)** or a
+**second device** (D3D9Ex / CreateDeviceEx). Legacy theory is gone; this round makes the next live run
+DECISIVE instead of silent.
+
+## Dali 1-MIN LIVE LOG (R15 build 61d8317d, session dev=0ca180a0 — the EVIDENCE)
+```
+CreateDevice hr=0000000000 dev=0ca180a0 patched=yes
+chain-break x5 (menu)
+reset dev=0ca180a0 -> font invalidated
+chain ... n=3 [human-p1]
+--- match start ---
+RES t=1 food=0 wood=0 coin=0 export=0 player=0F5C5800 res=12869F80
+UI: font created ...
+ovl first draw ok frame=506
+ovl diag rt=01149a60 rect=12,12:250x141 alpha=0xD9
+(END — no patch_swapchain:, no heartbeats, no RES t=2+, no ovl stop)
+```
+Decisive reading: if the match presented through a swapchain we PATCHED, the install line
+(`patch_swapchain: sw=.. vt=.. present=..`, logged once per swapchain on GetSwapChain) would exist.
+It does not => GetSwapChain was never called => the in-match swapchain (if any) comes from
+CreateAdditionalSwapChain or lives on a second device. PROVEN, no longer theory.
+
+## CHANGE LIST (all diagnostic-only — zero behavior change to gates/tracker/chain/fonts)
+- **present-path tracer (core):** file-scope `s_dev_presents` / `s_sw_presents` counters; incremented at
+  the TOP of `present_hook` / `sw_present_hook` (BEFORE the enabled check, so a disabled overlay can
+  never hide the path). Every 300 combined calls — `((s_dev_presents + s_sw_presents) % 300) == 0` —
+  ONE not-debug-gated line: `present-path dev=%u sw=%u frames=%u` (frames = g_frames_since_reset).
+  ~1 line/5s at 60fps. If neither counter moves during an 8-min match, the next log now SHOWS it.
+- **CreateAdditionalSwapChain hook (slot 13):** `w_casc` wraps it exactly like `w_get_swapchain`
+  (forward -> on success `patch_swapchain(*sc)` -> same slot-3 hook + once-per-object install log).
+  `patch_device_present` saves `s_orig_casc` ONCE and patches `vt[13]`. Slot truth re-verified against
+  the real mingw-w64 d3d9.h, IDirect3DDevice9 interface lines 1195-1218: 13 CreateAdditionalSwapChain,
+  14 GetSwapChain, 15 GetNumberOfSwapChains, 16 Reset, 17 Present, 18 GetBackBuffer. New canonical
+  slot set pinned EXACTLY: {3, 13, 14, 16, 38, 41, 42, 57, 58, 83, 89, 90}.
+- **device-count (second device):** `s_n_dev_seen` counts distinct device vtables seen through
+  `patch_device_present`; when a SECOND vtable shows up (the R8 A5 "second vtable" branch) the first
+  log adds `device-count: n_devices=%u`. Tells us if the match runs on a second D3D9Ex/CreateDeviceEx
+  device. Also incremented for the FIRST (patched) vtable so n_devices is truthful.
+- **DllMain:** resets `s_orig_casc`, `s_dev_presents`, `s_sw_presents`, `s_n_dev_seen`,
+  `s_second_vt_logged` on process attach.
+
+## TEST EVIDENCE (all 4 harnesses green)
+- `test_source_contract.py`: **SOURCE-CONTRACT: PASS** — d9mac set pinned to {3,13,14,16,38,41,42,57,58,
+  83,89,90}; 14 NEW R16 pins (counters static at file scope, one increment path each, increments BEFORE
+  the enabled-check/common body in BOTH hooks, tracer line defined EXACTLY once, mod-300 condition,
+  frames field = g_frames_since_reset, D9_CASC 13, w_casc exists + pending `patch_swapchain(*sc)`,
+  slot 13 saved once + patched, s_n_dev_seen present, device-count line on second-vtable path, attach
+  resets). All R15 pins still pass unchanged.
+- `tests\test_rate_engine.exe`: **FAILURES: 0** (untouched this round).
+- `tests\test_d3d9_actual.exe`: **ALL D3D9 ACTUAL CHECKS PASSED** — the R15 real-device swapchain block
+  (slot 14 -> w_get_swapchain, slot 3 -> sw_present_hook, orig saved, install logged, idempotent) PLUS a
+  NEW R16 tracer block against the REAL device + REAL swapchain: with `g_settings.enabled=0` (zero-touch
+  common body, forwards still hit real d3d9.dll) it drives `vt[17]` (present_hook) 150x + `sw_present_hook`
+  150x = 300 combined -> counters read 150/150, the mod-300 `present-path dev=150 sw=150 frames=..` line
+  fires exactly once, and device slot 13 is w_casc with the original saved.
+- `tests\test_pe_structure.py`: **FAILURES: 0** — imports unchanged {KERNEL32.dll, msvcrt.dll, USER32.dll},
+  11 exports, i386.
+
+## RESULT
+```
+sha256=ecca3c5fce6179a0aa2ebe34d4a8ea8d324ba24a3edfa9f708515691583826ce
+size=152038
+```
+Deployed byte-identical to repo root + game dir + tests; old d3d9mod.log deleted; game NOT launched.
+
+## EXPECTED-LOG for Dali's next run (ACCEPTANCE — run >=90s so the 300-modulo tracer certainly fires)
+```
+patch_swapchain: sw=.. vt=.. present=..      <- ONLY if the game acquires via GetSwapChain OR CreateAdditionalSwapChain
+present-path dev=.. sw=.. frames=..          <- every ~5s IN-MATCH is the DECIDING marker
+RES t=1 ... t=2 ...                          <- cadence as before
+ovl heartbeat 300 ...                        <- whenever the overlay draw path is alive
+```
+Reading table:
+- `dev` counts RISING in-match  => the device Present path IS alive (the R15 device-hook silence was
+  a different bug — revisit RES/log ordering, not the hooking).
+- `sw` counts RISING in-match   => swapchain path CONFIRMED alive -> hook deeper into that swapchain
+  (surface/RT acquire + raw draw) next round.
+- NEITHER rising while the game renders => present happens OUTSIDE our patched objects entirely ->
+  next step is D3D9Ex / CreateDeviceEx second-device tracing (watch `device-count: n_devices=`)
+  or a GetDeviceCaps-level probe.
+- both counting in menu/loading ONLY => match-specific present path — keep the log and correlate the
+  counter boundary with the match-start frame.
+
+---
+
 # BUILD — ROUND 15 (2026-09-07) — ROOT CAUSE: the game renders IN-MATCH via IDirect3DSwapChain9::Present
 
 ## ROUND SUMMARY

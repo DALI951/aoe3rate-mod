@@ -589,6 +589,43 @@ static void test_swapchain_hook(void) {
         }
     }
 
+    /* R16 present-path tracer: drive BOTH production hooks against the REAL
+     * device + REAL swapchain. g_settings.enabled=0 (zero-touch common body:
+     * only the counters move, no chain/font/RT work) while every call still
+     * FORWARDS through the true d3d9.dll Present — 150 device + 150 swapchain
+     * = 300 combined, so the mod-300 tracer line MUST fire exactly once and
+     * the readbacks must be 150/150. Proves the counters are live on the
+     * actual vtable call path (the R16 primary diagnostic). */
+    {
+        int saved_en = g_settings.enabled;
+        g_settings.enabled = 0;
+        int k;
+        for (k = 0; k < 150; k++) {
+            ((PRESENT_FN)vt[17])(dev, NULL, NULL, NULL, NULL);
+            sw_present_hook(sw, NULL, NULL, NULL, NULL, 0);
+        }
+        g_settings.enabled = saved_en;
+        if (s_dev_presents != 150 || s_sw_presents != 150) {
+            printf("FAIL: present-path counters wrong (%u device / %u swapchain)\n",
+                   s_dev_presents, s_sw_presents);
+            failures++;
+        } else {
+            printf("PASS: tracer counted 150 device + 150 swapchain presents\n");
+        }
+        if (!log_contains("present-path dev=")) {
+            printf("FAIL: present-path tracer line not logged at the 300-boundary\n");
+            failures++;
+        } else {
+            printf("PASS: `present-path dev=150 sw=150 frames=..` logged once per 300 calls\n");
+        }
+        if (s_orig_casc != NULL && ((DEV_CASC)vt[13]) == (DEV_CASC)w_casc) {
+            printf("PASS: device slot 13 -> w_casc (CreateAdditionalSwapChain captured)\n");
+        } else {
+            printf("FAIL: device slot 13 (CreateAdditionalSwapChain) not wrapped\n");
+            failures++;
+        }
+    }
+
     /* release the created objects via the vtable (COM) */
     void **vd = *(void ***)dev;
     if (vd != NULL && vd[2] != NULL) ((void (STDMETHODCALLTYPE *)(void *))vd[2])(dev);

@@ -490,14 +490,15 @@ with open(os.path.join(ROOT, "build", "build.bat"), "r", encoding="utf-8", error
     bb = bat.read()
 check("-lgdi32" not in bb, "R10: build.bat does NOT link gdi32 statically (import table stays clean)")
 
-# 4) vtable-slot constants: device D9_* and font FONT_* pinned EXACTLY (R15:
-# NEW canonical slots — 14 GetSwapChain + 3 SwapChain::Present — are the
-# round-15 mandate: without them in-match presents can never be hooked, since
-# the game renders through the swapchain, not the device).
+# 4) vtable-slot constants: device D9_* and font FONT_* pinned EXACTLY (R15/R16
+# canonical slots — 14 GetSwapChain + 3 SwapChain::Present hooked the game's
+# swapchain; R16 adds 13 CreateAdditionalSwapChain, the OTHER acquisition path
+# — the R15 live log showed zero GetSwapChain calls, so in-match swapchains are
+# either created here or live on a second device (R16 device-count tracer)).
 d9mac = set(int(v) for v in re.findall(r"#define D9_\w+\s+(\d+)", src))
 ftmac = set(int(v) for v in re.findall(r"#define FONT_\w+\s+(\d+)", src))
-check(d9mac == {3, 14, 16, 38, 41, 42, 57, 58, 83, 89, 90},
-      "R15: slot constants pinned EXACTLY {3(SW Present),14(GetSwapChain),16,38,41,42,57,58,83,89,90}")
+check(d9mac == {3, 13, 14, 16, 38, 41, 42, 57, 58, 83, 89, 90},
+      "R16: slot constants pinned EXACTLY {3(SW Present),13(CreateAdditionalSwapChain),14(GetSwapChain),16,38,41,42,57,58,83,89,90}")
 check(ftmac == {14, 16, 17},
       "R10: font vtable slots pinned EXACTLY {14,16,17} (no additions)")
 check("vt[" not in gbody, "R10: GDI fallback body contains NO device-vtable dispatch (vt[)")
@@ -716,6 +717,55 @@ check('!strcmp(stage, "values")' in code and '!strcmp(stage, "res")' in code,
 i_mg = src.find("g_match_active")
 check(i_mg != -1 and src.find("match start n=%d", i_mg) != -1,
       "R15: match-start separator (where the latch is set) present")
+
+# ================= ROUND 16: present-path tracer =================
+# R15 live log (Dali 1-min run, R15 build 61d8317d): ZERO `patch_swapchain:`
+# lines while the match rendered on a dead device-Present hook => the game never
+# called our wrapped IDirect3DDevice9::GetSwapChain. R16 is instrument-first:
+# (1) counters of BOTH present kinds log `present-path dev=%u sw=%u frames=%u`
+# once per 300 combined calls (NOT debug-gated — the deciding diagnostic);
+# (2) CreateAdditionalSwapChain (device slot 13) is wrapped so the OTHER
+# acquisition path is captured+patched too; (3) `device-count: n_devices=%u`
+# reports when a SECOND device vtable shows up (D3D9Ex/CreateDeviceEx).
+# Slot truth re-verified against the real mingw-w64 d3d9.h (IDirect3DDevice9
+# interface lines 1195-1218): 13 CreateAdditionalSwapChain, 14 GetSwapChain,
+# 15 GetNumberOfSwapChains, 16 Reset, 17 Present, 18 GetBackBuffer.
+check("static unsigned int s_dev_presents" in code,
+      "R16: device-present counter static at file scope")
+check("static unsigned int s_sw_presents" in code,
+      "R16: swapchain-present counter static at file scope")
+check(code.count("s_dev_presents++;") == 1 and code.count("s_sw_presents++;") == 1,
+      "R16: counters incremented on exactly one path each")
+i_dev_inc = code.find("s_dev_presents++;")
+i_dev_cmn = code.find("overlay_present_common(self, 0);")
+i_sw_inc = code.find("s_sw_presents++;")
+i_sw_cmn = code.find("overlay_present_common(sw, 1);")
+check(i_dev_inc != -1 and i_dev_cmn != -1 and i_dev_inc < i_dev_cmn,
+      "R16: device counter increments BEFORE the enabled check (present_hook top)")
+check(i_sw_inc != -1 and i_sw_cmn != -1 and i_sw_inc < i_sw_cmn,
+      "R16: swapchain counter increments BEFORE the enabled check (sw_present_hook top)")
+check(code.count('dlog("present-path dev=%u sw=%u frames=%u"') == 2,
+      "R16: present-path tracer line present in BOTH hooks (one mod-300 site each)")
+check("(s_dev_presents + s_sw_presents) % 300" in code,
+      "R16: tracer logs once per 300 combined present calls (mod-300)")
+check("s_dev_presents, s_sw_presents, (unsigned)g_frames_since_reset" in code,
+      "R16: tracer frames field carries the post-Reset frame counter")
+check("D9_CASC         13" in src or "D9_CASC 13" in src,
+      "R16: Device::CreateAdditionalSwapChain slot 13 constant")
+check("static int STDMETHODCALLTYPE w_casc" in code,
+      "R16: CreateAdditionalSwapChain wrapped (captures the OTHER acquisition)")
+check("patch_swapchain(*sc)" in code,
+      "R16: w_casc installs the swapchain slot-3 hook on the created object")
+check("s_orig_casc = (DEV_CASC)vt[13];" in code and "vt[13] = (void *)w_casc;" in code,
+      "R16: slot 13 saved once + patched inside patch_device_present")
+check("s_n_dev_seen" in code,
+      "R16: distinct-device-vtable counter present")
+check('dlog("device-count: n_devices=%u"' in code,
+      "R16: device-count line logged on the second-vtable path")
+check("s_second_vt_logged = 0;" in code,
+      "R16: second-vtable latch reset on process attach")
+check("s_orig_casc = NULL;" in code and "s_dev_presents = 0;" in code and "s_sw_presents = 0;" in code,
+      "R16: tracer statics reset on process attach")
 
 print("SOURCE-CONTRACT:", "PASS" if failures == 0 else f"{failures} FAILURES")
 sys.exit(0 if failures == 0 else 1)

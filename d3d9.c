@@ -116,25 +116,60 @@ static unsigned int s_re_present_n = 0;  /* R13: consecutive reentrant-present f
  *
  * Slot truth (verified from the REAL mingw-w64 d3d9.h of this toolchain, NOT
  * from memory):
- *   - IDirect3DDevice9 (lines 1773-1781): 13 CreateAdditionalSwapChain,
- *     14 GetSwapChain, 15 GetNumberOfSwapChains, 16 Reset, 17 Present,
- *     18 GetBackBuffer  -> GetSwapChain = 14 (matches the mandate's check).
+ *   - IDirect3DDevice9 (line 1195-1218 of the SAME header): 13
+ *     CreateAdditionalSwapChain, 14 GetSwapChain, 15 GetNumberOfSwapChains,
+ *     16 Reset, 17 Present, 18 GetBackBuffer  -> GetSwapChain = 14, and ROUND
+ *     16 adds 13 (CreateAdditionalSwapChain).
  *   - IDirect3DSwapChain9 (lines 307-323): 0 QueryInterface, 1 AddRef,
  *     2 Release, 3 Present(const RECT*, const RECT*, HWND, const RGNDATA*,
  *     DWORD flags)  <- NOTE the trailing DWORD flags Device::Present lacks,
  *     4 GetFrontBufferData, 5 GetBackBuffer, 6 GetRasterStatus, 7 GetDisplayMode,
  *     8 GetDevice, 9 GetPresentParameters  -> swapchain Present = 3.
+ *
+ * ROUND 16 (1-min live log, R15 build 61d8317d): NO `patch_swapchain:` line
+ * anywhere while the match rendered on a dead device-Present hook (zero RES t=2+,
+ * zero heartbeats, zero ovl stop). The game NEVER called our wrapped
+ * IDirect3DDevice9::GetSwapChain — so the in-match present goes through a
+ * swapchain path we do not intercept. Two candidates remain:
+ * CreateAdditionalSwapChain (device slot 13 — the other acquisition, NOW
+ * wrapped) and a second device via D3D9Ex/CreateDeviceEx (NOW counted). ROUND 16
+ * is an instrument-first round: counters for BOTH present kinds log
+ * `present-path dev=%u sw=%u frames=%u` once per 300 combined calls (not
+ * debug-gated), so the next live run PROVES the path instead of theorizing.
  */
 #define D9_GETSWAPCHAIN 14
 #define D9_SW_PRESENT    3        /* SwapChain::Present carries `DWORD flags` (5 args + this) */
+#define D9_CASC         13        /* Device::CreateAdditionalSwapChain (R16: the OTHER acquisition) */
 
 typedef int  (STDMETHODCALLTYPE *DEV_GETSC)(void *self, UINT i, void **pp);
+typedef int  (STDMETHODCALLTYPE *DEV_CASC)(void *self, const void *pp, void **sc);
 typedef int  (STDMETHODCALLTYPE *SW_PRESENT_FN)(void *sw, const RECT *a,
         const RECT *b, HWND hwnd, const void *dirty, DWORD flags);
 static DEV_GETSC s_orig_get_swapchain = NULL;  /* device slot 14, saved ONCE (R6 semantics) */
+static DEV_CASC  s_orig_casc          = NULL;  /* device slot 13, saved ONCE (R16) */
 static SW_PRESENT_FN s_orig_sw_present = NULL; /* swapchain slot 3, saved ONCE */
 static void *g_sw = NULL;                      /* last captured swapchain (re-patch + diagnostics) */
 static int g_ovl_last_draw_frame = -1;         /* R15: frame marker for the same-frame double-call guard */
+
+/* ========================= ROUND 16: present-path tracer =========================
+ * R15 PROVED the game presents through a swapchain we never intercept (no
+ * patch_swapchain line in the live log). This tracer makes the next live run
+ * DECISIVE instead of silent: both present entry points are counted and ONE
+ * line is logged per 300 combined calls (`present-path dev=%u sw=%u
+ * frames=%u`, ~1 line/5s at 60fps). NOT debug-gated — it is the PRIMARY
+ * diagnostic now. Reading the next log:
+ *   - dev rising in-match         -> the device path IS alive (revisit R15).
+ *   - sw rising in-match          -> swapchain path confirmed -> hook deeper.
+ *   - neither rising while the game renders -> present happens OUTSIDE our
+ *     patched objects entirely (D3D9Ex second device -> device-count below).
+ *   - both counting only pre-match -> match-specific path, keep the log.
+ * Plus: CreateAdditionalSwapChain (slot 13) is wrapped so the other swapchain
+ * acquisition is captured+patched too, and a `device-count: n_devices=%u` line
+ * fires when a SECOND device vtable shows up. All diagnostic-only: gates,
+ * tracker, chain and font semantics are untouched. */
+static unsigned int s_dev_presents = 0;   /* IDirect3DDevice9::Present (slot 17) calls, every one */
+static unsigned int s_sw_presents  = 0;   /* IDirect3DSwapChain9::Present (slot 3) calls, every one */
+static unsigned int s_n_dev_seen   = 0;   /* distinct device vtables seen through patch_device_present */
 
 /* (patch_device_present forward-declared above) */
 
@@ -144,6 +179,7 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
 static int STDMETHODCALLTYPE sw_present_hook(void *sw, const RECT *a, const RECT *b,
         HWND hwnd, const void *dirty, DWORD flags);
 static int STDMETHODCALLTYPE w_get_swapchain(void *self, UINT i, void **pp);
+static int STDMETHODCALLTYPE w_casc(void *self, const void *pp, void **sc);
 static void patch_swapchain(void *sw);
 
 static int  STDMETHODCALLTYPE w_query_interface(void *self, const void *iid, void **p);
@@ -368,6 +404,13 @@ static int overlay_present_common(void *self, int is_sw) {
  * dropping it would corrupt the stdcall frame. */
 static int STDMETHODCALLTYPE sw_present_hook(void *sw, const RECT *a, const RECT *b,
         HWND hwnd, const void *dirty, DWORD flags) {
+    /* R16 tracer: counted BEFORE the enabled check + common body, so a
+     * disabled overlay can never hide the path; one line per 300 combined
+     * presents of either kind (`frames` = the post-Reset frame counter). */
+    s_sw_presents++;
+    if (((s_dev_presents + s_sw_presents) % 300) == 0)
+        dlog("present-path dev=%u sw=%u frames=%u",
+             s_dev_presents, s_sw_presents, (unsigned)g_frames_since_reset);
     overlay_present_common(sw, 1);
     SW_PRESENT_FN fl = s_orig_sw_present;
     return (fl != NULL) ? fl(sw, a, b, hwnd, dirty, flags) : (int)0x8876086c;
@@ -407,6 +450,21 @@ static int STDMETHODCALLTYPE w_get_swapchain(void *self, UINT i, void **pp) {
     return hr;
 }
 
+/* R16: device CreateAdditionalSwapChain wrapper (slot 13) — a swapchain is
+ * obtained TWIN ways on the device: GetSwapChain (slot 14, wrapped in R15) and
+ * CreateAdditionalSwapChain (slot 13, wrapped here). The R15 live log showed
+ * ZERO GetSwapChain calls, so if the match presents through a swapchain it must
+ * be acquired THIS way (or via a second device — the device-count tracer in
+ * patch_device_present covers that). Same forward+capture+patch as
+ * w_get_swapchain. */
+static int STDMETHODCALLTYPE w_casc(void *self, const void *pp, void **sc) {
+    DEV_CASC o = s_orig_casc;   /* saved once by patch_device_present */
+    if (o == NULL) return (int)0x8876086c;
+    int hr = o(self, pp, sc);
+    if (hr >= 0 && sc != NULL && *sc != NULL) patch_swapchain(*sc);
+    return hr;
+}
+
 static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
     g_device = self;
     g_frames_since_reset = 0;
@@ -432,6 +490,13 @@ static int STDMETHODCALLTYPE reset_hook(void *self, const void *pp) {
 
 static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT *b,
         HWND hwnd, const void *dirty) {
+    /* R16 tracer: counted BEFORE the enabled check + common body, so a
+     * disabled overlay can never hide the path; one line per 300 combined
+     * presents of either kind (`frames` = the post-Reset frame counter). */
+    s_dev_presents++;
+    if (((s_dev_presents + s_sw_presents) % 300) == 0)
+        dlog("present-path dev=%u sw=%u frames=%u",
+             s_dev_presents, s_sw_presents, (unsigned)g_frames_since_reset);
     /* R15: the ONCE-PER-FRAME overlay body now lives in
      * overlay_present_common() (shared with the swapchain hook — one code
      * path, no duplication). This hook keeps the MENU path intact: run the
@@ -445,7 +510,7 @@ static int STDMETHODCALLTYPE present_hook(void *self, const RECT *a, const RECT 
 /* Re-assert our Present/Reset/GetSwapChain hooks on THE ACTUAL device (never a
  * stale stored pointer). Originals are saved ONCE from the first patched vtable
  * (R6/R13 semantics — the shape proven live on TAD's single device object). */
-static int s_second_vt_logged = 0;   /* R16 A5: log the second vtable once */
+static int s_second_vt_logged = 0;   /* R8 A5: log the second vtable once */
 
 static int patch_device_present(void *dev) {
     if (dev == NULL) return 0;
@@ -457,9 +522,12 @@ static int patch_device_present(void *dev) {
              * originals. Keep R6 semantics: single originals, ONE patched
              * vtable — a second device is left untouched (its Present is not
              * hooked; the overlay stays attached to the first device). Log it
-             * instead of silently skipping (R16 A5). */
+             * (R8 A5) AND report the device count (R16: tells us if the match
+             * runs on a second D3D9Ex/CreateDeviceEx device). */
+            s_n_dev_seen++;   /* R16: distinct device vtable seen (second) */
             if (!s_second_vt_logged) {
                 s_second_vt_logged = 1;
+                dlog("device-count: n_devices=%u", s_n_dev_seen);
                 dlog("patch_device_present: second vtable %p seen (had %p) - "
                      "not re-patched, overlay inactive on this device",
                      vt, g_devvt);
@@ -491,6 +559,17 @@ static int patch_device_present(void *dev) {
             vt[14] = (void *)w_get_swapchain;
             VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
         }
+        if (s_orig_casc == NULL) {
+            /* R16: wrap CreateAdditionalSwapChain (slot 13) — the OTHER way a
+             * swapchain is obtained; GetSwapChain (R15) got zero live calls, so
+             * an in-match swapchain present must come from here or a 2nd device. */
+            DWORD slot = (DWORD)(DWORD_PTR)&vt[13];
+            VirtualProtect((LPVOID)slot, sizeof(void *), PAGE_READWRITE, &old);
+            s_orig_casc = (DEV_CASC)vt[13];
+            vt[13] = (void *)w_casc;
+            VirtualProtect((LPVOID)slot, sizeof(void *), old, &old);
+        }
+        s_n_dev_seen++;   /* R16: distinct device vtable seen (patched) */
         g_devvt = vt;
     }
     return (g_devvt == vt && s_orig_present != NULL);
@@ -758,9 +837,14 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         s_orig_present = NULL;
         s_orig_reset = NULL;
         s_orig_get_swapchain = NULL;
+        s_orig_casc = NULL;
         s_orig_sw_present = NULL;
         g_sw = NULL;
         g_ovl_last_draw_frame = -1;
+        s_dev_presents = 0;
+        s_sw_presents = 0;
+        s_n_dev_seen = 0;
+        s_second_vt_logged = 0;
         g_devvt = NULL;
         g_base = (void *)GetModuleHandleA("age3y.exe");
 
