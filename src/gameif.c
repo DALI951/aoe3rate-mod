@@ -471,23 +471,25 @@ void observer_sample(void) {
     }
 }
 
-/* ---- R20: export thread ----
+/* ---- R21: export thread ----
  * Background thread that tails the verified resource chain and writes the
- * live exported values to d3d9mod.log in the exact recurring format
+ * live exported values to rates.log (R21: the DLL's own pipe, read by
+ * Dali's config/log_tailer/parser pipeline) in the exact recurring format
  * `t=%lu,food=%d,wood=%d,coin=%d,export=%d` (one line ~every 500ms).
  * t comes from clock_now() — the verified realtime QPC->ms clock (GetTickCount
  * fallback) already used across the rate engine. Launched lazily from the
  * FIRST Direct3DCreate9 call (never DllMain — avoids loader lock), only when
  * [Debug] Enabled=0 (export mode). Shutdown via s_export_running=0 from
- * DLL_PROCESS_DETACH + WaitForSingleObject. */
+ * DLL_PROCESS_DETACH + WaitForSingleObject. d3d9mod.log stays the DEBUG
+ * diagnostics log (Debug=1 only) — the export pipe is now rates.log. */
 static DWORD WINAPI export_thread(LPVOID param) {
     (void)param;
     char logpath[MAX_PATH];
     if (GetModuleFileNameA(NULL, logpath, MAX_PATH) == 0)
         return 0;
     char *slash = strrchr(logpath, '\\');
-    if (slash != NULL) { slash[1] = '\0'; lstrcatA(logpath, "d3d9mod.log"); }
-    else lstrcpyA(logpath, "d3d9mod.log");
+    if (slash != NULL) { slash[1] = '\0'; lstrcatA(logpath, "rates.log"); }
+    else lstrcpyA(logpath, "rates.log");
 
     /* truncate once at thread start (fresh session) */
     {

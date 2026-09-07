@@ -32,11 +32,12 @@ DiscontinuityRatio=3.0
 ShowGains=1
 
 [Debug]
-; Enabled=0  -> EXPORT MODE (default): d3d9mod.log contains ONLY recurring
+; Enabled=0  -> EXPORT MODE (default): rates.log contains ONLY recurring
 ;               `t=%lu,food=%d,wood=%d,coin=%d,export=%d` lines (t in realtime
 ;               milliseconds, live integer values ~every 500ms).
-;               The Python widget (tools\rates_widget.py) tails this file to show
-;               the numbers in an always-on-top window. NO other log lines.
+;               The Python app (app\app.py, built on Dali's config/log_tailer/parser
+;               core) tails this file to show the numbers in an always-on-top
+;               window. NO other log lines. (d3d9mod.log = diagnostics only.)
 ; Enabled=1  -> FULL DIAGNOSTICS: verbose chain / device / draw / heartbeat
 ;               logging for debugging. NO export lines are written in this mode.
 Enabled=0

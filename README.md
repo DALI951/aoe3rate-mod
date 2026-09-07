@@ -5,8 +5,8 @@ In-game resource-rate overlay for **Age of Empires III: The Asian Dynasties** (`
 Drops in as `d3d9.dll` next to the game executable. Reads the human player's **decrypted stock**
 (food / wood / coin / export — the verified memory chain), computes **real-time gather/spend rates**
 from per-slot ring sampling with EMA smoothing, and shows them two ways: a small native-looking
-in-game panel (D3DX9 overlay) and/or — the **recommended R20 surface** — by exporting the live values
-to `d3d9mod.log` for the always-on-top **`rates_widget.py`** viewer (see below). Settings live in
+in-game panel (D3DX9 overlay) and/or — the **recommended R21 surface** — by exporting the live values
+to `rates.log` for the always-on-top **`app\app.py`** viewer (see below). Settings live in
 `ResourceRateMod.ini` next to the DLL; F9 toggles the panel, and the overlay's
 two settings-hint lines let you flip toggles live (written back to the INI immediately).
 
@@ -23,25 +23,37 @@ refused by the version gate and left completely untouched.
 2. Launch **`age3y.exe`** and play. F9 toggles the panel, F9+Alt flips format/visibility toggles.
 3. Do **NOT** launch `age3.exe` / `age3x.exe` — the proxy targets `age3y.exe` only (see below).
 
-## Live Resource Viewer (external widget — R20)
+## Live Resource Viewer — Dali's Python pipeline (R21)
 
 The in-game overlay's in-match draw path is unreliable on the legacy engine, so the **recommended
-surface is now the external viewer**: the DLL exports your **live decrypted stock** as recurring
-`t=%lu,food=%d,wood=%d,coin=%d,export=%d` lines to `d3d9mod.log` (one line every ~500 ms; `t` is the
-realtime millisecond clock) and a small always-on-top window shows them (Food / Wood / Coin / Export
-+ a dimmed `t=` indicator) while you play.
+surface is the external viewer built entirely on Dali's own Python core**: the DLL exports your
+**live decrypted stock** as recurring `t=%lu,food=%d,wood=%d,coin=%d,export=%d` lines to **`rates.log`**
+(one line every ~500 ms; `t` = the DLL's own realtime millisecond clock),
+and the Python app tails + parses + rate-engineers them and shows Food / Wood / Coin / Export
+values with green/red income/spend rates in an always-on-top frameless window.
 
 ```bat
-pythonw.exe tools\rates_widget.py
+pythonw.exe app\app.py                      :: GUI
+python app\app.py --console                 :: headless — lines to stdout
+pythonw.exe app\app.py --log C:\path\rates.log
 ```
 
-- The widget is **stdlib-only** (Tkinter), frameless, always-on-top, draggable (left-drag), closes on
-  right-click. Optional: `--log <path>` and `--fps`.
-- Default log path = `C:\Users\dali\Documents\Age of Empires III - Complete Collection\d3d9mod.log`.
-- In the shipped default (`[Debug] Enabled=0`) `d3d9mod.log` contains **only** the recurring export
-  lines — clean and tiny. With `[Debug] Enabled=1` the full diagnostics return and export lines are
-  suppressed.
-- `.swarm/BUILD.md` ROUND 20 has the full implementation + harness detail.
+- The `app/` folder is **Dali's code kept byte-identical**: `config.py` (single source of truth:
+  `log_path`, resources, `smoothing_tau_sec` EMA time constant 3.5 s, `spend_ratio` 3.0,
+  `min_dt_sec` 0.05, display format, `refresh_hz` 5.0), `log_tailer.py` (`follow()` — starts at EOF,
+  survives missing file + partial mid-flush lines), `parser.py` (`parse_line()` → `(t_sec, {res:v})`,
+  pure/tolerant).
+- `app/engine.py` (**new**) = `RateEngine`: per-resource EMA income rate with
+  `alpha = 1 − exp(−dt/τ)`, spend rule `|instant| > |ema|×spend_ratio` ⇒ SPEND (excluded from EMA,
+  counted, spent/min), `dt < min_dt_sec` samples ignored, `rate_min = rate×60`, display formatting
+  honoring `rate_unit`/`decimals`/`show_plus_sign`/`show_zero`/`zero_epsilon`.
+- `app/app.py` (**new**) = the runnable app (Tkinter, frameless, always-on-top, α≈0.85, draggable,
+  dark cinema look, 4 rows + `t=` footer; repaint at `CONFIG.refresh_hz`; headless-safe — falls back
+  to console if Tk is unavailable).
+- Default log path = `C:\Users\dali\Documents\Age of Empires III - Complete Collection\rates.log`.
+- In the shipped default (`[Debug] Enabled=0`) `rates.log` contains **only** the recurring export
+  lines; `d3d9mod.log` is the debug diagnostics log (`[Debug] Enabled=1` only).
+- `.swarm/BUILD.md` ROUND 21 has the full implementation + harness detail.
 
 ## Supported Versions
 
@@ -255,7 +267,6 @@ d3d9.def               exported-symbol list
 build/build.bat        build + verify + deploy
 build/verify_pe.py     PE checks (machine, imports, exports, SHA256)
 tools/extract_bar.py   ESPN-v2 .bar list/extract (RE / experimental XML path)
-tools/rates_widget.py  always-on-top Tkinter live-resource viewer (tails d3d9mod.log export lines)
 config/schema.md       INI schema doc
 ResourceRateMod.ini.example
 tests/                 harness sources (SWARM_TEST builds use d3d9.dll)
@@ -265,7 +276,8 @@ VERIFIED_ADDRESSES.md  address notes
 
 | Tag | State | Artifact |
 |-----|-------|----------|
-| R20 | **Current — export line `t=ms` + export field (`t=%lu,food=%d,wood=%d,coin=%d,export=%d`, 155,825 B, `9b99c2a3…`)** | `d3d9.dll` + `tools/rates_widget.py` (see `.swarm/BUILD.md`) |
+| R21 | **Current — Python pipeline on Dali's core (byte-identical `app/config.py`, `app/log_tailer.py`, `app/parser.py` + new `RateEngine` + `app.py`; export now writes `rates.log`)** | `d3d9.dll` + `app/` (see `.swarm/BUILD.md`) |
+| R20 | Export line `t=ms` + export field (`t=%lu,food=%d,wood=%d,coin=%d,export=%d`, 155,825 B, `9b99c2a3…`) | `d3d9.dll` + `tools/rates_widget.py` (removed in R21) |
 | R19-PIVOT | File-export + external widget + logging diet (155,259 B, `65d8e880…`) | `d3d9.dll` + `tools/rates_widget.py` |
 | R11 (this round) | **Settings gap (decimal/plus/visibility/position) + two-line hints + version table + P0 `ovl diag`** | `d3d9.dll` (see `.swarm/BUILD.md` for size + SHA256) |
 | R14 | Overlay + rate engine + observer (previous) | `d3d9.dll` |

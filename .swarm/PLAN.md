@@ -6,6 +6,15 @@ Upgrade the R13 observer-only proxy (`d3d9.dll`) into the full resource-rate mod
 
 **Deliveries:** `d3d9.dll` (single artifact) + `ResourceRateMod.ini` (+ optional experimental loose `data\ui\options.xml`). Two-file delivery stays intact.
 
+**ROUND 21 (2026-09-07):** the whole external surface now runs on **Dali's own Python core**,
+copied into `app/` byte-identical and unmodified (`config.py`, `log_tailer.py`, `parser.py` — SHA256
+verified). New `app/engine.py` (`RateEngine`: EMA income rate, spend-spike rule `|instant|>[ema]*ratio`
+⇒ SPEND excluded from EMA, display formatting) + `app/app.py` (frameless always-on-top Tk viewer,
+headless `--console`, `--log` override) + `tests/test_app_core.py`. DLL export thread now writes
+**`rates.log`** (was `d3d9mod.log`); `d3d9mod.log` is debug-only. `tools/rates_widget.py` + its test
+**removed** (superseded). All harnesses green; built DLL auto-deploys to the game folder. Full detail:
+`.swarm/BUILD.md` ROUND 21.
+
 **ROUND 20 (2026-09-07):** export line re-formatted to the exact
 `t=%lu,food=%d,wood=%d,coin=%d,export=%d` contract — `t` = verified realtime ms clock
 (`tracker.c clock_now()` QPC→ms, NOT the `s_tick` frame counter), 4th resource **export (slot 7)**

@@ -1,4 +1,69 @@
-# BUILD — ROUND 20 (2026-09-07) — EXPORT LINE → `t=ms` + EXPORT FIELD (4 resources)
+# BUILD — ROUND 21 (2026-09-07) — PYTHON PIPELINE ON DALI'S CORE + `rates.log`
+
+## ROUND SUMMARY
+R21 rebuilds the whole external surface around **Dali's own Python core**, copied into
+`app/` **byte-identical and unmodified**: `app/config.py`, `app/log_tailer.py`, `app/parser.py`
+(SHA256-verified identical to Dali's originals). Around it sit two new files — `app/engine.py`
+(`RateEngine`: EMA income rate + spend-spike detection + formatting) and `app/app.py`
+(always-on-top Tkinter live viewer, headless `--console` mode) — plus `tests/test_app_core.py`.
+The DLL's export thread now writes **`rates.log`** (was `d3d9mod.log`), and
+`d3d9mod.log` is explicitly the debug-only diagnostics log. The old
+`tools/rates_widget.py` + `tests/test_widget_parse.py` are **removed** (superseded by the app).
+Imports stay {KERNEL32,USER32,msvcrt}, still 11 exports. All harnesses green.
+
+## (1) DALI'S FILES — BYTE-IDENTICAL, UNMODIFIED
+Copied from `C:\Users\dali\Downloads\Documents\` into `C:\Users\dali\aoe3rate-mod\app\`:
+- `config.py` → SHA256 `5EDBED531987D00BBFC727AA38A069E5956A6C8EA54BFF665FF91B0768A02C9B`
+- `log_tailer.py` → SHA256 `7D4E9DD864B0FF57FD44E37BC1D4E3D8C010489A9473503AE1ADEDE3807C6E89`
+- `parser.py` → SHA256 `73E1BDA174E63BB97F9715727BC82222606272228C8C87028A41C8E99C91958A`
+Copies re-hashed after copy and match the originals exactly. None of the three are edited by the repo.
+
+## (2) DLL CHANGE — EXPORT WRITES `rates.log`
+- `src/gameif.c` `export_thread` log path is now `rates.log` (`lstrcatA(logpath, "rates.log")`
+  from the writable games-folder-scratch buffer, `lstrcpyA(logpath, "rates.log")` fallback).
+- `d3d9mod.log` remains **diagnostics only** (dlog sites + logger.c untouched — 3 unconditional
+  sites, `[Debug] Enabled=1` only).
+- Export format **unchanged** and exact: `"t=%lu,food=%d,wood=%d,coin=%d,export=%d"`,
+  `t = (unsigned long)clock_now()` (QPC→ms), slots food=2, wood=1, coin=0, export=7, `Sleep(500)`,
+  truncate-once then append+`fflush`, Debug=0 gating, lazy launch/shutdown unchanged.
+
+## (3) NEW FILES — ENGINE + APP
+- `app/engine.py` — `RateEngine(config=None)`:
+  - first sample seeds baseline (`ema=0`, last t/v); `dt<=0` keeps last rate; `dt < min_dt_sec` ignored.
+  - `instant = delta/dt`; **spend rule**: `instant < 0 and |instant| > |ema|*spend_ratio` →
+    SPEND (counted, excluded from EMA); else fold `alpha = 1 − exp(−dt/τ)`, `ema = instant*α + ema*(1−α)`.
+  - per-resource record: `value, rate, rate_min (rate*60), spent_min (n*60/span, span ≥ 1s),
+    spend_count, formatted (+/decimals/zero_epsilon), formatted_min`; `update()` → `{"t", "resources"}`,
+    `.last`, `reset()`, `rate()`, `spent()`, `display()`.
+- `app/app.py` — CLI `--log <path>` + `--console`; tails `CONFIG.log_path` via `log_tailer.follow`,
+  parses via `parser.parse_line`, feeds `RateEngine`; GUI = frameless/always-on-top/α≈0.85 dark
+  viewer (Food/Wood/Coin/Export, green income / red spend rates, dimmed `t=` footer), repaint at
+  `CONFIG.refresh_hz`, drag = move, right-click = close, Tk-missing → console fallback.
+- `tests/test_app_core.py` — parser (Dali's 3 lines, garbage/partial/missing-t/extra-space/negative
+  export), tailer (EOF-start, no replay, partial-line rewind, missing-file survival), engine
+  (EMA convergence, spend exclusion + counting, dt<min ignore, rate_min, presets via
+  `set_smoothing_preset` incl. ValueError, reset), formatting helpers.
+- **REMOVED** `tools/rates_widget.py` + `tests/test_widget_parse.py` (superseded by `app/`).
+
+## HOW TO USE
+Default `[Debug] Enabled=0` → `rates.log` carries ONLY the recurring export lines:
+`pythonw.exe app\app.py` (GUI; drag = move, right-click = close), `python app\app.py --console`
+(headless stdout), optional `--log <path>`. `[Debug] Enabled=1` → full diagnostics
+in `d3d9mod.log`, export suppressed. `build\build.bat` auto-deploys the DLL to the game folder
+(intentionally — Dali's live pipeline includes the full game).
+
+## HARNESS (ALL GREEN)
+- `tests/test_app_core.py` → **APP-CORE: PASS** (parser / tailer / engine / display / presets).
+- `tests/test_source_contract.py` → **SOURCE-CONTRACT: PASS** — R21 pins: `rates.log` literal,
+  format literal, 5-arg signature, `(int)(x+0.5f)`, slot decrypt, truncate/append/fflush, gating,
+  DETACH shutdown, logging diet, export-only Debug=0. Widget-code pin removed with the widget.
+- `tests/test_rate_engine.exe` → **FAILURES: 0**; `tests/test_export.exe` → **FAILURES: 0**;
+  `tests/test_d3d9_actual.exe` → **PASS**; `tests/test_pe_structure.py` → **PASS**.
+
+## COMMIT
+`git` commit with `--author="DALI951 <dali951@users.noreply.github.com>"`, push `main`.
+
+---
 
 ## ROUND SUMMARY
 R20 re-formats the recurring export line to the exact
