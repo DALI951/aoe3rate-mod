@@ -20,7 +20,7 @@ import struct
 import sys
 
 DLL = r"C:\Users\dali\aoe3rate-mod\d3d9.dll"
-EXE = r"C:\Users\dali\Documents\Age of Empires III - Complete Collection\age3y.exe"
+EXE = r"C:\Users\dali\Documents\gaames\Age of Empires III - Complete Collection\age3y.exe"
 
 failures = 0
 

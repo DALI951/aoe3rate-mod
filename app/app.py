@@ -33,6 +33,12 @@ import threading                     # noqa: E402
 import time                          # noqa: E402
 import traceback                     # noqa: E402
 
+# ---- session stats (R26 additions) -----------------------------------------
+_SESSION_START = None                # wall-clock time of first engine update
+_SESSION_TOTALS = {}                 # resource -> cumulative raw value delta
+_SESSION_SPEND = {}                  # resource -> cumulative spend count
+_SESSION_PEAKS = {}                  # resource -> peak EMA rate
+
 ERROR_LOG = os.path.join(_HERE, "app.error.log")
 
 # ---- R25: log-path auto-detection ------------------------------------------
@@ -202,12 +208,25 @@ def _announce_path_change(announce, prev, now):
 
 def emit_console(engine):
     """One status line per Engine.update, showing every resource."""
+    global _SESSION_START
     t = engine.last_t
+    if _SESSION_START is None:
+        _SESSION_START = t
     parts = []
     for res, rec in engine.raw.get("resources", {}).items():
         v = rec["value"]
         r = rec["formatted"] or "0"
         sp = f"  SPEND x{rec['spend_count']}" if rec["spend_count"] else ""
+        # track session totals
+        if res not in _SESSION_TOTALS:
+            _SESSION_TOTALS[res] = 0.0
+        _SESSION_TOTALS[res] = v
+        if res not in _SESSION_SPEND:
+            _SESSION_SPEND[res] = 0.0
+        _SESSION_SPEND[res] = rec["spend_count"]
+        if res not in _SESSION_PEAKS:
+            _SESSION_PEAKS[res] = 0.0
+        _SESSION_PEAKS[res] = max(_SESSION_PEAKS[res], rec.get("rate_min", 0.0))
         parts.append(f"{res}={v:.0f} {r}{sp}")
     print(f"t={t:8.2f}s  " + "  ".join(parts))
 
@@ -243,7 +262,13 @@ def build_window(items_tk, engine, log_path, status):
         spend.pack(side="left")
         rows.append((res, val, rate, spend))
 
-    foot = tk.Label(root, text=f"waiting for {log_path}…", bg=BG, fg=T_FG,
+    # R26: session stats bar (total duration, peak rates)
+    stats_var = tk.StringVar(value="")
+    stats_lab = tk.Label(root, textvariable=stats_var, bg=BG, fg=DIM,
+                         font=("Consolas", 9))
+    stats_lab.pack(side="bottom", fill="x", padx=8, pady=(0, 1))
+
+    foot = tk.Label(root, text=f"waiting for {log_path}...", bg=BG, fg=T_FG,
                     font=("Consolas", 8))
     foot.pack(side="bottom", padx=6, pady=(0, 4))
 
@@ -262,9 +287,49 @@ def build_window(items_tk, engine, log_path, status):
         w.bind("<Button-1>", press)
         w.bind("<B1-Motion>", move)
 
+    # R26: keyboard shortcuts
+    paused = {"v": False}
+
+    def toggle_pause(_ev=None):
+        paused["v"] = not paused["v"]
+        state = "PAUSED" if paused["v"] else "resumed"
+        if hasattr(root, "_pause_label"):
+            root._pause_label.configure(text=state if paused["v"] else "")
+        print(f"[app] {state}")
+
+    def reset_session(_ev=None):
+        global _SESSION_START, _SESSION_TOTALS, _SESSION_SPEND, _SESSION_PEAKS
+        _SESSION_START = None
+        _SESSION_TOTALS.clear()
+        _SESSION_SPEND.clear()
+        _SESSION_PEAKS.clear()
+        print("[app] session stats reset")
+
+    def toggle_mini(_ev=None):
+        nonlocal _mini_mode
+        _mini_mode = not _mini_mode
+        state = "mini" if _mini_mode else "full"
+        print(f"[app] {state} mode")
+
+    _mini_mode = False
+
+    # Escape = pause/resume; Ctrl+R = reset stats; Ctrl+M = mini mode
+    root.bind("<Escape>", toggle_pause)
+    root.bind("<Control-r>", reset_session)
+    root.bind("<Control-m>", toggle_mini)
+
+    # R26: pause indicator
+    pause_var = tk.StringVar(value="")
+    root._pause_label = tk.Label(root, textvariable=pause_var, bg=BG,
+                                 fg="#ff7c6b", font=("Consolas", 10, "bold"))
+    root._pause_label.pack(side="top", anchor="w", padx=8, pady=(2, 0))
+
     last = {}   # resource -> last good record (survives momentary gaps)
 
     def poke():
+        if paused["v"]:
+            root.after(int(1000.0 / CONFIG.refresh_hz), poke)
+            return
         rec = engine.raw
         res_map = rec.get("resources", {})
         for res, val_lab, rate_lab, spend_lab in rows:
@@ -273,7 +338,7 @@ def build_window(items_tk, engine, log_path, status):
                 last[res] = r                              # remember last good
             r = last.get(res)
             if r is None:
-                val_lab.configure(text="…")                # never blank-out:
+                val_lab.configure(text="...")              # never blank-out:
                 rate_lab.configure(text="")               # keep last known once
                 spend_lab.configure(text="")              # we have data
                 continue
@@ -289,15 +354,26 @@ def build_window(items_tk, engine, log_path, status):
                 spend_lab.configure(text=f"-{spent_min:.0f}/min spent")
             else:
                 spend_lab.configure(text="")
+
+        # R26: update session stats bar
+        if _SESSION_START is not None and _SESSION_TOTALS:
+            dur = time.time() - _SESSION_START
+            parts = []
+            for res in CONFIG.resources:
+                peak = _SESSION_PEAKS.get(res, 0.0)
+                if peak > 0.1:
+                    parts.append(f"{res[:3].upper()}:peak={peak:.1f}/min")
+            stats_var.set(f"{dur:.0f}s  " + "  ".join(parts) if parts else f"{dur:.0f}s")
+
         state = _staleness_text(bool(res_map), status.get("last_at"))
         active = status.get("path") or log_path
         if state == "live":
-            foot.configure(text=f"t={rec['t']:.2f}s — {active}", fg=T_FG)
+            foot.configure(text=f"t={rec['t']:.2f}s -- {active}", fg=T_FG)
         elif state == "stale":
-            foot.configure(text="waiting for rates.log … (no new samples)",
+            foot.configure(text="waiting for rates.log ... (no new samples)",
                            fg=T_FG)
         else:
-            foot.configure(text="Waiting for data… (start a match)",
+            foot.configure(text="Waiting for data... (start a match)",
                            fg=LABEL_FG)
         root.after(int(1000.0 / CONFIG.refresh_hz), poke)
 

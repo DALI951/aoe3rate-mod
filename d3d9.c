@@ -178,6 +178,8 @@ static unsigned int s_sw_presents  = 0;   /* IDirect3DSwapChain9::Present (slot 
 static unsigned int s_scene_ends   = 0;   /* IDirect3DDevice9::EndScene (slot 42) calls, every one (R17) */
 static unsigned int s_n_dev_seen   = 0;   /* distinct device vtables seen through patch_device_present */
 
+static int s_endscene_drew = 0;   /* R26: one-shot EndScene overlay draw marker */
+
 /* R17: the MERGED tracer — ONE line every 300 combined Dev/Sw/Scene entry
  * points (keeps the R16 format and adds `scene`):
  *   present-path dev=%u sw=%u scene=%u frames=%u
@@ -515,15 +517,32 @@ static int STDMETHODCALLTYPE w_endscene(void *self) {
     DEV_ENDSCENE o = s_orig_endscene;
     if (o == NULL) return (int)0x8876086c;
     int hr = o(self);
-    /* R17 conditional EndScene-draw (DO NOT ENABLE — diagnostics run first):
-     * if the tracer shows `scene` climbing in-match while dev+sw stay frozen,
-     * the device is ALIVE and only Present is rerouted -> the overlay body
-     * belongs HERE: this frame is the game's final scene, back buffer holds
-     * the finished frame. Mirror the Present path via
-     * overlay_present_common(self, 0) with the same once-per-frame guard
-     * g_ovl_last_draw_frame + the B7 tripwire, running AFTER the real EndScene
-     * (like present_hook runs after the real Present). Wire it ONLY on
-     * evidence — never speculatively. */
+    /* R26: EndScene-draw path. R17 tracer proved the device IS alive in-match
+     * (scene climbing, dev+sw frozen). The overlay body is wired HERE instead
+     * of (or in addition to) the Present path: at EndScene time the game's
+     * frame is complete and the back buffer holds the finished scene.
+     *
+     * overlay_present_common(self, 0) handles everything: enabled-check,
+     * once-per-frame guard (g_ovl_last_draw_frame), re-entrancy tripwire
+     * (B7), chain walk, observer, hotkeys, profile poll, ui_draw, and frame
+     * counter advance. The real EndScene already ran above (forward-to-orig),
+     * so any nested Present the game's own EndScene triggers hits the present
+     * hook's frame guard and is skipped — the overlay body runs exactly once.
+     *
+     * In menu/loading, the device Present path (present_hook) is alive and
+     * runs the overlay there. In-match, the device Present path is frozen but
+     * EndScene keeps firing → this path takes over. The once-per-frame guard
+     * ensures both paths never draw on the same frame (if both fire, the
+     * second one's guard catches it). */
+    int ovl = overlay_present_common(self, 0);
+    /* R26: one-shot diagnostic — the first time the overlay draws via the
+     * EndScene path (in-match), log it unconditionally so the live log proves
+     * the path is active. Subsequent draws are silent (the heartbeat covers
+     * ongoing health). */
+    if (ovl && !s_endscene_drew) {
+        s_endscene_drew = 1;
+        dlog("R26 EndScene-draw: overlay active via EndScene path (dev=%p)", self);
+    }
     return hr;
 }
 
@@ -953,6 +972,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved) {
         s_scene_ends = 0;
         s_n_dev_seen = 0;
         s_second_vt_logged = 0;
+        s_endscene_drew = 0;
         g_devvt = NULL;
         g_base = (void *)GetModuleHandleA("age3y.exe");
 

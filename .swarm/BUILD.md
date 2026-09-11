@@ -1,3 +1,72 @@
+# BUILD — ROUND 26 (2026-09-11) — ENDSCENE-DRAW PATH: OVERLAY ALIVE IN-MATCH
+
+## ROUND SUMMARY
+R17 tracer proved the device IS alive in-match: `scene` climbing while dev+sw froze
+(device Present rerouted, but EndScene keeps firing). R26 wires the SHARED overlay
+body into `w_endscene` — the overlay now draws via the EndScene path in-match
+where the Present hook was dead. The overlay body is the SAME
+`overlay_present_common(self, 0)` the Present hooks use, so gates, chain walk,
+observer, hotkeys, profile poll and the once-per-frame guard are identical.
+
+## WHY IT'S SAFE (the once-per-frame analysis)
+- `w_endscene` runs the overlay body AFTER the REAL EndScene (`o(self)` first).
+  At that point the game's frame is complete and the back buffer holds it.
+- The real EndScene internally triggers the game's Present → our `present_hook`
+  → `overlay_present_common` → the `g_ovl_last_draw_frame == g_frames_since_reset`
+  guard SKIPS it (we already drew this frame via the EndScene path). The game's
+  real Present still runs — nothing is swallowed.
+- In menu/loading the device Present path is alive and draws there; EndScene's
+  call is skipped by the same guard. In-match, Present is frozen and EndScene
+  takes over. Both paths share one code body + one frame guard → overlay draws
+  EXACTLY once per frame regardless of which hook fires.
+
+## CHANGES (d3d9.c)
+1. `w_endscene` (slot 42): after forwarding to the real EndScene, calls
+   `overlay_present_common(self, 0)` — the same shared overlay body.
+2. One-shot diagnostic `s_endscene_drew`: on the FIRST successful EndScene-path
+   draw, logs (unconditionally) `R26 EndScene-draw: overlay active via EndScene
+   path (dev=%p)` so a live log proves the path is active. Reset on attach.
+3. `s_endscene_drew` reset in DllMain PROCESS_ATTACH.
+
+## ALSO THIS ROUND (app/)
+- `app/app.py`: session stats bar (duration + peak rates), Escape=pause,
+  Ctrl+R=session-stats reset, Ctrl+M=mini-mode, pause indicator label.
+- `tests/test_source_contract.py`: R26 pins (overlay body in BOTH hooks = the
+  EndScene + Present paths; `o(self)` before overlay; one-shot marker + reset).
+  R16 dev-before-present pin fixed for the new two-call-site shape.
+- `tests/test_pe_structure.py`: EXE path → `Documents\gaames\...` (big-PC path).
+
+## BUILD (on the big PC)
+```
+build\build.bat
+```
+Build rc=0 zero warnings, VERIFY PASS, byte-identical 3-copy
+(repo root / game dir / tests\d3d9.dll). Harnesses: test_source_contract.py PASS
+(R26 block green), test_app_core.py PASS. d3d9.dll hash + size to be recorded
+after the first build — this round is CODE + DOCS ONLY until Dali builds.
+
+## LIVE ACCEPTANCE (Dali, on the big PC)
+1. Deploy R26 build (build.bat deploy step) — keep `[General] PlayerIdx=1`,
+   `[Debug] Enabled=0` from the last deploy.
+2. Delete old game-dir `d3d9mod.log` if present.
+3. Launch a skirmish vs AI ≥90s, spend resources, watch the IN-GAME PANEL:
+   **the panel should now be VISIBLE during the match** (it was invisible
+   before R26 — that was the whole project blocker).
+4. Prove the path in the log: FIRST run with `[Debug] Enabled=1`, confirm
+   `R26 EndScene-draw: overlay active via EndScene path (dev=..)` appears once,
+   plus the `present-path dev=.. sw=.. scene=..` tracer showing scene climbing
+   in-match. Then set Debug back to 0 for the export-mode default.
+5. Confirm the external viewer (`AOE3 Rates` shortcut) still works alongside.
+
+## RISK / ROLLBACK
+- `w_endscene` draws on the current RT exactly like the Present path already
+  did (same ui_draw gate/RT/states). Worst case = a panel that flickers or
+  overlaps the game HUD; the `[General] Enabled=0` zero-touch path and the
+  `g_panel_visible` F9 toggle both still kill the draw completely.
+- Rollback = revert this commit's d3d9.c hunk (the R17 probe semantics stay).
+
+---
+
 # BUILD — ROUND 24 (2026-09-07) — STABLE "HUMAN" LOCK IN THE EXPORT THREAD
 
 ## ROUND SUMMARY

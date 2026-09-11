@@ -751,7 +751,11 @@ i_dev_inc = code.find("s_dev_presents++;")
 i_dev_cmn = code.find("overlay_present_common(self, 0);")
 i_sw_inc = code.find("s_sw_presents++;")
 i_sw_cmn = code.find("overlay_present_common(sw, 1);")
-check(i_dev_inc != -1 and i_dev_cmn != -1 and i_dev_inc < i_dev_cmn,
+# R26: overlay_present_common(self, 0) now appears TWICE (w_endscene + present_hook).
+# The device counter must increment before the ONE inside present_hook. Find the
+# second occurrence (the present_hook call) by searching after the first match.
+i_dev_cmn_ph = code.find("overlay_present_common(self, 0);", i_dev_cmn + 1)
+check(i_dev_inc != -1 and i_dev_cmn_ph != -1 and i_dev_inc < i_dev_cmn_ph,
       "R16: device counter increments BEFORE the enabled check (present_hook top)")
 check(i_sw_inc != -1 and i_sw_cmn != -1 and i_sw_inc < i_sw_cmn,
       "R16: swapchain counter increments BEFORE the enabled check (sw_present_hook top)")
@@ -971,6 +975,31 @@ check(i_r25 != -1 and "g_settings.debug_enabled" in code[i_r25 - 200:i_r25],
       "R25: export-skip dlog sits inside a debug_enabled gate (quiet by default)")
 check('"R25 PlayerIdx=%d not usable (idx=%d n=%d); falling back to auto"' in code,
       "R25: forced-index-unusable note present (debug-gated, auto fallback)")
+
+# ================= R26: EndScene-draw path (overlay in-match) =================
+# R17 tracer proved the device IS alive in-match (scene climbing, dev/sw
+# frozen). R26 wires the overlay body into w_endscene — AFTER the real EndScene
+# (the game's frame is complete, back buffer holds the finished scene). The
+# shared once-per-frame guard in overlay_present_common ensures EndScene and
+# Present paths never both draw on the same frame; one-shot diagnostic proves
+# the EndScene path is active in a live log.
+check('overlay_present_common(self, 0);' in code and
+      code.count("overlay_present_common(self, 0);") == 2,
+      "R26: overlay body wired into w_endscene AND present_hook (shared path, "
+      "guarded once-per-frame)")
+i_reset_ec = code.find("int hr = o(self);")
+i_ovl_ec = code.find("int ovl = overlay_present_common(self, 0);")
+check(i_reset_ec != -1 and i_ovl_ec != -1 and i_reset_ec < i_ovl_ec,
+      "R26: EndScene overlay runs AFTER the real EndScene (o(self) first)")
+check("s_endscene_drew" in code,
+      "R26: one-shot EndScene-draw marker static present")
+check('dlog("R26 EndScene-draw: overlay active via EndScene path (dev=%p)", self)'
+      in code,
+      "R26: one-shot EndScene-draw diagnostic present")
+check("if (ovl && !s_endscene_drew)" in code,
+      "R26: one-shot diagnostic gated by the marker (logs ONCE)")
+check("s_endscene_drew = 0;" in code,
+      "R26: EndScene-draw marker reset on process attach")
 
 print("SOURCE-CONTRACT:", "PASS" if failures == 0 else f"{failures} FAILURES")
 sys.exit(0 if failures == 0 else 1)
