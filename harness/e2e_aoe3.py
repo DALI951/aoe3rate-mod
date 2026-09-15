@@ -15,13 +15,15 @@ Modes:
     record - launch game, record Dali's clicks/keys to recordings/skirmish.json
              (F6 = start/stop recording). THE RECORDING IS THE NAVIGATION PLAN.
     run    - full flow: launch + replay macro + vision-adaptive in-game check
-             + overlay verify + rates.log liveness check + report JSON.
+             + SILENT GATHER wait (workers produce) + overlay verify + direct
+             rates.log resource count + report JSON.
 
 CLI:
     python e2e_aoe3.py probe
     python e2e_aoe3.py record
-    python e2e_aoe3.py run [--iter N] [--ingame-sec 30] [--timeout 300]
-                           [--no-vision] [--no-macro] [--macro PATH]
+    python e2e_aoe3.py run [--iter N] [--ingame-sec 30] [--gather-sec 60]
+                           [--timeout 300] [--no-vision] [--no-macro]
+                           [--macro PATH]
 
 Output: screens/<mode>-<ts>...png + report-<ts>.json printed + saved.
 Exit code 0 => PASS, 1 => FAIL (or aborted step), 2 => unrecoverable.
@@ -343,6 +345,69 @@ def play_macro(path=DEFAULT_MACRO, loop=1, stop_key="esc"):
     return player
 
 
+def pre_click_game(path=DEFAULT_MACRO):
+    """Dali: 'add a click in the same 1st click before the space bar twice
+    clicking so the mouse knows you are in the game'.
+
+    The macro starts with SPACE presses before any mouse event - if the game
+    window is not focused, those spaces go nowhere and everything after drifts
+    (Dali: 'the game is not consistent, you are not in the same place each
+    time'). So BEFORE replaying: focus the game window and inject a click at
+    the recording's FIRST CLICK position (window-center if that spot is
+    outside the current window rect - window position changes between runs).
+    Injection via SetCursorPos + mouse_event (same low-level class the
+    GamePlayer uses, reaches DirectX games).
+    """
+    if not os.path.isfile(path):
+        print("[preclick] macro not found - skipping")
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            events = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"[preclick] cannot read macro: {e}", file=sys.stderr)
+        return False
+
+    first_click = None
+    for e in events:
+        if e.get("type") == "click" and "x" in e and "y" in e:
+            first_click = (int(e["x"]), int(e["y"]))
+            break
+    if first_click is None:
+        print("[preclick] no click events in macro - skipping")
+        return False
+
+    w = find_game_window()
+    if w is None:
+        print("[preclick] no game window - skipping")
+        return False
+    l, t, r, b = w.rect
+    cx, cy = window_center(w.rect)
+    px, py = first_click
+    inside = (l <= px < r) and (t <= py < b)
+    tx, ty = (px, py) if inside else (cx, cy)
+    print(f"[preclick] first click in macro at {first_click} "
+          f"({'inside' if inside else 'OUTSIDE window -> center'}) "
+          f"-> clicking ({tx},{ty})")
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    win = w.hwnd
+    user32.ShowWindow(win, 9)          # SW_RESTORE
+    user32.SetForegroundWindow(win)
+    time.sleep(0.5)
+    user32.SetCursorPos(tx, ty)
+    time.sleep(0.15)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)   # LEFT DOWN
+    time.sleep(0.05)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)   # LEFT UP
+    time.sleep(0.5)
+    print("[preclick] game window focused + click injected")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # probe mode
 # ---------------------------------------------------------------------------
@@ -393,6 +458,13 @@ def run(args):
     # The navigation IS Dali's recorded macro: replay it now to drive the
     # game from wherever it is (title screen -> menu -> skirmish -> match).
     if not args.no_macro:
+        # Dali: the macro starts with space-bar presses - focus the game and
+        # inject a click at the recording's first-click spot FIRST so the
+        # game knows the mouse is in it before any key is pressed.
+        if not args.no_preclick:
+            pre_click_game(args.macro)
+        else:
+            print("[run] --no-preclick: skipping focus+click warm-up")
         player = play_macro(args.macro, loop=args.macro_loop,
                             stop_key=args.stop_key)
         if player is None:
@@ -443,6 +515,14 @@ def run(args):
               f"({args.ingame_sec}s)")
         report_fail(args, shot, "NOT-IN-GAME", cls, macro_tail_check())
         return 1
+
+    # ---- SILENT GATHER (Dali: workers need silence to gather) ----
+    # No input at all: let the settlers/units produce so the direct counts
+    # and instant rates have real movement before the visibility snapshot.
+    if args.gather_sec > 0:
+        print(f"[run] in-game confirmed - silent gather {args.gather_sec}s "
+              f"(no input, workers produce...)")
+        time.sleep(args.gather_sec)
 
     # ---- overlay report: rates.log must be LIVE and count directly (Dali)
     alive, age, last_line = verify_log_alive()
@@ -562,10 +642,16 @@ def main():
     r.add_argument("--ingame-sec", type=int, default=30,
                    help="max seconds spent LOOKING for in-game (direct mode "
                         "shows numbers immediately - no 90s warmup wait)")
+    r.add_argument("--gather-sec", type=int, default=60,
+                   help="silent no-input wait AFTER in-game is confirmed so "
+                        "workers gather real resources (Dali)")
     r.add_argument("--timeout", type=int, default=300)
     r.add_argument("--no-vision", action="store_true")
     r.add_argument("--no-macro", action="store_true",
                    help="skip replaying the recorded macro (game must be ready)")
+    r.add_argument("--no-preclick", action="store_true",
+                   help="skip the focus+first-click pre-click (normally done "
+                        "before the macro so spaces land in the game)")
     r.add_argument("--macro", default=DEFAULT_MACRO,
                    help="macro JSON to replay (default recordings/skirmish.json)")
     r.add_argument("--macro-loop", type=int, default=1)
