@@ -501,6 +501,29 @@ def run(args):
     if screen0:
         print(f"[run] step0 screen: {os.path.basename(screen0)} ({m0})")
 
+    # STABILIZE: the game starts with an INTRO CINEMATIC; the recorded macro
+    # was made from the main menu, so replaying during the intro drifts
+    # (Dali: 'not in the same place each time'). Wait until the screen is a
+    # stable menu before touching anything.
+    if not args.no_vision:
+        t0 = time.time()
+        while time.time() - t0 < args.menu_wait:
+            sstab, _ = capture_best("run-stab")
+            if not sstab:
+                break
+            stable, cls = classify_menu_stable(sstab)
+            print(f"[run] stabilize #{int(time.time() - t0)}s: stable={stable} "
+                  f"| {cls[:140]}")
+            if stable:
+                break
+            recovery_press()  # Enter/space often advances intro screens
+            time.sleep(3)
+        else:
+            print(f"[run] WARNING: still not stable after {args.menu_wait}s - "
+                  "proceeding anyway")
+    else:
+        print("[run] --no-vision: skipping stabilize (intro may still be up)")
+
     # The navigation IS Dali's recorded macro: replay it now to drive the
     # game from wherever it is (title screen -> menu -> skirmish -> match).
     if not args.no_macro:
@@ -685,6 +708,9 @@ def main():
                     help="macro output path (default recordings/skirmish.json)")
     r = sub.add_parser("run")
     r.add_argument("--iter", type=int, default=1)
+    r.add_argument("--menu-wait", type=int, default=60,
+                   help="max seconds to wait out the intro cinematic / "
+                        "loading until a stable menu screen (stabilize)")
     r.add_argument("--ingame-sec", type=int, default=30,
                    help="max seconds spent LOOKING for in-game (direct mode "
                         "shows numbers immediately - no 90s warmup wait)")
