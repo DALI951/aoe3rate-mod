@@ -51,6 +51,7 @@ ERROR_LOG = os.path.join(_HERE, "app.error.log")
 # dead/stale path never holds the app hostage.
 _DEFAULT_LOG_PATH = CONFIG.log_path          # the shipped config.py default
 _FALLBACK_RATES = [
+    r"C:\Program Files (x86)\Age of Empires III - Complete Collection\rates.log",
     r"C:\Users\Dali\Documents\gaames\Age of Empires III - Complete Collection\rates.log",
     _DEFAULT_LOG_PATH,
     os.path.join(os.getcwd(), "rates.log"),
