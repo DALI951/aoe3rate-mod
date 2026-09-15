@@ -6,13 +6,51 @@ events). Same callbacks/lock API as the original; kept self-contained.
 Hotkey: F6 toggles recording on/off; use start_listeners()/stop_listeners()
 for embedding (as the harness does).
 """
+import ctypes
 import json
+import subprocess
 import threading
 import time
+from ctypes import wintypes
 from pynput import mouse, keyboard
 
 DEFAULT_RECORD_HOTKEY = 'f6'
 MOVE_THROTTLE_INTERVAL = 0.02
+
+
+def _find_game_rect(proc="age3y.exe"):
+    """Current window rect (left, top, right, bottom) of the visible game
+    window, or None. Stamped into recordings so replay can map clicks into
+    the window wherever it is on the screen (Dali: 'save the location and
+    then click there')."""
+    user32 = ctypes.windll.user32
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"IMAGENAME eq {proc}", "/FO", "CSV", "/NH"],
+            text=True,
+        ).strip()
+    except Exception:
+        return None
+    if not out or proc.lower() not in out.lower():
+        return None
+    pid = int(out.split(",")[1].strip('"'))
+    hwnds = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def cb(h, lp):
+        p = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(h, ctypes.byref(p))
+        if p.value == pid and user32.IsWindowVisible(h):
+            hwnds.append(h)
+        return True
+
+    user32.EnumWindows(ctypes.WINFUNCTYPE(
+        ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)(cb), 0)
+    if not hwnds:
+        return None
+    r = wintypes.RECT()
+    user32.GetWindowRect(hwnds[0], ctypes.byref(r))
+    return (r.left, r.top, r.right, r.bottom)
 
 
 class Recorder:
@@ -22,6 +60,7 @@ class Recorder:
         self.recording = False
         self.entry_focused = False
         self.events = []
+        self.meta = None  # geometry stamp (window_rect + screen) at record start
         self.start_time = 0
         self.last_time = 0
         self.last_move_time = 0
@@ -121,6 +160,21 @@ class Recorder:
             self.last_time = self.start_time
             self.last_move_time = 0
             self.last_pos = None
+            # STAMP the geometry at record-start (Dali: 'save the location'):
+            # replay maps absolute clicks into the window wherever it now is.
+            rect = _find_game_rect()
+            self.meta = {
+                "window_rect": rect,
+                "screen": (ctypes.windll.user32.GetSystemMetrics(0),
+                           ctypes.windll.user32.GetSystemMetrics(1)),
+            }
+            # meta is ALWAYS stamped (rect may be None -> replay maps
+            # passthrough = raw absolute coords, same old behaviour)
+            self.events.append({
+                "type": "meta", "timestamp": 0.0,
+                "window_rect": list(rect) if rect else None,
+                "screen": list(self.meta["screen"]),
+            })
         self._schedule_cb('on_record_start')
 
     def stop_recording(self):

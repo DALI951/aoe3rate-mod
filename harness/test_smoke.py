@@ -55,7 +55,7 @@ def test_capture_monitor_fallback_shape():
 def test_macro_roundtrip():
     import json as _json
     import tempfile
-    from gameplayer import GamePlayer, _get_vk
+    from gameplayer import GamePlayer, _get_vk, map_point
     from recorder_dali import Recorder
 
     assert _get_vk("a") == ord("A")
@@ -63,12 +63,24 @@ def test_macro_roundtrip():
     assert _get_vk("f6") == 0x75
     print("PASS _get_vk: chars + named keys")
 
+    # geometry mapping: recorded window -> moved window keeps relative spot
+    # record window 1920x1080 at (0,0); click at (960,540) = dead center
+    m = map_point(960, 540, (0, 0, 1920, 1080), (640, 288, 1280, 768))
+    assert m == (960, 528), f"window-center maps to window-center, got {m}"
+    # top-left of the recorded window -> top-left of the new window
+    m = map_point(0, 0, (0, 0, 1920, 1080), (640, 288, 1280, 768))
+    assert m == (640, 288), f"top-left maps to top-left, got {m}"
+    # bottom-right maps into (not past) the new window
+    m = map_point(1919, 1079, (0, 0, 1920, 1080), (640, 288, 1280, 768))
+    assert m[0] < 1280 and m[1] < 768, f"clamped inside window, got {m}"
+    # missing rects => passthrough
+    assert map_point(100, 200, None, (0, 0, 100, 100)) == (100, 200)
+    print("PASS map_point: geometry normalization + clamp + passthrough")
+
     rec = Recorder(record_hotkey="f6")
     assert rec.record_hotkey == "f6"
-    rec.start_listeners()
-    time.sleep(0.3)
-    if rec.listeners_running:
-        rec.stop_listeners()
+    rec.start_recording()  # F6 press in the real flow -> stamps geometry meta
+    assert rec.recording and rec.meta, "recording start stamps geometry meta"
     # simulate a synthetic event directly (listeners can't be fed easily)
     rec.events.append({"type": "key", "key": "enter", "action": "press",
                        "timestamp": 0.1})
@@ -79,10 +91,16 @@ def test_macro_roundtrip():
         rec.save(p)
         with open(p) as f:
             ev = _json.load(f)
-        assert len(ev) == 2 and ev[0]["type"] == "key"
+        assert len(ev) == 3 and ev[0]["type"] == "meta", \
+            "recording stamps geometry first (meta event)"
+        assert "window_rect" in ev[0], "meta carries the window_rect field"
         gp = GamePlayer(stop_key="esc")
         assert gp.stop_key == "esc"
-    print("PASS macro roundtrip: record format -> our JSON -> GamePlayer aware")
+        gp._load_meta(ev)
+        # no game running here -> rect None -> map_point passthrough (old coords)
+        assert gp.rec_rect is None, f"rec_rect None without game, got {gp.rec_rect}"
+        assert gp._map(100, 200) == (100, 200), "passthrough without geometry"
+    print("PASS macro roundtrip: meta-stamped record -> JSON -> GamePlayer")
 
 
 if __name__ == "__main__":

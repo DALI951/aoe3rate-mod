@@ -234,7 +234,9 @@ def wait_ingame(seconds):
 
 def classify_screen(path):
     """Ask vision whether we are in a match (resource counters visible).
-    Returns (in_game: bool, reply: str)."""
+    Returns (in_game: bool, reply: str). Careful parse: the model sometimes
+    echoes the prompt's own words like 'IN-GAME: True | NOT-IN-GAME' - check
+    NOT-IN-GAME FIRST so an echo can never fake a positive."""
 
     def _ask(p):
         return vision(path, p)
@@ -245,12 +247,47 @@ def classify_screen(path):
         "(Food/Wood/Coin/Export numbers), a minimap, and/or units/buildings on "
         "the map? Answer exactly: IN-GAME or NOT-IN-GAME. Then in one short "
         "line say what screen you actually see (main menu / skirmish setup / "
-        "loading / victory or defeat / intro / desktop / other)."
+        "loading / intro cinematic / victory or defeat / desktop / other)."
     )
     if not reply:
         return None, ""
-    in_game = "IN-GAME" in reply.upper()
-    return in_game, reply
+    up = reply.upper()
+    # explicit NOT always wins (the model echoes prompt words sometimes)
+    if "NOT-IN-GAME" in up and up.rfind("NOT-IN-GAME") > up.rfind("IN-GAME"):
+        return False, reply
+    if "IN-GAME" in up and "NOT-IN-GAME" not in up:
+        return True, reply
+    if "NOT-IN-GAME" in up and "IN-GAME" not in up:
+        return False, reply
+    return None, reply
+
+
+def classify_menu_stable(path):
+    """Is the game at a stable navigable screen (main menu or beyond)?
+    The INTRO CINEMATIC at launch is NOT stable - the recorded macro was
+    made from the main menu, so replaying during the intro drifts.
+    Returns (stable: bool, reply: str)."""
+
+    def _ask(p):
+        return vision(path, p)
+
+    reply = _ask(
+        "This is a screenshot of Age of Empires 3 on the computer. Which "
+        "screen state is it in right now? Answer with EXACTLY one of: "
+        "MAIN-MENU / INTRO-CINEMATIC / LOADING / IN-GAME / SETUP / OTHER. "
+        "MAIN-MENU = menu with buttons like Single Player, Multiplayer, "
+        "Options. INTRO-CINEMATIC = logo/animation/cutscene playing. "
+        "SETUP = skirmish options screen. Then one short line describing "
+        "what you see."
+    )
+    if not reply:
+        return None, ""
+    up = reply.upper()
+    if "INTRO-CINEMATIC" in up or "LOADING" in up:
+        return False, reply
+    if "MAIN-MENU" in up or "IN-GAME" in up or "SETUP" in up:
+        return True, reply
+    return False, reply
 
 
 def recovery_press(first=False):
@@ -369,8 +406,11 @@ def pre_click_game(path=DEFAULT_MACRO):
         return False
 
     first_click = None
+    rec_rect = None
     for e in events:
-        if e.get("type") == "click" and "x" in e and "y" in e:
+        if e.get("type") == "meta" and e.get("window_rect"):
+            rec_rect = tuple(int(v) for v in e["window_rect"])
+        elif e.get("type") == "click" and "x" in e and "y" in e:
             first_click = (int(e["x"]), int(e["y"]))
             break
     if first_click is None:
@@ -381,13 +421,19 @@ def pre_click_game(path=DEFAULT_MACRO):
     if w is None:
         print("[preclick] no game window - skipping")
         return False
-    l, t, r, b = w.rect
-    cx, cy = window_center(w.rect)
-    px, py = first_click
-    inside = (l <= px < r) and (t <= py < b)
-    tx, ty = (px, py) if inside else (cx, cy)
+    cur_rect = w.rect
+    l, t, r, b = cur_rect
+    cx, cy = window_center(cur_rect)
+    # map the recorded first-click into the CURRENT window (same rules as the
+    # GamePlayer replay, so the pre-click lands on the exact target button)
+    from gameplayer import map_point
+
+    tx, ty = map_point(first_click[0], first_click[1], rec_rect, cur_rect)
+    inside = (l <= tx < r) and (t <= ty < b)
+    if not inside:
+        tx, ty = cx, cy
     print(f"[preclick] first click in macro at {first_click} "
-          f"({'inside' if inside else 'OUTSIDE window -> center'}) "
+          f"(rec_rect={rec_rect}, cur_rect={cur_rect}) "
           f"-> clicking ({tx},{ty})")
 
     import ctypes

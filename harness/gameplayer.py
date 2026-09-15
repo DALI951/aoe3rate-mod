@@ -78,6 +78,65 @@ def _get_vk(key_str):
     return VK.get(key_str, 0)
 
 
+def _find_game_rect(proc="age3y.exe"):
+    """Current visible game window rect (l, t, r, b) or None - used to map
+    recorded absolute clicks into the window wherever it is NOW."""
+    import subprocess
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    try:
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"IMAGENAME eq {proc}", "/FO", "CSV", "/NH"],
+            text=True,
+        ).strip()
+    except Exception:
+        return None
+    if not out or proc.lower() not in out.lower():
+        return None
+    pid = int(out.split(",")[1].strip('"'))
+    hwnds = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def cb(h, lp):
+        p = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(h, ctypes.byref(p))
+        if p.value == pid and user32.IsWindowVisible(h):
+            hwnds.append(h)
+        return True
+
+    user32.EnumWindows(cb, 0)
+    if not hwnds:
+        return None
+    r = wintypes.RECT()
+    user32.GetWindowRect(hwnds[0], ctypes.byref(r))
+    return (r.left, r.top, r.right, r.bottom)
+
+
+def map_point(x, y, rec_rect, cur_rect):
+    """Map a recorded ABSOLUTE screen coordinate into the CURRENT game window
+    frame. rec_rect/cur_rect = (left, top, right, bottom).
+
+    The recording is made with the game at SOME geometry on SOME screen
+    (Dali: 'the game is not consistent, you are not in the same place each
+    time' - so save the location and click there). Replay normalizes:
+    fraction inside the recorded window -> fraction inside the current
+    window -> current absolute coordinate. Missing rects => input unchanged.
+    """
+    if not rec_rect or not cur_rect:
+        return x, y
+    rl, rt, rr, rb = rec_rect
+    cl, ct, cr, cb = cur_rect
+    rw, rh = max(1, rr - rl), max(1, rb - rt)
+    cw, ch = max(1, cr - cl), max(1, cb - ct)
+    fx = (x - rl) / rw
+    fy = (y - rt) / rh
+    # clamp into the target window so clicks can never land on another screen
+    fx = max(0.0, min(1.0, fx))
+    fy = max(0.0, min(1.0, fy))
+    return int(cl + fx * cw), int(ct + fy * ch)
+
+
 class GamePlayer:
     def __init__(self, stop_key=None, callbacks=None):
         self.stop_key = (stop_key or DEFAULT_PLAYBACK_STOP_KEY).lower()
@@ -89,9 +148,15 @@ class GamePlayer:
         self.retry_delay = GAME_KEYBOARD_RETRY_DELAY
         self._last_x = None
         self._last_y = None
+        self.rec_rect = None      # geometry the recording was made at
+        self.cur_rect = None      # geometry at replay time (mapped target)
 
     def set_stop_key(self, key):
         self.stop_key = key.lower()
+
+    def _map(self, x, y):
+        """Apply geometry normalization if the recording stamped its rect."""
+        return map_point(x, y, self.rec_rect, self.cur_rect)
 
     def _on_press(self, key):
         try:
@@ -119,6 +184,8 @@ class GamePlayer:
         t = event.get('type')
         x = event.get('x')
         y = event.get('y')
+        if x is not None and y is not None:
+            x, y = self._map(x, y)
 
         if t == 'move':
             self._move_relative(x, y)
@@ -151,6 +218,16 @@ class GamePlayer:
             else:
                 user32.keybd_event(vk, 0, 2, 0)
 
+    def _load_meta(self, events):
+        """Grab the geometry stamp event (type=meta) if the recording has one.
+        Also snapshot where the game window is RIGHT NOW so clicks get mapped."""
+        self.rec_rect = None
+        self.cur_rect = _find_game_rect()
+        for e in events:
+            if e.get('type') == 'meta' and e.get('window_rect'):
+                self.rec_rect = tuple(int(v) for v in e['window_rect'])
+                break
+
     def _play_loop(self, events, loop):
         self.stop_flag = False
         self.listener = keyboard.Listener(on_press=self._on_press)
@@ -158,6 +235,8 @@ class GamePlayer:
         cb_start = self.callbacks.get('on_play_start')
         cb_progress = self.callbacks.get('on_play_progress')
         cb_complete = self.callbacks.get('on_play_complete')
+
+        self._load_meta(events)
 
         if cb_start:
             cb_start(loop, len(events))
