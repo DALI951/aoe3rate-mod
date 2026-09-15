@@ -26,7 +26,8 @@ PositionMode=Default
 
 [Rate]
 SampleMs=500
-Smoothing=med
+Smoothing=direct  ; direct=instant (rate of last 2 samples, no warmup / default),
+                  ; low/med/high = EMA-smoothed (tau 10s/5s/2.5s)
 Unit=min
 UseGameTime=1
 DiscontinuityRatio=3.0

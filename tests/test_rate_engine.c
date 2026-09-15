@@ -223,6 +223,8 @@ static void test_settings_ini(void) {
     CHECK(g_settings.use_game_time == 1, "default: game-time clock");
     CHECK(g_settings.sample_ms == (int)SAMPLE_MS_DEFAULT, "default: 500ms sample");
     CHECK(g_settings.discontinuity_ratio == 3.0f, "default: discontinuity ratio 3.0");
+    CHECK(strcmp(g_settings.smoothing, "direct") == 0,
+          "default: smoothing = direct (instant rates, no warmup)");
 
     lstrcpyA(g_settings.font_name, "Arial");
     g_settings.font_size = 18;

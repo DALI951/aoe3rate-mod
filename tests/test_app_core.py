@@ -218,6 +218,35 @@ check("+120" in rec_fmt.get("formatted_min", "") and "+2" in rec_fmt.get("format
       f"engine record exposes formatted (+2.0/sec) + formatted_min (+120.0/min), got {rec_fmt['formatted']!r} / {rec_fmt['formatted_min']!r}")
 
 
+# =====================================================================
+# DIRECT mode: rate = instant rate of last 2 samples, NO warmup wait.
+# (Dali: "count directly, don't wait 90 seconds".)
+# =====================================================================
+cfg_direct = config.Config()
+cfg_direct.log_path = "unused.log"
+cfg_direct.set_smoothing_preset("direct")
+eng_d = RateEngine(cfg_direct)
+eng_d.update(0.0, {"food": 100.0})    # baseline, no delta yet
+eng_d.update(1.0, {"food": 110.0})    # +10 in 1s -> instant rate 10.0/sec
+eng_d.update(2.0, {"food": 118.0})    # +8 in 1s -> instant rate 8.0/sec (NO lag)
+rec_d = eng_d.last["resources"]["food"]
+check(rec_d["rate"] == 8.0,
+      f"direct: second delta shown immediately (was 8.0/sec, got {rec_d['rate']})")
+check(eng_d._ema["food"] == 8.0,
+      f"direct: EMA IS the instant rate (was 8.0, got {eng_d._ema['food']})")
+
+# DIRECT vs MEDIUM responsiveness: medium still converging at sample 3
+cfg_med = config.Config()
+cfg_med.log_path = "unused.log"
+cfg_med.set_smoothing_preset("medium")
+eng_m = RateEngine(cfg_med)
+eng_m.update(0.0, {"food": 100.0})
+eng_m.update(1.0, {"food": 110.0})
+eng_m.update(2.0, {"food": 118.0})
+check(eng_m._ema["food"] != 8.0,
+      f"medium: EMA still lagging behind direct (ema={eng_m._ema['food']})")
+
+
 # smoothing presets
 c = config.Config()
 c.set_smoothing_preset("low")
@@ -226,6 +255,8 @@ c.set_smoothing_preset("MeDiUm")
 check(c.smoothing_tau_sec == 3.5, "preset: case-insensitive 'MeDiUm' -> tau 3.5")
 c.set_smoothing_preset("high")
 check(c.smoothing_tau_sec == 8.0, "preset: high -> tau 8.0")
+c.set_smoothing_preset("direct")
+check(c.smoothing_tau_sec == 0.0, "preset: direct -> tau 0.0")
 try:
     c.set_smoothing_preset("ultra")
     check(False, "preset: unknown name -> ValueError")

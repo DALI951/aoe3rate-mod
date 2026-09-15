@@ -32,7 +32,10 @@ class Config:
 
     # Named presets so a GUI can offer "Low/Medium/High" without hardcoding
     # numbers anywhere else. Use cfg.set_smoothing_preset("high").
+    # "direct" = 0.0 tau -> alpha is forced to 1.0 in engine.py: the shown
+    # rate IS the instant rate of the last two samples (no EMA warmup/lag).
     SMOOTHING_PRESETS: Dict[str, float] = field(default_factory=lambda: {
+        "direct": 0.0,
         "low": 1.5,
         "medium": 3.5,
         "high": 8.0,

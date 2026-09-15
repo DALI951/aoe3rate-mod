@@ -57,6 +57,12 @@ void tracker_reset(void) {
 }
 
 static float ema_alpha(void) {
+    /* 'd'/'D' = DIRECT mode: alpha 1.0 -> the displayed rate IS the instant
+     * rate of the last two samples. Zero warmup, zero lag (Dali: "count
+     * directly, don't wait 90 seconds"). The game already maintains the
+     * true stock values, so per-sample deltas are already accurate. */
+    if (g_settings.smoothing[0] == 'd' || g_settings.smoothing[0] == 'D')
+        return 1.0f;
     if (g_settings.smoothing[0] == 'l' || g_settings.smoothing[0] == 'L')
         return 0.1f;
     if (g_settings.smoothing[0] == 'h' || g_settings.smoothing[0] == 'H')

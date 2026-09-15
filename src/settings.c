@@ -34,7 +34,7 @@ static void settings_defaults(void) {
     s->show_food = 1; s->show_wood = 1; s->show_coin = 1; s->show_export = 1;
     s->position_mode       = 0;
     s->sample_ms           = (int)SAMPLE_MS_DEFAULT;
-    lstrcpyA(s->smoothing, "med");
+    lstrcpyA(s->smoothing, "direct");
     s->use_unit_min        = 1;
     s->use_game_time       = 1;
     s->discontinuity_ratio = 3.0f;

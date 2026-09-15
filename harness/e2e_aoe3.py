@@ -1,19 +1,27 @@
 """e2e_aoe3.py - self-driving test harness for the aoe3rate-mod overlay.
 
-Launches the REAL game (Program Files install with the mod DLL), walks the menu
-to a skirmish with keyboard navigation, waits in-match, captures the game
-monitor via dxcam/mss, asks the vision model whether the overlay panel is
-VISIBLE and reads its numbers, then compares with rates.log.
+Launches the REAL game (Program Files install with the mod DLL), replays Dali's
+recorded macro (menu -> skirmish -> match), then LOOKS at the screen with
+vision to confirm we are actually IN a match (the game does NOT always land in
+the same menus - so we classify the screen and recover with Enter presses
+instead of blind waiting), captures the game monitor via dxcam/mss, asks the
+vision model whether the overlay panel is VISIBLE and reads its numbers + the
+native top-right resource COUNTS (ground truth - the game calculates them
+automatically), and compares with rates.log (must be LIVE, "count directly").
 
 Modes:
     probe  - launch game, wait for main menu, capture + vision-report the menu
              screen (used to calibrate navigation). Does NOT start a match.
-    run    - full flow: probe + navigate to skirmish + start match + wait
-             --ingame-sec + overlay check + rates.log compare + report JSON.
+    record - launch game, record Dali's clicks/keys to recordings/skirmish.json
+             (F6 = start/stop recording). THE RECORDING IS THE NAVIGATION PLAN.
+    run    - full flow: launch + replay macro + vision-adaptive in-game check
+             + overlay verify + rates.log liveness check + report JSON.
 
 CLI:
     python e2e_aoe3.py probe
-    python e2e_aoe3.py run [--iter N] [--ingame-sec 120] [--timeout 300] [--no-vision]
+    python e2e_aoe3.py record
+    python e2e_aoe3.py run [--iter N] [--ingame-sec 30] [--timeout 300]
+                           [--no-vision] [--no-macro] [--macro PATH]
 
 Output: screens/<mode>-<ts>...png + report-<ts>.json printed + saved.
 Exit code 0 => PASS, 1 => FAIL (or aborted step), 2 => unrecoverable.
@@ -222,6 +230,57 @@ def wait_ingame(seconds):
         time.sleep(1)
 
 
+def classify_screen(path):
+    """Ask vision whether we are in a match (resource counters visible).
+    Returns (in_game: bool, reply: str)."""
+
+    def _ask(p):
+        return vision(path, p)
+
+    reply = _ask(
+        "This is a screenshot of Age of Empires 3. Is the game IN A MATCH right "
+        "now - meaning a real game screen with the resource counters top-right "
+        "(Food/Wood/Coin/Export numbers), a minimap, and/or units/buildings on "
+        "the map? Answer exactly: IN-GAME or NOT-IN-GAME. Then in one short "
+        "line say what screen you actually see (main menu / skirmish setup / "
+        "loading / victory or defeat / intro / desktop / other)."
+    )
+    if not reply:
+        return None, ""
+    in_game = "IN-GAME" in reply.upper()
+    return in_game, reply
+
+
+def recovery_press(first=False):
+    """Menu-advance recovery: Enter often confirms/advances AoE3 menus.
+    Returns nothing. Caller re-classifies after each press."""
+    import ctrl
+
+    try:
+        ctrl.bring("enter")
+    except SystemExit:
+        print("  [recover] no game window to focus", file=sys.stderr)
+    time.sleep(3)
+
+
+def verify_log_alive(tail=5.0):
+    """True if rates.log was written within `tail` seconds (DLL alive +
+    export mode). Returns (alive, mtime_age, last_line)."""
+    try:
+        st = os.stat(RATES_LOG)
+    except OSError:
+        return False, None, ""
+    age = time.time() - st.st_mtime
+    last = ""
+    try:
+        with open(RATES_LOG, "r", errors="replace") as f:
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        last = lines[-1] if lines else ""
+    except OSError:
+        pass
+    return age <= tail, age, last
+
+
 # ---------------------------------------------------------------------------
 # macro recording / playback (Dali's macro_recorder App, vendored GamePlayer)
 # ---------------------------------------------------------------------------
@@ -340,9 +399,8 @@ def run(args):
             print("FAIL: no macro to replay. Run: python e2e_aoe3.py record")
             return 1
 
-        # The macro drives the game through menus + the start of a match
-        # (in Dali's recordings the in-match segment runs ~60-90s). Wait for
-        # it to finish or abort via hotkey; then keep gathering for the rest.
+        # The macro drives the game through menus + the start of a match.
+        # Wait for it to finish or abort via hotkey.
         t0 = time.time()
         while (time.time() - t0 < args.macro_timeout
                and player.play_thread and player.play_thread.is_alive()):
@@ -350,12 +408,48 @@ def run(args):
         if player.play_thread and player.play_thread.is_alive():
             print(f"[run] macro still running after {args.macro_timeout}s - "
                   "continuing with capture anyway (hotkey esc to stop it)")
-        print(f"[run] macro phase done ({(time.time() - t0):.0f}s), "
-              f"waiting in-game {args.ingame_sec}s ...")
-        time.sleep(args.ingame_sec)
+        print(f"[run] macro phase done ({(time.time() - t0):.0f}s)")
     else:
-        print("[run] --no-macro: waiting directly (game must already be in match)")
-        time.sleep(args.ingame_sec)
+        print("[run] --no-macro: game must already be in match")
+
+    # ---- vision-guided verification (Dali: the game does NOT always land
+    # ---- in the same place - so LOOK and recover instead of blind waiting)
+    deadline = time.time() + args.ingame_sec
+    in_game = False
+    attempts = 0
+    while time.time() < deadline:
+        shot, mth = capture_best("run-check")
+        if not shot:
+            print("FAIL: no capture while checking")
+            return 1
+        attempts += 1
+        if not args.no_vision:
+            in_game, cls = classify_screen(shot)
+            print(f"[run] check#{attempts}: IN-GAME={in_game} | {cls[:160]}")
+            if in_game:
+                break
+            if cls and ("VICTORY" in cls.upper() or "DEFEAT" in cls.upper()
+                        or "MAIN MENU" in cls.upper()):
+                print("[run] reached an end state, recovery not useful")
+                break
+        else:
+            # blind mode: trust the macro + elapsed time
+            in_game = True
+            break
+        # not in game yet -> nudge the menu forward, re-look
+        recovery_press()
+    if not in_game:
+        print(f"[run] never confirmed in-game after {attempts} checks "
+              f"({args.ingame_sec}s)")
+        report_fail(args, shot, "NOT-IN-GAME", cls, macro_tail_check())
+        return 1
+
+    # ---- overlay report: rates.log must be LIVE and count directly (Dali)
+    alive, age, last_line = verify_log_alive()
+    if not alive:
+        print(f"[run] WARNING: rates.log stale ({age:.0f}s) - DLL not writing?")
+    else:
+        print(f"[run] rates.log LIVE (age {age:.0f}s): {last_line[:80]}")
 
     shot, mth = capture_best("run-match")
     if not shot:
@@ -368,32 +462,49 @@ def run(args):
     if not args.no_vision:
         reply = vision(shot, (
             "You are looking at an Age of Empires 3 screenshot taken IN A MATCH. "
-            "CRITICAL QUESTION: is there a small SEMI-TRANSPARENT OVERLAY PANEL "
-            "drawn ON TOP of the game showing resource RATES - typically a box in "
-            "a corner with lines like 'Food +12/min' or 'food rate x' etc - that "
-            "is NOT standard AoE3 UI? Answer: OVERLAY-VISIBLE or NO-OVERLAY. "
-            "Then: 1) describe the top-right resource counters if visible and "
-            "quote exact numbers; 2) if an overlay panel exists, quote ALL text/"
-            "numbers in it EXACTLY; 3) describe where in the screen it is."
+            "The game itself shows Live Resource COUNTS in the top-right corner "
+            "(Food / Wood / Coin / Export numbers). "
+            "QUESTION 1: quote the EXACT current numbers of those native top-right "
+            "counters (they are the ground truth - the game calculates them "
+            "automatically). "
+            "QUESTION 2: is there a small SEMI-TRANSPARENT OVERLAY PANEL drawn ON "
+            "TOP of the game showing resource RATES - a box in a corner with lines "
+            "like 'Food +12/min' or similar that is NOT standard AoE3 UI? Answer "
+            "OVERLAY-VISIBLE or NO-OVERLAY. If an overlay exists, quote ALL its "
+            "text/numbers EXACTLY and say where it is on screen."
         ))
         if reply:
             overlay_text = reply
             overlay_visible = "OVERLAY-VISIBLE" in reply.upper()
             print(f"[run] OVERLAY VISION: {reply}")
 
-    # rates.log compare
+    # rates.log: direct current values (count them directly - Dali)
     log_data = ""
+    cur_values = {}
     try:
-        with open(RATES_LOG, "r") as f:
+        with open(RATES_LOG, "r", errors="replace") as f:
             lines = [l.strip() for l in f if l.strip()]
         log_data = lines[-5:] if lines else []
+        if lines:
+            last = lines[-1]
+            for part in last.split(","):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    if k in ("food", "wood", "coin", "export"):
+                        try:
+                            cur_values[k] = int(v)
+                        except ValueError:
+                            pass
     except OSError as e:
         print(f"[run] rates.log unreadable: {e}", file=sys.stderr)
 
     report = {
         "iter": args.iter,
+        "in_game_confirmed": True,
         "overlay_visible": overlay_visible,
         "overlay_text": overlay_text,
+        "resources_direct": cur_values,
+        "rates_log_live": alive,
         "rates_log_tail": log_data,
         "shot": os.path.basename(shot),
         "macro": os.path.basename(args.macro) if not args.no_macro else None,
@@ -410,6 +521,34 @@ def run(args):
     return 1
 
 
+def report_fail(args, shot, reason, vision_reply, log_note):
+    """Write a FAIL report JSON for the not-in-game / stuck paths."""
+    report = {
+        "iter": args.iter,
+        "in_game_confirmed": False,
+        "reason": reason,
+        "vision_reply": vision_reply,
+        "shot": os.path.basename(shot) if shot else None,
+        "macro": os.path.basename(args.macro) if not args.no_macro else None,
+        "log_note": log_note,
+        "game_pid": proc_pid(),
+    }
+    rp = os.path.join(SHOT_DIR, f"report-{time.strftime('%H%M%S')}.json")
+    with open(rp, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    print("[run] FAIL REPORT:", json.dumps(report, indent=2, ensure_ascii=False))
+
+
+def macro_tail_check():
+    """Snapshot of the last rates.log line for fail reports."""
+    try:
+        with open(RATES_LOG, "r", errors="replace") as f:
+            lines = [l for l in f.read().splitlines() if l.strip()]
+        return lines[-1] if lines else "no lines"
+    except OSError as e:
+        return f"unreadable: {e}"
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="mode", required=True)
@@ -420,7 +559,9 @@ def main():
                     help="macro output path (default recordings/skirmish.json)")
     r = sub.add_parser("run")
     r.add_argument("--iter", type=int, default=1)
-    r.add_argument("--ingame-sec", type=int, default=120)
+    r.add_argument("--ingame-sec", type=int, default=30,
+                   help="max seconds spent LOOKING for in-game (direct mode "
+                        "shows numbers immediately - no 90s warmup wait)")
     r.add_argument("--timeout", type=int, default=300)
     r.add_argument("--no-vision", action="store_true")
     r.add_argument("--no-macro", action="store_true",

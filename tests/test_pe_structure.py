@@ -16,11 +16,13 @@ plan demands (plan section "ADDITIONAL VERIFICATION"):
   6. age3y.exe statically imports d3d9.dll (proxy injection via import table).
   7. Version-gate primitives on age3y.exe: size 11,598,648 bytes.
 """
+import os
 import struct
 import sys
 
-DLL = r"C:\Users\dali\aoe3rate-mod\d3d9.dll"
-EXE = r"C:\Users\dali\Documents\gaames\Age of Empires III - Complete Collection\age3y.exe"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DLL = os.path.join(ROOT, "d3d9.dll")
+EXE = r"C:\Program Files (x86)\Age of Empires III - Complete Collection\age3y.exe"
 
 failures = 0
 

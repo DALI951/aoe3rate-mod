@@ -170,6 +170,8 @@ check("!g_version_ok" in src and 'ovl_abort_stop("version")' in src,
 
 check("ema_alpha" in src and "0.4f" in src and "0.1f" in src,
       "EMA alphas low/med/high (0.1/0.2/0.4) present")
+check("'d' || g_settings.smoothing[0] == 'D'" in src and "return 1.0f" in src,
+      "DIRECT mode: smoothing[0]=='d'/'D' -> alpha 1.0 (instant rates)")
 check("discontinuity_ratio" in src, "spending-spike ratio present")
 check("inst < 0.0f" in src, "spending-spike skip on negative rate")
 check("g_slot_frozen" in src, "slot-level pause freeze present")

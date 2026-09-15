@@ -230,6 +230,8 @@ void ui_check_hotkey(void) {
                     lstrcpyA(g_settings.smoothing, "med");
                 else if (g_settings.smoothing[0] == 'm' || g_settings.smoothing[0] == '\0')
                     lstrcpyA(g_settings.smoothing, "high");
+                else if (g_settings.smoothing[0] == 'h')
+                    lstrcpyA(g_settings.smoothing, "direct");
                 else
                     lstrcpyA(g_settings.smoothing, "low");
                 break;

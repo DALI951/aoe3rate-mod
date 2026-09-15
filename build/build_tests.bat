@@ -1,6 +1,6 @@
 @echo off
 setlocal
-set "W64=C:\Users\dali\AppData\Local\Temp\opencode\w64devkit-x86\w64devkit"
+set "W64=C:\Users\Dali\Documents\gaames\w64devkit-x86\w64devkit"
 set "PATH=%W64%\bin;%W64%\libexec\gcc\i686-w64-mingw32\16.2.0;%PATH%"
 pushd "%~dp0.."
 

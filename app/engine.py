@@ -86,10 +86,16 @@ class RateEngine:
                 self._window_start[res] = t_sec
             # do NOT fold into the EMA — the rate is unchanged by the spend
         else:
-            alpha = 1.0 - math.exp(-dt / self.config.smoothing_tau_sec)
-            # clamp alpha to (0,1) for numeric safety
-            alpha = max(0.0, min(1.0, alpha))
-            self._ema[res] = instant * alpha + ema * (1.0 - alpha)
+            # DIRECT mode (tau=0, alpha=1): the rate IS the instant rate of
+            # the last two samples — zero warmup, zero lag. Matches the DLL's
+            # Smoothing=direct. (Dali: "count directly, don't wait 90s".)
+            if self.config.smoothing_tau_sec <= 0.0:
+                self._ema[res] = instant
+            else:
+                alpha = 1.0 - math.exp(-dt / self.config.smoothing_tau_sec)
+                # clamp alpha to (0,1) for numeric safety
+                alpha = max(0.0, min(1.0, alpha))
+                self._ema[res] = instant * alpha + ema * (1.0 - alpha)
 
         self._t_last[res] = t_sec
         self._v_last[res] = value
